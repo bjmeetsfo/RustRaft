@@ -12,10 +12,16 @@ metaserver integration.
 - `RustRaftParityContract`
 - `RustRaftParityReport`
 - `RustRaftProductionStatus`
+- `RustRaftStorage`
+- `RustRaftTransport`
+- `RustRaftStatusSnapshot`
+- `RustRaftMetricNames`
 - `RustRaftReadinessEvidence`
 - `RustRaftReadinessSnapshot`
 - `rustraft_parity_contract`
 - `rustraft_parity_report`
+- `rustraft_public_api_contract`
+- `rustraft_metric_names`
 
 The crate is independent of OpenRaft types. TemporalStore converts its internal
 readiness evidence into `RustRaftReadinessSnapshot` or implements
@@ -52,7 +58,9 @@ consensus-readiness boundary:
 ## Current Scope
 
 This first standalone version is a contract library. It does not yet implement a
-complete Raft consensus runtime. The remaining roadmap is tracked in
+complete Raft consensus runtime. It now also owns the stable storage, transport,
+status, and metric contract surface that TemporalStore can implement from its
+data-node and metaserver runtime code. The remaining roadmap is tracked in
 [`docs/gap_plan.md`](docs/gap_plan.md).
 
 ## Test

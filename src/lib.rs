@@ -7,6 +7,245 @@
 
 use serde::{Deserialize, Serialize};
 
+pub type RustRaftNodeId = u64;
+pub type RustRaftTerm = u64;
+pub type RustRaftLogIndex = u64;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftLogId {
+    pub term: RustRaftTerm,
+    pub index: RustRaftLogIndex,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftHardState {
+    pub current_term: RustRaftTerm,
+    pub voted_for: Option<RustRaftNodeId>,
+    pub committed: RustRaftLogIndex,
+    pub applied: RustRaftLogIndex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftLogEntry {
+    pub log_id: RustRaftLogId,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftSnapshotMeta {
+    pub snapshot_id: String,
+    pub last_included: RustRaftLogId,
+    pub membership_generation: u64,
+    pub checksum: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftSnapshotChunk {
+    pub meta: RustRaftSnapshotMeta,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftAppendEntriesRequest {
+    pub group_id: u64,
+    pub term: RustRaftTerm,
+    pub leader_id: RustRaftNodeId,
+    pub prev_log_id: Option<RustRaftLogId>,
+    pub entries: Vec<RustRaftLogEntry>,
+    pub leader_commit: RustRaftLogIndex,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftAppendEntriesResponse {
+    pub term: RustRaftTerm,
+    pub success: bool,
+    pub match_index: RustRaftLogIndex,
+    pub conflict_index: Option<RustRaftLogIndex>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftVoteRequest {
+    pub group_id: u64,
+    pub term: RustRaftTerm,
+    pub candidate_id: RustRaftNodeId,
+    pub last_log_id: Option<RustRaftLogId>,
+    pub pre_vote: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftVoteResponse {
+    pub term: RustRaftTerm,
+    pub vote_granted: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftInstallSnapshotRequest {
+    pub group_id: u64,
+    pub term: RustRaftTerm,
+    pub leader_id: RustRaftNodeId,
+    pub chunk: RustRaftSnapshotChunk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftInstallSnapshotResponse {
+    pub term: RustRaftTerm,
+    pub accepted: bool,
+    pub next_offset: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftReadIndexRequest {
+    pub group_id: u64,
+    pub requester_id: RustRaftNodeId,
+    pub min_commit_index: RustRaftLogIndex,
+    pub allow_lease_read: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftReadIndexResponse {
+    pub term: RustRaftTerm,
+    pub read_index: RustRaftLogIndex,
+    pub lease_read: bool,
+    pub safe: bool,
+    pub reason: String,
+}
+
+pub trait RustRaftStorage {
+    type Error;
+
+    fn append_entries(&mut self, entries: &[RustRaftLogEntry]) -> Result<(), Self::Error>;
+    fn read_entries(
+        &self,
+        start: RustRaftLogIndex,
+        end: RustRaftLogIndex,
+    ) -> Result<Vec<RustRaftLogEntry>, Self::Error>;
+    fn save_hard_state(&mut self, hard_state: &RustRaftHardState) -> Result<(), Self::Error>;
+    fn load_hard_state(&self) -> Result<RustRaftHardState, Self::Error>;
+    fn save_snapshot(
+        &mut self,
+        meta: &RustRaftSnapshotMeta,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error>;
+    fn load_snapshot(&self, snapshot_id: &str) -> Result<Vec<u8>, Self::Error>;
+    fn tombstone_compacted_entries(
+        &mut self,
+        compacted_through: RustRaftLogIndex,
+    ) -> Result<(), Self::Error>;
+}
+
+pub trait RustRaftTransport {
+    type Error;
+
+    fn append_entries(
+        &self,
+        target: RustRaftNodeId,
+        request: RustRaftAppendEntriesRequest,
+    ) -> Result<RustRaftAppendEntriesResponse, Self::Error>;
+    fn vote(
+        &self,
+        target: RustRaftNodeId,
+        request: RustRaftVoteRequest,
+    ) -> Result<RustRaftVoteResponse, Self::Error>;
+    fn install_snapshot(
+        &self,
+        target: RustRaftNodeId,
+        request: RustRaftInstallSnapshotRequest,
+    ) -> Result<RustRaftInstallSnapshotResponse, Self::Error>;
+    fn read_index(
+        &self,
+        target: RustRaftNodeId,
+        request: RustRaftReadIndexRequest,
+    ) -> Result<RustRaftReadIndexResponse, Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustRaftRole {
+    Leader,
+    Follower,
+    Candidate,
+    Learner,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftPeerStatus {
+    pub node_id: RustRaftNodeId,
+    pub matched: RustRaftLogIndex,
+    pub next_index: RustRaftLogIndex,
+    pub learner: bool,
+    pub healthy: bool,
+    pub lag: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftStatusSnapshot {
+    pub group_id: u64,
+    pub node_id: RustRaftNodeId,
+    pub role: RustRaftRole,
+    pub term: RustRaftTerm,
+    pub leader_id: Option<RustRaftNodeId>,
+    pub commit_index: RustRaftLogIndex,
+    pub applied_index: RustRaftLogIndex,
+    pub last_log_index: RustRaftLogIndex,
+    pub last_snapshot_index: RustRaftLogIndex,
+    pub peers: Vec<RustRaftPeerStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftMetricNames {
+    pub leader_changes_total: String,
+    pub append_entries_qps: String,
+    pub append_entries_latency_ms: String,
+    pub read_index_latency_ms: String,
+    pub apply_lag: String,
+    pub snapshot_install_total: String,
+    pub snapshot_install_latency_ms: String,
+    pub membership_change_total: String,
+    pub transport_errors_total: String,
+}
+
+pub fn rustraft_metric_names() -> RustRaftMetricNames {
+    RustRaftMetricNames {
+        leader_changes_total: "rustraft_leader_changes_total".to_string(),
+        append_entries_qps: "rustraft_append_entries_qps".to_string(),
+        append_entries_latency_ms: "rustraft_append_entries_latency_ms".to_string(),
+        read_index_latency_ms: "rustraft_read_index_latency_ms".to_string(),
+        apply_lag: "rustraft_apply_lag".to_string(),
+        snapshot_install_total: "rustraft_snapshot_install_total".to_string(),
+        snapshot_install_latency_ms: "rustraft_snapshot_install_latency_ms".to_string(),
+        membership_change_total: "rustraft_membership_change_total".to_string(),
+        transport_errors_total: "rustraft_transport_errors_total".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftPublicApiContract {
+    pub storage_trait: String,
+    pub transport_trait: String,
+    pub status_snapshot: String,
+    pub metric_namespace: String,
+    pub rpc_messages: Vec<String>,
+}
+
+pub fn rustraft_public_api_contract() -> RustRaftPublicApiContract {
+    RustRaftPublicApiContract {
+        storage_trait: "RustRaftStorage".to_string(),
+        transport_trait: "RustRaftTransport".to_string(),
+        status_snapshot: "RustRaftStatusSnapshot".to_string(),
+        metric_namespace: "rustraft".to_string(),
+        rpc_messages: vec![
+            "RustRaftAppendEntriesRequest".to_string(),
+            "RustRaftVoteRequest".to_string(),
+            "RustRaftInstallSnapshotRequest".to_string(),
+            "RustRaftReadIndexRequest".to_string(),
+        ],
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftSemanticRequirement {
     pub id: String,
@@ -269,6 +508,143 @@ fn requirement(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct MemoryRustRaftStorage {
+        entries: BTreeMap<RustRaftLogIndex, RustRaftLogEntry>,
+        hard_state: RustRaftHardState,
+        snapshots: BTreeMap<String, Vec<u8>>,
+        compacted_through: RustRaftLogIndex,
+    }
+
+    impl RustRaftStorage for MemoryRustRaftStorage {
+        type Error = String;
+
+        fn append_entries(&mut self, entries: &[RustRaftLogEntry]) -> Result<(), Self::Error> {
+            for entry in entries {
+                if entry.log_id.index <= self.compacted_through {
+                    return Err("entry_compacted".to_string());
+                }
+                self.entries.insert(entry.log_id.index, entry.clone());
+            }
+            Ok(())
+        }
+
+        fn read_entries(
+            &self,
+            start: RustRaftLogIndex,
+            end: RustRaftLogIndex,
+        ) -> Result<Vec<RustRaftLogEntry>, Self::Error> {
+            Ok(self
+                .entries
+                .range(start..end)
+                .map(|(_, entry)| entry.clone())
+                .collect())
+        }
+
+        fn save_hard_state(&mut self, hard_state: &RustRaftHardState) -> Result<(), Self::Error> {
+            self.hard_state = hard_state.clone();
+            Ok(())
+        }
+
+        fn load_hard_state(&self) -> Result<RustRaftHardState, Self::Error> {
+            Ok(self.hard_state.clone())
+        }
+
+        fn save_snapshot(
+            &mut self,
+            meta: &RustRaftSnapshotMeta,
+            bytes: &[u8],
+        ) -> Result<(), Self::Error> {
+            self.snapshots
+                .insert(meta.snapshot_id.clone(), bytes.to_vec());
+            Ok(())
+        }
+
+        fn load_snapshot(&self, snapshot_id: &str) -> Result<Vec<u8>, Self::Error> {
+            self.snapshots
+                .get(snapshot_id)
+                .cloned()
+                .ok_or_else(|| "snapshot_not_found".to_string())
+        }
+
+        fn tombstone_compacted_entries(
+            &mut self,
+            compacted_through: RustRaftLogIndex,
+        ) -> Result<(), Self::Error> {
+            self.compacted_through = compacted_through;
+            self.entries
+                .retain(|index, _| *index > self.compacted_through);
+            Ok(())
+        }
+    }
+
+    struct LoopbackRustRaftTransport;
+
+    impl RustRaftTransport for LoopbackRustRaftTransport {
+        type Error = String;
+
+        fn append_entries(
+            &self,
+            _target: RustRaftNodeId,
+            request: RustRaftAppendEntriesRequest,
+        ) -> Result<RustRaftAppendEntriesResponse, Self::Error> {
+            Ok(RustRaftAppendEntriesResponse {
+                term: request.term,
+                success: true,
+                match_index: request
+                    .entries
+                    .last()
+                    .map(|entry| entry.log_id.index)
+                    .unwrap_or_else(|| request.prev_log_id.map(|log| log.index).unwrap_or(0)),
+                conflict_index: None,
+            })
+        }
+
+        fn vote(
+            &self,
+            _target: RustRaftNodeId,
+            request: RustRaftVoteRequest,
+        ) -> Result<RustRaftVoteResponse, Self::Error> {
+            Ok(RustRaftVoteResponse {
+                term: request.term,
+                vote_granted: request.last_log_id.is_some(),
+                reason: if request.pre_vote {
+                    "pre_vote_checked".to_string()
+                } else {
+                    "vote_checked".to_string()
+                },
+            })
+        }
+
+        fn install_snapshot(
+            &self,
+            _target: RustRaftNodeId,
+            request: RustRaftInstallSnapshotRequest,
+        ) -> Result<RustRaftInstallSnapshotResponse, Self::Error> {
+            Ok(RustRaftInstallSnapshotResponse {
+                term: request.term,
+                accepted: request.chunk.done,
+                next_offset: request.chunk.offset + request.chunk.bytes.len() as u64,
+                reason: "snapshot_chunk_checked".to_string(),
+            })
+        }
+
+        fn read_index(
+            &self,
+            _target: RustRaftNodeId,
+            request: RustRaftReadIndexRequest,
+        ) -> Result<RustRaftReadIndexResponse, Self::Error> {
+            Ok(RustRaftReadIndexResponse {
+                term: 7,
+                read_index: request.min_commit_index,
+                lease_read: request.allow_lease_read,
+                safe: true,
+                reason: "read_index_checked".to_string(),
+            })
+        }
+    }
 
     #[test]
     fn contract_contains_production_semantics_without_openraft() {
@@ -328,5 +704,142 @@ mod tests {
             RustRaftProductionStatus::ProductionReady
         );
         assert!(report.production_blockers.is_empty());
+    }
+
+    #[test]
+    fn public_api_contract_exposes_storage_transport_status_and_metrics() {
+        let api = rustraft_public_api_contract();
+        assert_eq!(api.storage_trait, "RustRaftStorage");
+        assert_eq!(api.transport_trait, "RustRaftTransport");
+        assert_eq!(api.status_snapshot, "RustRaftStatusSnapshot");
+        assert!(api
+            .rpc_messages
+            .contains(&"RustRaftAppendEntriesRequest".to_string()));
+
+        let metrics = rustraft_metric_names();
+        assert_eq!(metrics.apply_lag, "rustraft_apply_lag");
+        assert!(metrics
+            .transport_errors_total
+            .starts_with(&api.metric_namespace));
+    }
+
+    #[test]
+    fn storage_trait_covers_hard_state_log_snapshot_and_compaction() {
+        let mut storage = MemoryRustRaftStorage::default();
+        storage
+            .save_hard_state(&RustRaftHardState {
+                current_term: 3,
+                voted_for: Some(2),
+                committed: 4,
+                applied: 3,
+            })
+            .unwrap();
+        assert_eq!(storage.load_hard_state().unwrap().current_term, 3);
+
+        storage
+            .append_entries(&[
+                RustRaftLogEntry {
+                    log_id: RustRaftLogId { term: 3, index: 4 },
+                    payload: b"set a".to_vec(),
+                },
+                RustRaftLogEntry {
+                    log_id: RustRaftLogId { term: 3, index: 5 },
+                    payload: b"set b".to_vec(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(storage.read_entries(4, 6).unwrap().len(), 2);
+
+        let meta = RustRaftSnapshotMeta {
+            snapshot_id: "snap-5".to_string(),
+            last_included: RustRaftLogId { term: 3, index: 5 },
+            membership_generation: 9,
+            checksum: "sha256:demo".to_string(),
+        };
+        storage.save_snapshot(&meta, b"snapshot").unwrap();
+        assert_eq!(storage.load_snapshot("snap-5").unwrap(), b"snapshot");
+
+        storage.tombstone_compacted_entries(4).unwrap();
+        assert_eq!(storage.read_entries(1, 6).unwrap().len(), 1);
+        assert!(storage
+            .append_entries(&[RustRaftLogEntry {
+                log_id: RustRaftLogId { term: 3, index: 4 },
+                payload: b"stale".to_vec(),
+            }])
+            .is_err());
+    }
+
+    #[test]
+    fn transport_trait_covers_append_vote_snapshot_and_read_index() {
+        let transport = LoopbackRustRaftTransport;
+        let append = transport
+            .append_entries(
+                2,
+                RustRaftAppendEntriesRequest {
+                    group_id: 1,
+                    term: 8,
+                    leader_id: 1,
+                    prev_log_id: Some(RustRaftLogId { term: 7, index: 11 }),
+                    entries: vec![RustRaftLogEntry {
+                        log_id: RustRaftLogId { term: 8, index: 12 },
+                        payload: b"write".to_vec(),
+                    }],
+                    leader_commit: 12,
+                },
+            )
+            .unwrap();
+        assert!(append.success);
+        assert_eq!(append.match_index, 12);
+
+        let vote = transport
+            .vote(
+                2,
+                RustRaftVoteRequest {
+                    group_id: 1,
+                    term: 9,
+                    candidate_id: 3,
+                    last_log_id: Some(RustRaftLogId { term: 8, index: 12 }),
+                    pre_vote: true,
+                },
+            )
+            .unwrap();
+        assert!(vote.vote_granted);
+
+        let snapshot = transport
+            .install_snapshot(
+                2,
+                RustRaftInstallSnapshotRequest {
+                    group_id: 1,
+                    term: 9,
+                    leader_id: 1,
+                    chunk: RustRaftSnapshotChunk {
+                        meta: RustRaftSnapshotMeta {
+                            snapshot_id: "snap-12".to_string(),
+                            last_included: RustRaftLogId { term: 8, index: 12 },
+                            membership_generation: 1,
+                            checksum: "sha256:demo".to_string(),
+                        },
+                        offset: 0,
+                        bytes: b"chunk".to_vec(),
+                        done: true,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(snapshot.accepted);
+
+        let read = transport
+            .read_index(
+                2,
+                RustRaftReadIndexRequest {
+                    group_id: 1,
+                    requester_id: 2,
+                    min_commit_index: 12,
+                    allow_lease_read: false,
+                },
+            )
+            .unwrap();
+        assert!(read.safe);
+        assert_eq!(read.read_index, 12);
     }
 }
