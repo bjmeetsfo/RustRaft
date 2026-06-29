@@ -71,3 +71,24 @@ implement from its data-node and metaserver runtime code. The remaining roadmap 
 ```bash
 cargo test
 ```
+
+## Examples
+
+The examples are intentionally storage/runtime agnostic. They show how an
+application such as TemporalStore should feed process evidence into the
+standalone RustRaft contract.
+
+Build and run the readiness report example:
+
+```bash
+cargo run --example readiness_report
+```
+
+Run the read-safety policy example:
+
+```bash
+cargo run --example read_safety
+```
+
+Both examples are also covered by integration tests so the public snippets stay
+in sync with the crate API.
