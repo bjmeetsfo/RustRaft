@@ -16,6 +16,9 @@ metaserver integration.
 - `RustRaftTransport`
 - `RustRaftStatusSnapshot`
 - `RustRaftMetricNames`
+- `rustraft_read_safety_decision`
+- `rustraft_learner_promotion_decision`
+- `rustraft_append_safety_decision`
 - `RustRaftReadinessEvidence`
 - `RustRaftReadinessSnapshot`
 - `rustraft_parity_contract`
@@ -59,8 +62,8 @@ consensus-readiness boundary:
 
 This first standalone version is a contract library. It does not yet implement a
 complete Raft consensus runtime. It now also owns the stable storage, transport,
-status, and metric contract surface that TemporalStore can implement from its
-data-node and metaserver runtime code. The remaining roadmap is tracked in
+status, metric, and safety-policy contract surface that TemporalStore can
+implement from its data-node and metaserver runtime code. The remaining roadmap is tracked in
 [`docs/gap_plan.md`](docs/gap_plan.md).
 
 ## Test

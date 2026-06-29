@@ -195,6 +195,147 @@ pub struct RustRaftStatusSnapshot {
     pub peers: Vec<RustRaftPeerStatus>,
 }
 
+impl RustRaftStatusSnapshot {
+    pub fn apply_lag(&self) -> u64 {
+        self.commit_index.saturating_sub(self.applied_index)
+    }
+
+    pub fn peer(&self, node_id: RustRaftNodeId) -> Option<&RustRaftPeerStatus> {
+        self.peers.iter().find(|peer| peer.node_id == node_id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftReadSafetyDecision {
+    pub safe: bool,
+    pub read_index: RustRaftLogIndex,
+    pub lease_read: bool,
+    pub reason: String,
+}
+
+pub fn rustraft_read_safety_decision(
+    status: &RustRaftStatusSnapshot,
+    request: &RustRaftReadIndexRequest,
+) -> RustRaftReadSafetyDecision {
+    if !matches!(status.role, RustRaftRole::Leader | RustRaftRole::Follower) {
+        return RustRaftReadSafetyDecision {
+            safe: false,
+            read_index: status.commit_index,
+            lease_read: false,
+            reason: "role_not_readable".to_string(),
+        };
+    }
+    if status.commit_index < request.min_commit_index {
+        return RustRaftReadSafetyDecision {
+            safe: false,
+            read_index: status.commit_index,
+            lease_read: false,
+            reason: "commit_index_too_low".to_string(),
+        };
+    }
+    if status.applied_index < request.min_commit_index {
+        return RustRaftReadSafetyDecision {
+            safe: false,
+            read_index: status.applied_index,
+            lease_read: false,
+            reason: "apply_lag_too_high".to_string(),
+        };
+    }
+    if status.last_snapshot_index > request.min_commit_index {
+        return RustRaftReadSafetyDecision {
+            safe: false,
+            read_index: status.last_snapshot_index,
+            lease_read: false,
+            reason: "read_before_snapshot_floor".to_string(),
+        };
+    }
+    RustRaftReadSafetyDecision {
+        safe: true,
+        read_index: request.min_commit_index,
+        lease_read: request.allow_lease_read && matches!(status.role, RustRaftRole::Leader),
+        reason: "read_safe".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftLearnerPromotionDecision {
+    pub promotable: bool,
+    pub reason: String,
+}
+
+pub fn rustraft_learner_promotion_decision(
+    status: &RustRaftStatusSnapshot,
+    learner_id: RustRaftNodeId,
+    max_lag: u64,
+) -> RustRaftLearnerPromotionDecision {
+    let Some(peer) = status.peer(learner_id) else {
+        return RustRaftLearnerPromotionDecision {
+            promotable: false,
+            reason: "peer_not_found".to_string(),
+        };
+    };
+    if !peer.learner {
+        return RustRaftLearnerPromotionDecision {
+            promotable: false,
+            reason: "peer_not_learner".to_string(),
+        };
+    }
+    if !peer.healthy {
+        return RustRaftLearnerPromotionDecision {
+            promotable: false,
+            reason: "peer_unhealthy".to_string(),
+        };
+    }
+    if peer.lag > max_lag || peer.matched.saturating_add(max_lag) < status.commit_index {
+        return RustRaftLearnerPromotionDecision {
+            promotable: false,
+            reason: "learner_lag_too_high".to_string(),
+        };
+    }
+    RustRaftLearnerPromotionDecision {
+        promotable: true,
+        reason: "learner_caught_up".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftAppendSafetyDecision {
+    pub accepted: bool,
+    pub reason: String,
+}
+
+pub fn rustraft_append_safety_decision(
+    snapshot_floor: RustRaftLogIndex,
+    first_retained_log_index: RustRaftLogIndex,
+    request: &RustRaftAppendEntriesRequest,
+) -> RustRaftAppendSafetyDecision {
+    let prev_index = request
+        .prev_log_id
+        .as_ref()
+        .map(|log| log.index)
+        .unwrap_or(0);
+    if prev_index != 0 && prev_index < snapshot_floor {
+        return RustRaftAppendSafetyDecision {
+            accepted: false,
+            reason: "prev_log_before_snapshot_floor".to_string(),
+        };
+    }
+    if let Some(entry) = request
+        .entries
+        .iter()
+        .find(|entry| entry.log_id.index < first_retained_log_index)
+    {
+        return RustRaftAppendSafetyDecision {
+            accepted: false,
+            reason: format!("entry_compacted:{}", entry.log_id.index),
+        };
+    }
+    RustRaftAppendSafetyDecision {
+        accepted: true,
+        reason: "append_safe".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftMetricNames {
     pub leader_changes_total: String,
@@ -841,5 +982,125 @@ mod tests {
             .unwrap();
         assert!(read.safe);
         assert_eq!(read.read_index, 12);
+    }
+
+    #[test]
+    fn read_safety_policy_rejects_unapplied_or_compacted_reads() {
+        let status = RustRaftStatusSnapshot {
+            group_id: 1,
+            node_id: 1,
+            role: RustRaftRole::Leader,
+            term: 4,
+            leader_id: Some(1),
+            commit_index: 20,
+            applied_index: 18,
+            last_log_index: 20,
+            last_snapshot_index: 9,
+            peers: Vec::new(),
+        };
+        assert_eq!(status.apply_lag(), 2);
+
+        let lagging = rustraft_read_safety_decision(
+            &status,
+            &RustRaftReadIndexRequest {
+                group_id: 1,
+                requester_id: 1,
+                min_commit_index: 19,
+                allow_lease_read: true,
+            },
+        );
+        assert!(!lagging.safe);
+        assert_eq!(lagging.reason, "apply_lag_too_high");
+
+        let compacted = rustraft_read_safety_decision(
+            &status,
+            &RustRaftReadIndexRequest {
+                group_id: 1,
+                requester_id: 1,
+                min_commit_index: 8,
+                allow_lease_read: true,
+            },
+        );
+        assert!(!compacted.safe);
+        assert_eq!(compacted.reason, "read_before_snapshot_floor");
+
+        let safe = rustraft_read_safety_decision(
+            &status,
+            &RustRaftReadIndexRequest {
+                group_id: 1,
+                requester_id: 1,
+                min_commit_index: 18,
+                allow_lease_read: true,
+            },
+        );
+        assert!(safe.safe);
+        assert!(safe.lease_read);
+    }
+
+    #[test]
+    fn learner_promotion_requires_health_and_low_lag() {
+        let status = RustRaftStatusSnapshot {
+            group_id: 1,
+            node_id: 1,
+            role: RustRaftRole::Leader,
+            term: 4,
+            leader_id: Some(1),
+            commit_index: 20,
+            applied_index: 20,
+            last_log_index: 20,
+            last_snapshot_index: 9,
+            peers: vec![RustRaftPeerStatus {
+                node_id: 3,
+                matched: 19,
+                next_index: 20,
+                learner: true,
+                healthy: true,
+                lag: 1,
+            }],
+        };
+
+        let ok = rustraft_learner_promotion_decision(&status, 3, 2);
+        assert!(ok.promotable);
+        assert_eq!(ok.reason, "learner_caught_up");
+
+        let too_lagged = rustraft_learner_promotion_decision(&status, 3, 0);
+        assert!(!too_lagged.promotable);
+        assert_eq!(too_lagged.reason, "learner_lag_too_high");
+    }
+
+    #[test]
+    fn append_safety_rejects_entries_before_snapshot_or_compaction_floor() {
+        let safe_request = RustRaftAppendEntriesRequest {
+            group_id: 1,
+            term: 5,
+            leader_id: 1,
+            prev_log_id: Some(RustRaftLogId { term: 4, index: 10 }),
+            entries: vec![RustRaftLogEntry {
+                log_id: RustRaftLogId { term: 5, index: 11 },
+                payload: b"write".to_vec(),
+            }],
+            leader_commit: 11,
+        };
+        assert!(rustraft_append_safety_decision(9, 10, &safe_request).accepted);
+
+        let stale_prev = RustRaftAppendEntriesRequest {
+            prev_log_id: Some(RustRaftLogId { term: 3, index: 8 }),
+            ..safe_request.clone()
+        };
+        let decision = rustraft_append_safety_decision(9, 10, &stale_prev);
+        assert!(!decision.accepted);
+        assert_eq!(decision.reason, "prev_log_before_snapshot_floor");
+
+        let compacted_entry = RustRaftAppendEntriesRequest {
+            prev_log_id: Some(RustRaftLogId { term: 4, index: 10 }),
+            entries: vec![RustRaftLogEntry {
+                log_id: RustRaftLogId { term: 4, index: 9 },
+                payload: b"old".to_vec(),
+            }],
+            ..safe_request
+        };
+        let decision = rustraft_append_safety_decision(8, 10, &compacted_entry);
+        assert!(!decision.accepted);
+        assert_eq!(decision.reason, "entry_compacted:9");
     }
 }
