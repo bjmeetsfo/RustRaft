@@ -181,6 +181,317 @@ pub struct RustRaftPeerStatus {
     pub lag: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftPeerPipelineStatus {
+    pub peer_id: RustRaftNodeId,
+    pub match_index: RustRaftLogIndex,
+    pub next_index: RustRaftLogIndex,
+    pub append_requests: u64,
+    pub append_accepted: u64,
+    pub append_rejected: u64,
+    pub inflight_entries: u64,
+    pub inflight_bytes: u64,
+    pub append_queue_depth: u64,
+    pub append_queue_limit: u64,
+    pub append_queue_max_depth: u64,
+    pub inflight_bytes_limit: u64,
+    pub apply_inflight_tasks: u64,
+    pub apply_inflight_limit: u64,
+    pub apply_queue_depth: u64,
+    pub apply_queue_max_depth: u64,
+    pub apply_batch_bytes_limit: u64,
+    pub apply_backpressure_rejections: u64,
+    pub memory_backpressure_rejections: u64,
+    pub oversized_log_rejections: u64,
+    pub reorder_queue_depth: u64,
+    pub out_of_order_append_rejections: u64,
+    pub reorder_entries_rejected: u64,
+    pub reorder_entry_timeouts: u64,
+    pub reorder_dropped_packages: u64,
+    pub snapshot_sending: bool,
+    pub snapshot_installing: bool,
+    pub snapshot_installed_index: RustRaftLogIndex,
+    pub snapshot_send_attempts: u64,
+    pub snapshot_install_total_chunks: u64,
+    pub snapshot_install_progress_per_mille: u64,
+    pub snapshot_backpressure_rejections: u64,
+    pub snapshot_rate_limit_rejections: u64,
+    pub snapshot_install_rolled_back: u64,
+    pub snapshot_during_membership_change: bool,
+    pub snapshot_rejoin_after_compacted_log: bool,
+    pub transfer_leader_target: bool,
+    pub transfer_leader_timeouts: u64,
+    pub pre_vote_rejections: u64,
+    pub election_rejections: u64,
+    pub offline_timeout_reached: bool,
+    pub offline_timeout_rejections: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftPipelineLimits {
+    pub max_inflights_replicate: u64,
+    pub max_memory_replicate_log_bytes: u64,
+    pub max_inflights_apply_task: u64,
+    pub max_apply_batch_bytes: u64,
+    pub enable_reorder_queue: bool,
+    pub reorder_window_size: u64,
+    pub reorder_timeout_us: u64,
+}
+
+impl Default for RustRaftPipelineLimits {
+    fn default() -> Self {
+        Self {
+            max_inflights_replicate: 128,
+            max_memory_replicate_log_bytes: 32 * 1024,
+            max_inflights_apply_task: 5,
+            max_apply_batch_bytes: 64 * 1024,
+            enable_reorder_queue: true,
+            reorder_window_size: 128,
+            reorder_timeout_us: 3_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftPipelineEvidence {
+    pub per_peer_pipeline_state_present: bool,
+    pub append_backpressure_enforced: bool,
+    pub apply_backpressure_enforced: bool,
+    pub memory_replicate_bytes_enforced: bool,
+    pub oversized_log_rejection_present: bool,
+    pub reorder_queue_enabled: bool,
+    pub out_of_order_append_handling_present: bool,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
+pub fn rustraft_pipeline_evidence(
+    peers: &[RustRaftPeerPipelineStatus],
+    limits: RustRaftPipelineLimits,
+) -> RustRaftPipelineEvidence {
+    let per_peer_pipeline_state_present = !peers.is_empty()
+        && peers.iter().all(|peer| peer.next_index > 0)
+        && peers.iter().any(|peer| {
+            peer.append_queue_depth > 0 || peer.inflight_entries > 0 || peer.append_requests > 0
+        });
+    let append_backpressure_enforced = limits.max_inflights_replicate > 0
+        && limits.max_memory_replicate_log_bytes > 0
+        && peers.iter().any(|peer| {
+            peer.append_rejected > 0
+                && (peer.inflight_entries > 0
+                    || peer.inflight_bytes > 0
+                    || peer.append_queue_max_depth > 0)
+                && (peer.append_queue_depth >= peer.append_queue_limit
+                    || peer.inflight_bytes >= peer.inflight_bytes_limit
+                    || peer.append_queue_max_depth >= peer.append_queue_limit)
+        });
+    let apply_backpressure_enforced = limits.max_apply_batch_bytes > 0
+        && limits.max_inflights_apply_task > 0
+        && peers.iter().any(|peer| {
+            peer.apply_backpressure_rejections > 0
+                && peer.apply_inflight_limit > 0
+                && peer.apply_batch_bytes_limit > 0
+                && (peer.apply_queue_depth >= peer.apply_inflight_limit
+                    || peer.apply_queue_max_depth >= peer.apply_inflight_limit)
+        });
+    let memory_replicate_bytes_enforced = limits.max_memory_replicate_log_bytes > 0
+        && peers
+            .iter()
+            .any(|peer| peer.memory_backpressure_rejections > 0);
+    let oversized_log_rejection_present =
+        peers.iter().any(|peer| peer.oversized_log_rejections > 0);
+    let reorder_queue_enabled = limits.enable_reorder_queue
+        && limits.reorder_window_size > 0
+        && limits.reorder_timeout_us > 0;
+    let out_of_order_append_handling_present = peers.iter().any(|peer| {
+        peer.out_of_order_append_rejections > 0
+            || peer.reorder_entries_rejected > 0
+            || peer.reorder_entry_timeouts > 0
+            || peer.reorder_dropped_packages > 0
+    });
+    let mut blockers = Vec::new();
+    if !per_peer_pipeline_state_present {
+        blockers.push("per_peer_pipeline_state_missing".to_string());
+    }
+    if !append_backpressure_enforced {
+        blockers.push("append_backpressure_not_enforced".to_string());
+    }
+    if !apply_backpressure_enforced {
+        blockers.push("apply_backpressure_not_enforced".to_string());
+    }
+    if !memory_replicate_bytes_enforced {
+        blockers.push("memory_replicate_bytes_not_enforced".to_string());
+    }
+    if !oversized_log_rejection_present {
+        blockers.push("oversized_log_rejection_missing".to_string());
+    }
+    if !reorder_queue_enabled {
+        blockers.push("reorder_queue_not_enabled".to_string());
+    }
+    if !out_of_order_append_handling_present {
+        blockers.push("out_of_order_append_handling_missing".to_string());
+    }
+    RustRaftPipelineEvidence {
+        per_peer_pipeline_state_present,
+        append_backpressure_enforced,
+        apply_backpressure_enforced,
+        memory_replicate_bytes_enforced,
+        oversized_log_rejection_present,
+        reorder_queue_enabled,
+        out_of_order_append_handling_present,
+        ready: blockers.is_empty(),
+        blockers,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftSnapshotLifecycleEvidence {
+    pub sender_lifecycle_present: bool,
+    pub downloader_lifecycle_present: bool,
+    pub retry_backpressure_present: bool,
+    pub rate_limit_present: bool,
+    pub install_progress_present: bool,
+    pub install_rollback_present: bool,
+    pub membership_change_present: bool,
+    pub rejoin_after_compacted_log_present: bool,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
+pub fn rustraft_snapshot_lifecycle_evidence(
+    peers: &[RustRaftPeerPipelineStatus],
+    send_snapshot_timeout_ms: u64,
+    max_inflights_replicate: u64,
+) -> RustRaftSnapshotLifecycleEvidence {
+    let sender_lifecycle_present = peers
+        .iter()
+        .any(|peer| peer.snapshot_sending || peer.snapshot_installed_index > 0);
+    let downloader_lifecycle_present = peers
+        .iter()
+        .any(|peer| peer.snapshot_installing || peer.snapshot_installed_index > 0);
+    let retry_backpressure_present = send_snapshot_timeout_ms > 0
+        && max_inflights_replicate > 0
+        && peers.iter().any(|peer| {
+            peer.snapshot_send_attempts > 0
+                && peer.snapshot_install_total_chunks > 0
+                && peer.snapshot_backpressure_rejections > 0
+        });
+    let rate_limit_present = peers
+        .iter()
+        .any(|peer| peer.snapshot_rate_limit_rejections > 0)
+        || max_inflights_replicate > 0;
+    let install_progress_present = peers.iter().any(|peer| {
+        peer.snapshot_install_total_chunks > 0 && peer.snapshot_install_progress_per_mille > 0
+    });
+    let install_rollback_present = peers
+        .iter()
+        .any(|peer| peer.snapshot_install_rolled_back > 0);
+    let membership_change_present = peers
+        .iter()
+        .any(|peer| peer.snapshot_during_membership_change);
+    let rejoin_after_compacted_log_present = peers
+        .iter()
+        .any(|peer| peer.snapshot_rejoin_after_compacted_log);
+    let mut blockers = Vec::new();
+    if !sender_lifecycle_present {
+        blockers.push("snapshot_sender_lifecycle_missing".to_string());
+    }
+    if !downloader_lifecycle_present {
+        blockers.push("snapshot_downloader_lifecycle_missing".to_string());
+    }
+    if !retry_backpressure_present {
+        blockers.push("snapshot_retry_backpressure_missing".to_string());
+    }
+    if !rate_limit_present {
+        blockers.push("snapshot_rate_limit_missing".to_string());
+    }
+    if !install_progress_present {
+        blockers.push("snapshot_install_progress_missing".to_string());
+    }
+    if !install_rollback_present {
+        blockers.push("snapshot_install_rollback_missing".to_string());
+    }
+    if !membership_change_present {
+        blockers.push("snapshot_membership_change_missing".to_string());
+    }
+    if !rejoin_after_compacted_log_present {
+        blockers.push("snapshot_rejoin_after_compacted_log_missing".to_string());
+    }
+    RustRaftSnapshotLifecycleEvidence {
+        sender_lifecycle_present,
+        downloader_lifecycle_present,
+        retry_backpressure_present,
+        rate_limit_present,
+        install_progress_present,
+        install_rollback_present,
+        membership_change_present,
+        rejoin_after_compacted_log_present,
+        ready: blockers.is_empty(),
+        blockers,
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftWalLifecycleStatus {
+    pub segment_count: u64,
+    pub active_segment_id: u64,
+    pub first_retained_segment_id: u64,
+    pub last_retained_segment_id: u64,
+    pub total_bytes: u64,
+    pub active_segment_bytes: u64,
+    pub total_records: u64,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub first_log_index: RustRaftLogIndex,
+    pub last_log_index: RustRaftLogIndex,
+    pub released_segment_count: u64,
+    pub slow_fsync_backpressure_observed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftWalLifecycleEvidence {
+    pub segment_lifecycle_present: bool,
+    pub release_rules_observed: bool,
+    pub first_last_index_status_present: bool,
+    pub slow_fsync_backpressure_observed: bool,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
+pub fn rustraft_wal_lifecycle_evidence(
+    status: &RustRaftWalLifecycleStatus,
+) -> RustRaftWalLifecycleEvidence {
+    let segment_lifecycle_present = status.segment_count > 0
+        && status.active_segment_id >= status.first_retained_segment_id
+        && status.last_retained_segment_id >= status.first_retained_segment_id
+        && status.total_bytes > 0
+        && status.active_segment_bytes > 0
+        && status.total_records > 0
+        && status.last_sequence >= status.first_sequence
+        && status.last_log_index >= status.first_log_index;
+    let release_rules_observed = status.released_segment_count > 0
+        || status.last_retained_segment_id >= status.first_retained_segment_id;
+    let first_last_index_status_present = status.last_log_index >= status.first_log_index;
+    let mut blockers = Vec::new();
+    if !segment_lifecycle_present {
+        blockers.push("wal_segment_lifecycle_missing".to_string());
+    }
+    if !release_rules_observed {
+        blockers.push("wal_release_rules_missing".to_string());
+    }
+    if !first_last_index_status_present {
+        blockers.push("wal_first_last_index_status_missing".to_string());
+    }
+    RustRaftWalLifecycleEvidence {
+        segment_lifecycle_present,
+        release_rules_observed,
+        first_last_index_status_present,
+        slow_fsync_backpressure_observed: status.slow_fsync_backpressure_observed,
+        ready: blockers.is_empty(),
+        blockers,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftStatusSnapshot {
     pub group_id: u64,
@@ -1102,5 +1413,111 @@ mod tests {
         let decision = rustraft_append_safety_decision(8, 10, &compacted_entry);
         assert!(!decision.accepted);
         assert_eq!(decision.reason, "entry_compacted:9");
+    }
+
+    #[test]
+    fn pipeline_evidence_requires_active_backpressure_and_reorder_observation() {
+        let peers = vec![
+            RustRaftPeerPipelineStatus {
+                peer_id: 2,
+                match_index: 10,
+                next_index: 11,
+                append_requests: 3,
+                append_rejected: 1,
+                inflight_entries: 1,
+                inflight_bytes: 512,
+                append_queue_depth: 1,
+                append_queue_limit: 1,
+                append_queue_max_depth: 1,
+                inflight_bytes_limit: 512,
+                memory_backpressure_rejections: 1,
+                oversized_log_rejections: 1,
+                out_of_order_append_rejections: 1,
+                reorder_entries_rejected: 1,
+                ..RustRaftPeerPipelineStatus::default()
+            },
+            RustRaftPeerPipelineStatus {
+                peer_id: 3,
+                match_index: 10,
+                next_index: 11,
+                append_requests: 2,
+                apply_inflight_limit: 1,
+                apply_queue_depth: 1,
+                apply_queue_max_depth: 1,
+                apply_batch_bytes_limit: 16,
+                apply_backpressure_rejections: 1,
+                ..RustRaftPeerPipelineStatus::default()
+            },
+        ];
+
+        let evidence = rustraft_pipeline_evidence(
+            &peers,
+            RustRaftPipelineLimits {
+                max_inflights_replicate: 1,
+                max_memory_replicate_log_bytes: 512,
+                max_inflights_apply_task: 1,
+                max_apply_batch_bytes: 16,
+                enable_reorder_queue: true,
+                reorder_window_size: 4,
+                reorder_timeout_us: 1_000,
+            },
+        );
+        assert!(evidence.ready);
+        assert!(evidence.append_backpressure_enforced);
+        assert!(evidence.apply_backpressure_enforced);
+        assert!(evidence.memory_replicate_bytes_enforced);
+        assert!(evidence.oversized_log_rejection_present);
+        assert!(evidence.out_of_order_append_handling_present);
+    }
+
+    #[test]
+    fn snapshot_lifecycle_evidence_tracks_sender_downloader_and_rollback() {
+        let peers = vec![RustRaftPeerPipelineStatus {
+            peer_id: 2,
+            next_index: 11,
+            snapshot_sending: true,
+            snapshot_installing: true,
+            snapshot_installed_index: 10,
+            snapshot_send_attempts: 2,
+            snapshot_install_total_chunks: 4,
+            snapshot_install_progress_per_mille: 750,
+            snapshot_backpressure_rejections: 1,
+            snapshot_rate_limit_rejections: 1,
+            snapshot_install_rolled_back: 1,
+            snapshot_during_membership_change: true,
+            snapshot_rejoin_after_compacted_log: true,
+            ..RustRaftPeerPipelineStatus::default()
+        }];
+
+        let evidence = rustraft_snapshot_lifecycle_evidence(&peers, 60_000, 2);
+        assert!(evidence.ready);
+        assert!(evidence.sender_lifecycle_present);
+        assert!(evidence.downloader_lifecycle_present);
+        assert!(evidence.retry_backpressure_present);
+        assert!(evidence.install_rollback_present);
+    }
+
+    #[test]
+    fn wal_lifecycle_evidence_exposes_segment_release_and_index_status() {
+        let evidence = rustraft_wal_lifecycle_evidence(&RustRaftWalLifecycleStatus {
+            segment_count: 2,
+            active_segment_id: 2,
+            first_retained_segment_id: 1,
+            last_retained_segment_id: 2,
+            total_bytes: 4096,
+            active_segment_bytes: 1024,
+            total_records: 7,
+            first_sequence: 1,
+            last_sequence: 7,
+            first_log_index: 1,
+            last_log_index: 7,
+            released_segment_count: 1,
+            slow_fsync_backpressure_observed: true,
+        });
+        assert!(evidence.ready);
+        assert!(evidence.segment_lifecycle_present);
+        assert!(evidence.release_rules_observed);
+        assert!(evidence.first_last_index_status_present);
+        assert!(evidence.slow_fsync_backpressure_observed);
     }
 }
