@@ -16,6 +16,7 @@ and observable apply lag.
   - `RustRaftSemanticRequirement`
   - `RustRaftParityContract`
   - `RustRaftParityReport`
+  - `RustRaftProductionStatus`
   - `RustRaftReadinessEvidence`
   - `RustRaftReadinessSnapshot`
   - `rustraft_parity_contract`
@@ -25,6 +26,32 @@ and observable apply lag.
   report.
 - Shared corpus and Rust tests use `raft_rustraft_*` case names.
 - OpenRaft is not part of the RustRaft contract.
+- Production readiness is fail-closed. A report is `blocked` when any required
+  semantic is missing, and `production_blockers` carries category-qualified
+  blocker ids such as `safety:compacted_entry_rejection` or
+  `durability:storage_apply_fence`.
+
+## Production Readiness Gates
+
+RustRaft should only be treated as production-ready when all of these categories
+are satisfied by TemporalStore data-node and metaserver evidence:
+
+| Category | Required Evidence |
+|---|---|
+| Safety | leader write authority, snapshot floor/log matching, compacted entry rejection, metaserver snapshot-floor election safety |
+| Durability | storage apply fence tied to durable apply index state |
+| Transport | AppendEntries, Vote, InstallSnapshot, and ReadIndex contracts |
+| Snapshot | trigger policy, apply fence, snapshot plus tail catch-up |
+| Membership | learner catch-up before promotion and metaserver-owned membership workflow |
+| Observability | operator status for leader, term, commit, apply, peer state, and lag |
+
+The intended CI rule is:
+
+```text
+if production_status != production_ready:
+  block production Raft claim
+  print production_blockers
+```
 
 ## Remaining Gaps
 

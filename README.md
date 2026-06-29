@@ -11,6 +11,7 @@ metaserver integration.
 - `RustRaftSemanticRequirement`
 - `RustRaftParityContract`
 - `RustRaftParityReport`
+- `RustRaftProductionStatus`
 - `RustRaftReadinessEvidence`
 - `RustRaftReadinessSnapshot`
 - `rustraft_parity_contract`
@@ -20,6 +21,22 @@ The crate is independent of OpenRaft types. TemporalStore converts its internal
 readiness evidence into `RustRaftReadinessSnapshot` or implements
 `RustRaftReadinessEvidence`, then asks this crate to build a conservative parity
 report.
+
+## Production Readiness Status
+
+`rustraft_parity_report` returns both a compatibility boolean and an explicit
+production status:
+
+- `blocked`: at least one required safety, durability, transport, snapshot,
+  membership, or observability requirement is missing.
+- `feature_correct`: the contract shape is usable, but the runtime evidence is
+  not enough to claim production readiness.
+- `production_ready`: every required semantic is present, OpenRaft is absent
+  from the public contract, and the TemporalRaft runtime is available.
+
+Reports include `production_blockers` such as
+`durability:storage_apply_fence`, making missing production evidence easy to
+surface in TemporalStore readiness gates and CI.
 
 ## Why It Lives Separately
 
