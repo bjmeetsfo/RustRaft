@@ -1,5 +1,5 @@
 use rustraft::{
-    rustraft_parity_report_from_snapshot, rustraft_read_safety_decision, RustRaftProductionStatus,
+    rustraft_parity_report, rustraft_read_safety_decision, RustRaftProductionStatus,
     RustRaftReadIndexRequest, RustRaftReadinessSnapshot, RustRaftRole, RustRaftStatusSnapshot,
 };
 
@@ -20,7 +20,7 @@ fn production_readiness_snapshot_reports_ready_when_all_evidence_is_present() {
         metaserver_membership_workflow_present: true,
     };
 
-    let report = rustraft_parity_report_from_snapshot(&readiness);
+    let report = rustraft_parity_report(&readiness);
     assert!(report.ready);
     assert!(report.missing.is_empty());
     assert_eq!(
@@ -30,7 +30,7 @@ fn production_readiness_snapshot_reports_ready_when_all_evidence_is_present() {
 }
 
 #[test]
-fn read_safety_example_rejects_reads_behind_snapshot_floor() {
+fn read_safety_example_rejects_reads_ahead_of_applied_index() {
     let status = RustRaftStatusSnapshot {
         group_id: 7,
         node_id: 1,
@@ -49,11 +49,11 @@ fn read_safety_example_rejects_reads_behind_snapshot_floor() {
         &RustRaftReadIndexRequest {
             group_id: 7,
             requester_id: 1,
-            min_commit_index: 29,
+            min_commit_index: 43,
             allow_lease_read: true,
         },
     );
 
     assert!(!decision.safe);
-    assert_eq!(decision.reason, "read_before_snapshot_floor");
+    assert_eq!(decision.reason, "apply_lag");
 }

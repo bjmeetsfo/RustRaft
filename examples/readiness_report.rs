@@ -1,6 +1,4 @@
-use rustraft::{
-    rustraft_parity_report_from_snapshot, RustRaftProductionStatus, RustRaftReadinessSnapshot,
-};
+use rustraft::{rustraft_parity_report, RustRaftProductionStatus, RustRaftReadinessSnapshot};
 
 fn main() {
     let readiness = RustRaftReadinessSnapshot {
@@ -18,7 +16,7 @@ fn main() {
         metaserver_membership_workflow_present: true,
     };
 
-    let report = rustraft_parity_report_from_snapshot(&readiness);
+    let report = rustraft_parity_report(&readiness);
     assert_eq!(
         report.production_status,
         RustRaftProductionStatus::ProductionReady

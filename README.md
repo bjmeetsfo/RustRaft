@@ -6,11 +6,15 @@ for RustRaft semantic requirements, readiness evidence, and parity reports,
 while TemporalStore owns the storage runtime, data-node integration, and
 metaserver integration.
 
+License: Apache-2.0.
+
 ## What This Crate Provides
 
 - `RustRaftSemanticRequirement`
 - `RustRaftParityContract`
 - `RustRaftParityReport`
+- `RustRaftProductionReadinessInput`
+- `RustRaftProductionReadinessReport`
 - `RustRaftProductionStatus`
 - `RustRaftStorage`
 - `RustRaftTransport`
@@ -23,13 +27,14 @@ metaserver integration.
 - `RustRaftReadinessSnapshot`
 - `rustraft_parity_contract`
 - `rustraft_parity_report`
+- `rustraft_production_readiness_report`
 - `rustraft_public_api_contract`
 - `rustraft_metric_names`
 
-The crate is independent of OpenRaft types. TemporalStore converts its internal
-readiness evidence into `RustRaftReadinessSnapshot` or implements
-`RustRaftReadinessEvidence`, then asks this crate to build a conservative parity
-report.
+The crate is OpenRaft-free and independent of OpenRaft types. TemporalStore
+converts its internal readiness evidence into `RustRaftReadinessSnapshot` or
+implements `RustRaftReadinessEvidence`, then asks this crate to build a
+conservative parity report.
 
 ## Production Readiness Status
 
@@ -46,6 +51,10 @@ production status:
 Reports include `production_blockers` such as
 `durability:storage_apply_fence`, making missing production evidence easy to
 surface in TemporalStore readiness gates and CI.
+
+`rustraft_production_readiness_report` is the fail-closed deployment gate. It
+wraps the semantic parity report with runtime evidence for peer pipeline,
+snapshot lifecycle, WAL lifecycle, data-node rollout, and metaserver rollout.
 
 ## Why It Lives Separately
 

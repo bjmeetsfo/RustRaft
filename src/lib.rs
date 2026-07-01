@@ -1,191 +1,150 @@
-//! RustRaft readiness and parity contract types.
+#![forbid(unsafe_code)]
+//! RustRaft is the TemporalStore-owned Raft contract and readiness library.
 //!
-//! This crate deliberately keeps the public RustRaft contract separate from
-//! TemporalStore's data-node and metaserver runtime code. Runtime crates provide
-//! readiness evidence; this crate turns that evidence into a stable parity
-//! contract and report.
+//! The crate intentionally focuses on portable consensus-facing contracts:
+//! request/response types, storage and transport traits, safety decisions,
+//! metrics names, and fail-closed production readiness reports. It does not run
+//! the TemporalStore data-node or metaserver by itself. Those runtimes consume
+//! this crate and attach live evidence for pipeline, WAL, snapshot, membership,
+//! failover, and process-rollout behavior.
+//!
+//! Typical integration flow:
+//!
+//! 1. Build a [`RustRaftReadinessSnapshot`] from the serving runtime.
+//! 2. Call [`rustraft_parity_report`] for semantic contract readiness.
+//! 3. Attach live runtime evidence to [`RustRaftProductionReadinessInput`].
+//! 4. Call [`rustraft_production_readiness_report`] and block production claims
+//!    unless the report is ready.
+//!
+//! The public API is OpenRaft-free by design. Compatibility with existing
+//! TemporalStore deployment semantics is expressed through RustRaft-owned types
+//! and tests instead of upstream-specific type aliases.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-pub type RustRaftNodeId = u64;
-pub type RustRaftTerm = u64;
-pub type RustRaftLogIndex = u64;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftLogId {
-    pub term: RustRaftTerm,
-    pub index: RustRaftLogIndex,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftHardState {
-    pub current_term: RustRaftTerm,
-    pub voted_for: Option<RustRaftNodeId>,
-    pub committed: RustRaftLogIndex,
-    pub applied: RustRaftLogIndex,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustRaftRequirementCategory {
+    Safety,
+    Durability,
+    Observability,
+    Transport,
+    Membership,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftLogEntry {
-    pub log_id: RustRaftLogId,
-    pub payload: Vec<u8>,
+pub struct RustRaftSemanticRequirement {
+    pub id: String,
+    pub category: RustRaftRequirementCategory,
+    pub readiness_field: String,
+    pub required_for_production: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftSnapshotMeta {
-    pub snapshot_id: String,
-    pub last_included: RustRaftLogId,
-    pub membership_generation: u64,
-    pub checksum: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftSnapshotChunk {
-    pub meta: RustRaftSnapshotMeta,
-    pub offset: u64,
-    pub bytes: Vec<u8>,
-    pub done: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftAppendEntriesRequest {
-    pub group_id: u64,
-    pub term: RustRaftTerm,
-    pub leader_id: RustRaftNodeId,
-    pub prev_log_id: Option<RustRaftLogId>,
-    pub entries: Vec<RustRaftLogEntry>,
-    pub leader_commit: RustRaftLogIndex,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftAppendEntriesResponse {
-    pub term: RustRaftTerm,
-    pub success: bool,
-    pub match_index: RustRaftLogIndex,
-    pub conflict_index: Option<RustRaftLogIndex>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftVoteRequest {
-    pub group_id: u64,
-    pub term: RustRaftTerm,
-    pub candidate_id: RustRaftNodeId,
-    pub last_log_id: Option<RustRaftLogId>,
-    pub pre_vote: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftVoteResponse {
-    pub term: RustRaftTerm,
-    pub vote_granted: bool,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftInstallSnapshotRequest {
-    pub group_id: u64,
-    pub term: RustRaftTerm,
-    pub leader_id: RustRaftNodeId,
-    pub chunk: RustRaftSnapshotChunk,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftInstallSnapshotResponse {
-    pub term: RustRaftTerm,
-    pub accepted: bool,
-    pub next_offset: u64,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftReadIndexRequest {
-    pub group_id: u64,
-    pub requester_id: RustRaftNodeId,
-    pub min_commit_index: RustRaftLogIndex,
-    pub allow_lease_read: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftReadIndexResponse {
-    pub term: RustRaftTerm,
-    pub read_index: RustRaftLogIndex,
-    pub lease_read: bool,
-    pub safe: bool,
-    pub reason: String,
-}
-
-pub trait RustRaftStorage {
-    type Error;
-
-    fn append_entries(&mut self, entries: &[RustRaftLogEntry]) -> Result<(), Self::Error>;
-    fn read_entries(
-        &self,
-        start: RustRaftLogIndex,
-        end: RustRaftLogIndex,
-    ) -> Result<Vec<RustRaftLogEntry>, Self::Error>;
-    fn save_hard_state(&mut self, hard_state: &RustRaftHardState) -> Result<(), Self::Error>;
-    fn load_hard_state(&self) -> Result<RustRaftHardState, Self::Error>;
-    fn save_snapshot(
-        &mut self,
-        meta: &RustRaftSnapshotMeta,
-        bytes: &[u8],
-    ) -> Result<(), Self::Error>;
-    fn load_snapshot(&self, snapshot_id: &str) -> Result<Vec<u8>, Self::Error>;
-    fn tombstone_compacted_entries(
-        &mut self,
-        compacted_through: RustRaftLogIndex,
-    ) -> Result<(), Self::Error>;
-}
-
-pub trait RustRaftTransport {
-    type Error;
-
-    fn append_entries(
-        &self,
-        target: RustRaftNodeId,
-        request: RustRaftAppendEntriesRequest,
-    ) -> Result<RustRaftAppendEntriesResponse, Self::Error>;
-    fn vote(
-        &self,
-        target: RustRaftNodeId,
-        request: RustRaftVoteRequest,
-    ) -> Result<RustRaftVoteResponse, Self::Error>;
-    fn install_snapshot(
-        &self,
-        target: RustRaftNodeId,
-        request: RustRaftInstallSnapshotRequest,
-    ) -> Result<RustRaftInstallSnapshotResponse, Self::Error>;
-    fn read_index(
-        &self,
-        target: RustRaftNodeId,
-        request: RustRaftReadIndexRequest,
-    ) -> Result<RustRaftReadIndexResponse, Self::Error>;
+pub struct RustRaftParityContract {
+    pub library_name: String,
+    pub consensus_backend_boundary: String,
+    pub openraft_dependency_removed: bool,
+    pub requirements: Vec<RustRaftSemanticRequirement>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RustRaftRole {
-    Leader,
-    Follower,
-    Candidate,
-    Learner,
+pub enum RustRaftProductionStatus {
+    ProductionReady,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftPeerStatus {
-    pub node_id: RustRaftNodeId,
-    pub matched: RustRaftLogIndex,
-    pub next_index: RustRaftLogIndex,
-    pub learner: bool,
-    pub healthy: bool,
-    pub lag: u64,
+pub struct RustRaftParityReport {
+    pub contract: RustRaftParityContract,
+    pub ready: bool,
+    pub production_status: RustRaftProductionStatus,
+    pub satisfied: Vec<String>,
+    pub missing: Vec<String>,
+    pub production_blockers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftProductionReadinessInput {
+    pub readiness: RustRaftReadinessSnapshot,
+    #[serde(default)]
+    pub peer_pipeline: Option<RustRaftPipelineEvidence>,
+    #[serde(default)]
+    pub snapshot_lifecycle: Option<RustRaftSnapshotLifecycleEvidence>,
+    #[serde(default)]
+    pub wal_lifecycle: Option<RustRaftWalLifecycleEvidence>,
+    #[serde(default)]
+    pub data_node_rollout: Option<RustRaftDataNodeProcessRolloutReport>,
+    #[serde(default)]
+    pub metaserver_rollout: Option<RustRaftMetaProcessRolloutReport>,
+    #[serde(default)]
+    pub membership_transitions: Vec<RustRaftMembershipTransitionEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftProductionReadinessReport {
+    pub parity: RustRaftParityReport,
+    pub public_api: RustRaftPublicApiContract,
+    pub ready: bool,
+    pub production_status: RustRaftProductionStatus,
+    pub satisfied: Vec<String>,
+    pub missing: Vec<String>,
+    pub production_blockers: Vec<String>,
+    pub recommended_next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftReadinessEvidence {
+    pub requirement_id: String,
+    pub readiness_field: String,
+    pub present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftReadinessSnapshot {
+    pub rustraft_leader_write_authority_present: bool,
+    pub rustraft_operator_observability_present: bool,
+    pub rustraft_rpc_transport_contract_present: bool,
+    pub rustraft_log_retention_snapshot_trigger_present: bool,
+    pub rustraft_apply_snapshot_fence_present: bool,
+    pub raft_storage_apply_fence_present: bool,
+    pub rustraft_snapshot_floor_log_matching_present: bool,
+    pub rustraft_snapshot_tail_catchup_present: bool,
+    pub rustraft_compacted_entry_rejection_present: bool,
+    pub rustraft_metaserver_snapshot_floor_election_present: bool,
+    pub learner_catchup_promotion_present: bool,
+    pub metaserver_membership_workflow_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftPublicApiContract {
+    pub storage_trait: String,
+    pub transport_trait: String,
+    pub rpc_messages: Vec<String>,
+    pub safety_helpers: Vec<String>,
+    pub metrics: RustRaftMetricNames,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftMetricNames {
+    pub ready: String,
+    pub append_latency_ms: String,
+    pub vote_latency_ms: String,
+    pub read_index_latency_ms: String,
+    pub snapshot_install_latency_ms: String,
+    pub peer_append_queue_depth: String,
+    pub peer_reorder_queue_depth: String,
+    pub peer_snapshot_installed_index: String,
+    pub wal_segment_count: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftPeerPipelineStatus {
-    pub peer_id: RustRaftNodeId,
-    pub match_index: RustRaftLogIndex,
-    pub next_index: RustRaftLogIndex,
+    pub peer_id: u64,
+    pub match_index: u64,
+    pub next_index: u64,
     pub append_requests: u64,
     pub append_accepted: u64,
     pub append_rejected: u64,
@@ -210,7 +169,7 @@ pub struct RustRaftPeerPipelineStatus {
     pub reorder_dropped_packages: u64,
     pub snapshot_sending: bool,
     pub snapshot_installing: bool,
-    pub snapshot_installed_index: RustRaftLogIndex,
+    pub snapshot_installed_index: u64,
     pub snapshot_send_attempts: u64,
     pub snapshot_install_total_chunks: u64,
     pub snapshot_install_progress_per_mille: u64,
@@ -238,20 +197,6 @@ pub struct RustRaftPipelineLimits {
     pub reorder_timeout_us: u64,
 }
 
-impl Default for RustRaftPipelineLimits {
-    fn default() -> Self {
-        Self {
-            max_inflights_replicate: 128,
-            max_memory_replicate_log_bytes: 32 * 1024,
-            max_inflights_apply_task: 5,
-            max_apply_batch_bytes: 64 * 1024,
-            enable_reorder_queue: true,
-            reorder_window_size: 128,
-            reorder_timeout_us: 3_000,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftPipelineEvidence {
     pub per_peer_pipeline_state_present: bool,
@@ -259,89 +204,8 @@ pub struct RustRaftPipelineEvidence {
     pub apply_backpressure_enforced: bool,
     pub memory_replicate_bytes_enforced: bool,
     pub oversized_log_rejection_present: bool,
-    pub reorder_queue_enabled: bool,
     pub out_of_order_append_handling_present: bool,
-    pub ready: bool,
-    pub blockers: Vec<String>,
-}
-
-pub fn rustraft_pipeline_evidence(
-    peers: &[RustRaftPeerPipelineStatus],
-    limits: RustRaftPipelineLimits,
-) -> RustRaftPipelineEvidence {
-    let per_peer_pipeline_state_present = !peers.is_empty()
-        && peers.iter().all(|peer| peer.next_index > 0)
-        && peers.iter().any(|peer| {
-            peer.append_queue_depth > 0 || peer.inflight_entries > 0 || peer.append_requests > 0
-        });
-    let append_backpressure_enforced = limits.max_inflights_replicate > 0
-        && limits.max_memory_replicate_log_bytes > 0
-        && peers.iter().any(|peer| {
-            peer.append_rejected > 0
-                && (peer.inflight_entries > 0
-                    || peer.inflight_bytes > 0
-                    || peer.append_queue_max_depth > 0)
-                && (peer.append_queue_depth >= peer.append_queue_limit
-                    || peer.inflight_bytes >= peer.inflight_bytes_limit
-                    || peer.append_queue_max_depth >= peer.append_queue_limit)
-        });
-    let apply_backpressure_enforced = limits.max_apply_batch_bytes > 0
-        && limits.max_inflights_apply_task > 0
-        && peers.iter().any(|peer| {
-            peer.apply_backpressure_rejections > 0
-                && peer.apply_inflight_limit > 0
-                && peer.apply_batch_bytes_limit > 0
-                && (peer.apply_queue_depth >= peer.apply_inflight_limit
-                    || peer.apply_queue_max_depth >= peer.apply_inflight_limit)
-        });
-    let memory_replicate_bytes_enforced = limits.max_memory_replicate_log_bytes > 0
-        && peers
-            .iter()
-            .any(|peer| peer.memory_backpressure_rejections > 0);
-    let oversized_log_rejection_present =
-        peers.iter().any(|peer| peer.oversized_log_rejections > 0);
-    let reorder_queue_enabled = limits.enable_reorder_queue
-        && limits.reorder_window_size > 0
-        && limits.reorder_timeout_us > 0;
-    let out_of_order_append_handling_present = peers.iter().any(|peer| {
-        peer.out_of_order_append_rejections > 0
-            || peer.reorder_entries_rejected > 0
-            || peer.reorder_entry_timeouts > 0
-            || peer.reorder_dropped_packages > 0
-    });
-    let mut blockers = Vec::new();
-    if !per_peer_pipeline_state_present {
-        blockers.push("per_peer_pipeline_state_missing".to_string());
-    }
-    if !append_backpressure_enforced {
-        blockers.push("append_backpressure_not_enforced".to_string());
-    }
-    if !apply_backpressure_enforced {
-        blockers.push("apply_backpressure_not_enforced".to_string());
-    }
-    if !memory_replicate_bytes_enforced {
-        blockers.push("memory_replicate_bytes_not_enforced".to_string());
-    }
-    if !oversized_log_rejection_present {
-        blockers.push("oversized_log_rejection_missing".to_string());
-    }
-    if !reorder_queue_enabled {
-        blockers.push("reorder_queue_not_enabled".to_string());
-    }
-    if !out_of_order_append_handling_present {
-        blockers.push("out_of_order_append_handling_missing".to_string());
-    }
-    RustRaftPipelineEvidence {
-        per_peer_pipeline_state_present,
-        append_backpressure_enforced,
-        apply_backpressure_enforced,
-        memory_replicate_bytes_enforced,
-        oversized_log_rejection_present,
-        reorder_queue_enabled,
-        out_of_order_append_handling_present,
-        ready: blockers.is_empty(),
-        blockers,
-    }
+    pub reorder_queue_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -354,84 +218,9 @@ pub struct RustRaftSnapshotLifecycleEvidence {
     pub install_rollback_present: bool,
     pub membership_change_present: bool,
     pub rejoin_after_compacted_log_present: bool,
-    pub ready: bool,
-    pub blockers: Vec<String>,
 }
 
-pub fn rustraft_snapshot_lifecycle_evidence(
-    peers: &[RustRaftPeerPipelineStatus],
-    send_snapshot_timeout_ms: u64,
-    max_inflights_replicate: u64,
-) -> RustRaftSnapshotLifecycleEvidence {
-    let sender_lifecycle_present = peers
-        .iter()
-        .any(|peer| peer.snapshot_sending || peer.snapshot_installed_index > 0);
-    let downloader_lifecycle_present = peers
-        .iter()
-        .any(|peer| peer.snapshot_installing || peer.snapshot_installed_index > 0);
-    let retry_backpressure_present = send_snapshot_timeout_ms > 0
-        && max_inflights_replicate > 0
-        && peers.iter().any(|peer| {
-            peer.snapshot_send_attempts > 0
-                && peer.snapshot_install_total_chunks > 0
-                && peer.snapshot_backpressure_rejections > 0
-        });
-    let rate_limit_present = peers
-        .iter()
-        .any(|peer| peer.snapshot_rate_limit_rejections > 0)
-        || max_inflights_replicate > 0;
-    let install_progress_present = peers.iter().any(|peer| {
-        peer.snapshot_install_total_chunks > 0 && peer.snapshot_install_progress_per_mille > 0
-    });
-    let install_rollback_present = peers
-        .iter()
-        .any(|peer| peer.snapshot_install_rolled_back > 0);
-    let membership_change_present = peers
-        .iter()
-        .any(|peer| peer.snapshot_during_membership_change);
-    let rejoin_after_compacted_log_present = peers
-        .iter()
-        .any(|peer| peer.snapshot_rejoin_after_compacted_log);
-    let mut blockers = Vec::new();
-    if !sender_lifecycle_present {
-        blockers.push("snapshot_sender_lifecycle_missing".to_string());
-    }
-    if !downloader_lifecycle_present {
-        blockers.push("snapshot_downloader_lifecycle_missing".to_string());
-    }
-    if !retry_backpressure_present {
-        blockers.push("snapshot_retry_backpressure_missing".to_string());
-    }
-    if !rate_limit_present {
-        blockers.push("snapshot_rate_limit_missing".to_string());
-    }
-    if !install_progress_present {
-        blockers.push("snapshot_install_progress_missing".to_string());
-    }
-    if !install_rollback_present {
-        blockers.push("snapshot_install_rollback_missing".to_string());
-    }
-    if !membership_change_present {
-        blockers.push("snapshot_membership_change_missing".to_string());
-    }
-    if !rejoin_after_compacted_log_present {
-        blockers.push("snapshot_rejoin_after_compacted_log_missing".to_string());
-    }
-    RustRaftSnapshotLifecycleEvidence {
-        sender_lifecycle_present,
-        downloader_lifecycle_present,
-        retry_backpressure_present,
-        rate_limit_present,
-        install_progress_present,
-        install_rollback_present,
-        membership_change_present,
-        rejoin_after_compacted_log_present,
-        ready: blockers.is_empty(),
-        blockers,
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftWalLifecycleStatus {
     pub segment_count: u64,
     pub active_segment_id: u64,
@@ -442,8 +231,8 @@ pub struct RustRaftWalLifecycleStatus {
     pub total_records: u64,
     pub first_sequence: u64,
     pub last_sequence: u64,
-    pub first_log_index: RustRaftLogIndex,
-    pub last_log_index: RustRaftLogIndex,
+    pub first_log_index: u64,
+    pub last_log_index: u64,
     pub released_segment_count: u64,
     pub slow_fsync_backpressure_observed: bool,
 }
@@ -451,690 +240,1783 @@ pub struct RustRaftWalLifecycleStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftWalLifecycleEvidence {
     pub segment_lifecycle_present: bool,
-    pub release_rules_observed: bool,
-    pub first_last_index_status_present: bool,
+    pub retained_range_present: bool,
+    pub sequence_range_present: bool,
+    pub log_index_range_present: bool,
+    pub compaction_observed: bool,
     pub slow_fsync_backpressure_observed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftProcessNodeEvidence {
+    pub node_id: u64,
+    pub addr: String,
+    pub wal_dir: String,
+    #[serde(default)]
+    pub snapshot_dir: String,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    pub snapshot_id: Option<String>,
+    pub restarted: bool,
+    pub log_store_validated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftProcessOperationalSemanticsEvidence {
+    #[serde(default)]
+    pub api_presence_only_rejected: bool,
+    #[serde(default)]
+    pub process_path_validated: bool,
+    #[serde(default)]
+    pub read_index_validated: bool,
+    #[serde(default)]
+    pub leader_lease_validated: bool,
+    #[serde(default)]
+    pub stale_leader_lease_rejection_observed: bool,
+    #[serde(default)]
+    pub follower_lease_expiration_observed: bool,
+    #[serde(default)]
+    pub lagging_follower_read_rejected: bool,
+    #[serde(default)]
+    pub bounded_stale_read_acceptance_observed: bool,
+    #[serde(default)]
+    pub bounded_stale_read_rejection_observed: bool,
+    #[serde(default)]
+    pub minority_partition_read_rejection_observed: bool,
+    #[serde(default)]
+    pub healed_follower_catchup_observed: bool,
+    #[serde(default)]
+    pub stale_follower_write_rejected: bool,
+    #[serde(default)]
+    pub leader_transfer_exact_once_validated: bool,
+    #[serde(default)]
+    pub leader_transfer_under_load_validated: bool,
+    #[serde(default)]
+    pub snapshot_bootstrap_validated: bool,
+    #[serde(default)]
+    pub snapshot_install_restart_validated: bool,
+    #[serde(default)]
+    pub membership_rescale_validated: bool,
+    #[serde(default)]
+    pub membership_add_promote_remove_validated: bool,
+    #[serde(default)]
+    pub follower_rejoin_after_compaction_validated: bool,
+    #[serde(default)]
+    pub secondary_read_eligibility_validated: bool,
+    #[serde(default)]
+    pub apply_pipeline_converged: bool,
+    #[serde(default)]
+    pub wal_persistence_observed: bool,
+    #[serde(default)]
+    pub fsm_apply_idempotent_replay_observed: bool,
+    #[serde(default)]
+    pub storage_mutation_wal_fence_atomicity_observed: bool,
+    #[serde(default)]
+    pub snapshot_install_apply_fence_atomicity_observed: bool,
+    #[serde(default)]
+    pub process_restart_after_apply_crash_recovered: bool,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+}
+
+impl RustRaftProcessOperationalSemanticsEvidence {
+    pub fn proves_runtime_semantics(&self) -> bool {
+        self.ready
+            && self.blockers.is_empty()
+            && self.api_presence_only_rejected
+            && self.process_path_validated
+            && self.read_index_validated
+            && self.leader_lease_validated
+            && self.stale_leader_lease_rejection_observed
+            && self.follower_lease_expiration_observed
+            && self.lagging_follower_read_rejected
+            && self.bounded_stale_read_acceptance_observed
+            && self.bounded_stale_read_rejection_observed
+            && self.minority_partition_read_rejection_observed
+            && self.healed_follower_catchup_observed
+            && self.stale_follower_write_rejected
+            && self.leader_transfer_exact_once_validated
+            && self.leader_transfer_under_load_validated
+            && self.snapshot_bootstrap_validated
+            && self.snapshot_install_restart_validated
+            && self.membership_rescale_validated
+            && self.membership_add_promote_remove_validated
+            && self.follower_rejoin_after_compaction_validated
+            && self.secondary_read_eligibility_validated
+            && self.apply_pipeline_converged
+            && self.wal_persistence_observed
+            && self.fsm_apply_idempotent_replay_observed
+            && self.storage_mutation_wal_fence_atomicity_observed
+            && self.snapshot_install_apply_fence_atomicity_observed
+            && self.process_restart_after_apply_crash_recovered
+    }
+
+    pub fn missing_requirements(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        for (present, requirement) in [
+            (self.ready, "operational_semantics_ready"),
+            (
+                self.api_presence_only_rejected,
+                "api_presence_only_rejected",
+            ),
+            (self.process_path_validated, "process_path_validated"),
+            (self.read_index_validated, "read_index_validated"),
+            (self.leader_lease_validated, "leader_lease_validated"),
+            (
+                self.stale_leader_lease_rejection_observed,
+                "stale_leader_lease_rejection_observed",
+            ),
+            (
+                self.follower_lease_expiration_observed,
+                "follower_lease_expiration_observed",
+            ),
+            (
+                self.lagging_follower_read_rejected,
+                "lagging_follower_read_rejected",
+            ),
+            (
+                self.bounded_stale_read_acceptance_observed,
+                "bounded_stale_read_acceptance_observed",
+            ),
+            (
+                self.bounded_stale_read_rejection_observed,
+                "bounded_stale_read_rejection_observed",
+            ),
+            (
+                self.minority_partition_read_rejection_observed,
+                "minority_partition_read_rejection_observed",
+            ),
+            (
+                self.healed_follower_catchup_observed,
+                "healed_follower_catchup_observed",
+            ),
+            (
+                self.stale_follower_write_rejected,
+                "stale_follower_write_rejected",
+            ),
+            (
+                self.leader_transfer_exact_once_validated,
+                "leader_transfer_exact_once_validated",
+            ),
+            (
+                self.leader_transfer_under_load_validated,
+                "leader_transfer_under_load_validated",
+            ),
+            (
+                self.snapshot_bootstrap_validated,
+                "snapshot_bootstrap_validated",
+            ),
+            (
+                self.snapshot_install_restart_validated,
+                "snapshot_install_restart_validated",
+            ),
+            (
+                self.membership_rescale_validated,
+                "membership_rescale_validated",
+            ),
+            (
+                self.membership_add_promote_remove_validated,
+                "membership_add_promote_remove_validated",
+            ),
+            (
+                self.follower_rejoin_after_compaction_validated,
+                "follower_rejoin_after_compaction_validated",
+            ),
+            (
+                self.secondary_read_eligibility_validated,
+                "secondary_read_eligibility_validated",
+            ),
+            (self.apply_pipeline_converged, "apply_pipeline_converged"),
+            (self.wal_persistence_observed, "wal_persistence_observed"),
+            (
+                self.fsm_apply_idempotent_replay_observed,
+                "fsm_apply_idempotent_replay_observed",
+            ),
+            (
+                self.storage_mutation_wal_fence_atomicity_observed,
+                "storage_mutation_wal_fence_atomicity_observed",
+            ),
+            (
+                self.snapshot_install_apply_fence_atomicity_observed,
+                "snapshot_install_apply_fence_atomicity_observed",
+            ),
+            (
+                self.process_restart_after_apply_crash_recovered,
+                "process_restart_after_apply_crash_recovered",
+            ),
+        ] {
+            if !present {
+                missing.push(requirement.to_string());
+            }
+        }
+        missing.extend(
+            self.blockers
+                .iter()
+                .map(|blocker| format!("blocker:{blocker}")),
+        );
+        missing
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftDataNodeProcessRolloutReport {
+    pub shard_id: u64,
+    #[serde(default)]
+    pub voters: Vec<u64>,
+    #[serde(default)]
+    pub learners: Vec<u64>,
+    pub nodes: Vec<RustRaftProcessNodeEvidence>,
+    #[serde(default)]
+    pub spawned_process_count: u64,
+    #[serde(default)]
+    pub independent_wal_dirs: bool,
+    #[serde(default)]
+    pub independent_snapshot_dirs: bool,
+    #[serde(default)]
+    pub observed_process_requests: u64,
+    #[serde(default)]
+    pub read_index_responses_observed: u64,
+    #[serde(default)]
+    pub restarted_node_count: u64,
+    #[serde(default)]
+    pub per_node_log_store_inspection_count: u64,
+    pub write_proposed_through_process_api: bool,
+    #[serde(default)]
+    pub leader_transfer_validated: bool,
+    #[serde(default)]
+    pub failover_validated: bool,
+    #[serde(default)]
+    pub secondary_lag_observed: bool,
+    #[serde(default)]
+    pub lagging_follower_read_rejection_observed: bool,
+    #[serde(default)]
+    pub stale_follower_write_rejection_observed: bool,
+    #[serde(default)]
+    pub catchup_read_eligibility_observed: bool,
+    #[serde(default)]
+    pub minority_partition_rejection_observed: bool,
+    #[serde(default)]
+    pub bounded_stale_read_eligibility_observed: bool,
+    #[serde(default)]
+    pub healed_follower_catchup_observed: bool,
+    #[serde(default)]
+    pub lagging_follower_observed_lag: u64,
+    #[serde(default)]
+    pub membership_change_validated: bool,
+    #[serde(default)]
+    pub follower_lag_validated: bool,
+    #[serde(default)]
+    pub secondary_read_validated: bool,
+    pub recovered_after_restart: bool,
+    #[serde(default)]
+    pub restart_recovery_validated: bool,
+    pub snapshot_install_validated: bool,
+    pub applied_fence_validated: bool,
+    #[serde(default)]
+    pub crash_after_storage_mutation_recovered: bool,
+    #[serde(default)]
+    pub crash_after_wal_persist_recovered: bool,
+    #[serde(default)]
+    pub crash_during_snapshot_install_recovered: bool,
+    #[serde(default)]
+    pub apply_fence_recovered_after_restart: bool,
+    pub multi_process_log_store_validated: bool,
+    #[serde(default)]
+    pub operational_semantics: RustRaftProcessOperationalSemanticsEvidence,
     pub ready: bool,
     pub blockers: Vec<String>,
 }
 
-pub fn rustraft_wal_lifecycle_evidence(
-    status: &RustRaftWalLifecycleStatus,
-) -> RustRaftWalLifecycleEvidence {
-    let segment_lifecycle_present = status.segment_count > 0
-        && status.active_segment_id >= status.first_retained_segment_id
-        && status.last_retained_segment_id >= status.first_retained_segment_id
-        && status.total_bytes > 0
-        && status.active_segment_bytes > 0
-        && status.total_records > 0
-        && status.last_sequence >= status.first_sequence
-        && status.last_log_index >= status.first_log_index;
-    let release_rules_observed = status.released_segment_count > 0
-        || status.last_retained_segment_id >= status.first_retained_segment_id;
-    let first_last_index_status_present = status.last_log_index >= status.first_log_index;
-    let mut blockers = Vec::new();
-    if !segment_lifecycle_present {
-        blockers.push("wal_segment_lifecycle_missing".to_string());
-    }
-    if !release_rules_observed {
-        blockers.push("wal_release_rules_missing".to_string());
-    }
-    if !first_last_index_status_present {
-        blockers.push("wal_first_last_index_status_missing".to_string());
-    }
-    RustRaftWalLifecycleEvidence {
-        segment_lifecycle_present,
-        release_rules_observed,
-        first_last_index_status_present,
-        slow_fsync_backpressure_observed: status.slow_fsync_backpressure_observed,
-        ready: blockers.is_empty(),
-        blockers,
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftMetaProcessRolloutReport {
+    #[serde(default)]
+    pub voters: Vec<u64>,
+    #[serde(default)]
+    pub learners: Vec<u64>,
+    pub nodes: Vec<RustRaftProcessNodeEvidence>,
+    #[serde(default)]
+    pub spawned_process_count: u64,
+    #[serde(default)]
+    pub independent_wal_dirs: bool,
+    #[serde(default)]
+    pub independent_snapshot_dirs: bool,
+    #[serde(default)]
+    pub observed_process_requests: u64,
+    #[serde(default)]
+    pub read_index_responses_observed: u64,
+    #[serde(default)]
+    pub restarted_node_count: u64,
+    #[serde(default)]
+    pub per_node_log_store_inspection_count: u64,
+    pub mutation_proposed_through_process_api: bool,
+    #[serde(default)]
+    pub applied_raft_mutations: u64,
+    #[serde(default)]
+    pub generated_scheduler_tasks: u64,
+    #[serde(default)]
+    pub scheduler_retries: u64,
+    #[serde(default)]
+    pub stale_scheduler_token_rejected: bool,
+    #[serde(default)]
+    pub data_node_membership_results_ready: bool,
+    #[serde(default)]
+    pub scheduler_mutations_proposed_through_process_api: bool,
+    #[serde(default)]
+    pub scheduler_task_replay_from_raft_log_observed: bool,
+    #[serde(default)]
+    pub membership_mutations_proposed_through_process_api: bool,
+    #[serde(default)]
+    pub data_node_membership_workflow_report_attached: bool,
+    #[serde(default)]
+    pub data_node_raft_group_results_observed: bool,
+    #[serde(default)]
+    pub failover_validated: bool,
+    #[serde(default)]
+    pub membership_change_validated: bool,
+    #[serde(default)]
+    pub follower_lag_validated: bool,
+    #[serde(default)]
+    pub secondary_read_validated: bool,
+    pub read_index_validated: bool,
+    pub snapshot_install_validated: bool,
+    pub recovered_after_restart: bool,
+    pub scheduler_task_replay_validated: bool,
+    #[serde(default)]
+    pub crash_after_meta_mutation_recovered: bool,
+    #[serde(default)]
+    pub crash_after_meta_wal_persist_recovered: bool,
+    #[serde(default)]
+    pub crash_during_meta_snapshot_install_recovered: bool,
+    #[serde(default)]
+    pub meta_apply_fence_recovered_after_restart: bool,
+    pub multi_process_log_store_validated: bool,
+    #[serde(default)]
+    pub operational_semantics: RustRaftProcessOperationalSemanticsEvidence,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RustRaftMembershipScope {
+    Metaserver,
+    DataNode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RustRaftMembershipTransitionKind {
+    Failover,
+    ScaleUp,
+    ScaleDown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftMembershipTransitionEvidence {
+    pub scope: RustRaftMembershipScope,
+    pub transition: RustRaftMembershipTransitionKind,
+    #[serde(default)]
+    pub before_voters: Vec<u64>,
+    #[serde(default)]
+    pub after_voters: Vec<u64>,
+    #[serde(default)]
+    pub before_learners: Vec<u64>,
+    #[serde(default)]
+    pub after_learners: Vec<u64>,
+    pub leader_before: Option<u64>,
+    pub leader_after: Option<u64>,
+    #[serde(default)]
+    pub failed_or_removed_nodes: Vec<u64>,
+    #[serde(default)]
+    pub added_nodes: Vec<u64>,
+    #[serde(default)]
+    pub caught_up_nodes: Vec<u64>,
+    pub commit_index_before: u64,
+    pub commit_index_after: u64,
+    pub applied_index_after: u64,
+    pub joint_consensus_used: bool,
+    pub old_majority_preserved: bool,
+    pub new_majority_reached: bool,
+    pub stale_leader_rejected: bool,
+    pub read_index_validated_after: bool,
+    pub write_validated_after: bool,
+    pub snapshot_floor_preserved: bool,
+    pub secondary_replication_visible: bool,
+    #[serde(default)]
+    pub scheduler_generation_advanced: bool,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftMembershipTransitionDecision {
+    pub scope: RustRaftMembershipScope,
+    pub transition: RustRaftMembershipTransitionKind,
+    pub ready: bool,
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftMembershipReadinessReport {
+    pub ready: bool,
+    pub satisfied: Vec<String>,
+    pub missing: Vec<String>,
+    pub decisions: Vec<RustRaftMembershipTransitionDecision>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustRaftRole {
+    Leader,
+    Follower,
+    Candidate,
+    Learner,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftLogId {
+    pub term: u64,
+    pub index: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftLogEntry {
+    pub log_id: RustRaftLogId,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftHardState {
+    pub current_term: u64,
+    pub voted_for: Option<u64>,
+    pub committed: Option<RustRaftLogId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftPeerStatus {
+    pub node_id: u64,
+    pub matched: u64,
+    pub next_index: u64,
+    pub learner: bool,
+    pub healthy: bool,
+    pub lag: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftStatusSnapshot {
     pub group_id: u64,
-    pub node_id: RustRaftNodeId,
+    pub node_id: u64,
     pub role: RustRaftRole,
-    pub term: RustRaftTerm,
-    pub leader_id: Option<RustRaftNodeId>,
-    pub commit_index: RustRaftLogIndex,
-    pub applied_index: RustRaftLogIndex,
-    pub last_log_index: RustRaftLogIndex,
-    pub last_snapshot_index: RustRaftLogIndex,
+    pub term: u64,
+    pub leader_id: Option<u64>,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    pub last_log_index: u64,
+    pub last_snapshot_index: u64,
     pub peers: Vec<RustRaftPeerStatus>,
 }
 
-impl RustRaftStatusSnapshot {
-    pub fn apply_lag(&self) -> u64 {
-        self.commit_index.saturating_sub(self.applied_index)
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftAppendEntriesRequest {
+    pub group_id: u64,
+    pub term: u64,
+    pub leader_id: u64,
+    pub prev_log_id: Option<RustRaftLogId>,
+    pub entries: Vec<RustRaftLogEntry>,
+    pub leader_commit: u64,
+}
 
-    pub fn peer(&self, node_id: RustRaftNodeId) -> Option<&RustRaftPeerStatus> {
-        self.peers.iter().find(|peer| peer.node_id == node_id)
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftAppendEntriesResponse {
+    pub term: u64,
+    pub success: bool,
+    pub match_index: u64,
+    pub rejection_hint: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftVoteRequest {
+    pub group_id: u64,
+    pub term: u64,
+    pub candidate_id: u64,
+    pub last_log_id: Option<RustRaftLogId>,
+    pub pre_vote: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftVoteResponse {
+    pub term: u64,
+    pub vote_granted: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftSnapshotMeta {
+    pub snapshot_id: String,
+    pub last_log_id: RustRaftLogId,
+    pub membership: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftSnapshotChunk {
+    pub meta: RustRaftSnapshotMeta,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftInstallSnapshotRequest {
+    pub group_id: u64,
+    pub term: u64,
+    pub leader_id: u64,
+    pub chunk: RustRaftSnapshotChunk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftInstallSnapshotResponse {
+    pub term: u64,
+    pub accepted: bool,
+    pub next_offset: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftReadIndexRequest {
+    pub group_id: u64,
+    pub requester_id: u64,
+    pub min_commit_index: u64,
+    pub allow_lease_read: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftReadIndexResponse {
+    pub safe: bool,
+    pub read_index: u64,
+    pub lease_read: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftReadSafetyDecision {
     pub safe: bool,
-    pub read_index: RustRaftLogIndex,
+    pub read_index: u64,
     pub lease_read: bool,
     pub reason: String,
-}
-
-pub fn rustraft_read_safety_decision(
-    status: &RustRaftStatusSnapshot,
-    request: &RustRaftReadIndexRequest,
-) -> RustRaftReadSafetyDecision {
-    if !matches!(status.role, RustRaftRole::Leader | RustRaftRole::Follower) {
-        return RustRaftReadSafetyDecision {
-            safe: false,
-            read_index: status.commit_index,
-            lease_read: false,
-            reason: "role_not_readable".to_string(),
-        };
-    }
-    if status.commit_index < request.min_commit_index {
-        return RustRaftReadSafetyDecision {
-            safe: false,
-            read_index: status.commit_index,
-            lease_read: false,
-            reason: "commit_index_too_low".to_string(),
-        };
-    }
-    if status.applied_index < request.min_commit_index {
-        return RustRaftReadSafetyDecision {
-            safe: false,
-            read_index: status.applied_index,
-            lease_read: false,
-            reason: "apply_lag_too_high".to_string(),
-        };
-    }
-    if status.last_snapshot_index > request.min_commit_index {
-        return RustRaftReadSafetyDecision {
-            safe: false,
-            read_index: status.last_snapshot_index,
-            lease_read: false,
-            reason: "read_before_snapshot_floor".to_string(),
-        };
-    }
-    RustRaftReadSafetyDecision {
-        safe: true,
-        read_index: request.min_commit_index,
-        lease_read: request.allow_lease_read && matches!(status.role, RustRaftRole::Leader),
-        reason: "read_safe".to_string(),
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftLearnerPromotionDecision {
     pub promotable: bool,
+    pub learner_id: u64,
+    pub learner_match_index: u64,
+    pub required_match_index: u64,
     pub reason: String,
-}
-
-pub fn rustraft_learner_promotion_decision(
-    status: &RustRaftStatusSnapshot,
-    learner_id: RustRaftNodeId,
-    max_lag: u64,
-) -> RustRaftLearnerPromotionDecision {
-    let Some(peer) = status.peer(learner_id) else {
-        return RustRaftLearnerPromotionDecision {
-            promotable: false,
-            reason: "peer_not_found".to_string(),
-        };
-    };
-    if !peer.learner {
-        return RustRaftLearnerPromotionDecision {
-            promotable: false,
-            reason: "peer_not_learner".to_string(),
-        };
-    }
-    if !peer.healthy {
-        return RustRaftLearnerPromotionDecision {
-            promotable: false,
-            reason: "peer_unhealthy".to_string(),
-        };
-    }
-    if peer.lag > max_lag || peer.matched.saturating_add(max_lag) < status.commit_index {
-        return RustRaftLearnerPromotionDecision {
-            promotable: false,
-            reason: "learner_lag_too_high".to_string(),
-        };
-    }
-    RustRaftLearnerPromotionDecision {
-        promotable: true,
-        reason: "learner_caught_up".to_string(),
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftAppendSafetyDecision {
     pub accepted: bool,
+    pub rejected_compacted_entry: bool,
     pub reason: String,
 }
 
-pub fn rustraft_append_safety_decision(
-    snapshot_floor: RustRaftLogIndex,
-    first_retained_log_index: RustRaftLogIndex,
-    request: &RustRaftAppendEntriesRequest,
-) -> RustRaftAppendSafetyDecision {
-    let prev_index = request
-        .prev_log_id
-        .as_ref()
-        .map(|log| log.index)
-        .unwrap_or(0);
-    if prev_index != 0 && prev_index < snapshot_floor {
-        return RustRaftAppendSafetyDecision {
-            accepted: false,
-            reason: "prev_log_before_snapshot_floor".to_string(),
-        };
-    }
-    if let Some(entry) = request
-        .entries
-        .iter()
-        .find(|entry| entry.log_id.index < first_retained_log_index)
-    {
-        return RustRaftAppendSafetyDecision {
-            accepted: false,
-            reason: format!("entry_compacted:{}", entry.log_id.index),
-        };
-    }
-    RustRaftAppendSafetyDecision {
-        accepted: true,
-        reason: "append_safe".to_string(),
-    }
+#[derive(Debug, Error)]
+pub enum RustRaftError {
+    #[error("transport error: {0}")]
+    Transport(String),
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftMetricNames {
-    pub leader_changes_total: String,
-    pub append_entries_qps: String,
-    pub append_entries_latency_ms: String,
-    pub read_index_latency_ms: String,
-    pub apply_lag: String,
-    pub snapshot_install_total: String,
-    pub snapshot_install_latency_ms: String,
-    pub membership_change_total: String,
-    pub transport_errors_total: String,
+pub trait RustRaftStorage {
+    fn append_entries(&mut self, entries: &[RustRaftLogEntry]) -> Result<(), RustRaftError>;
+    fn read_entries(&self, start: u64, end: u64) -> Result<Vec<RustRaftLogEntry>, RustRaftError>;
+    fn hard_state(&self) -> Result<RustRaftHardState, RustRaftError>;
+    fn install_snapshot(&mut self, chunk: RustRaftSnapshotChunk) -> Result<(), RustRaftError>;
 }
 
-pub fn rustraft_metric_names() -> RustRaftMetricNames {
-    RustRaftMetricNames {
-        leader_changes_total: "rustraft_leader_changes_total".to_string(),
-        append_entries_qps: "rustraft_append_entries_qps".to_string(),
-        append_entries_latency_ms: "rustraft_append_entries_latency_ms".to_string(),
-        read_index_latency_ms: "rustraft_read_index_latency_ms".to_string(),
-        apply_lag: "rustraft_apply_lag".to_string(),
-        snapshot_install_total: "rustraft_snapshot_install_total".to_string(),
-        snapshot_install_latency_ms: "rustraft_snapshot_install_latency_ms".to_string(),
-        membership_change_total: "rustraft_membership_change_total".to_string(),
-        transport_errors_total: "rustraft_transport_errors_total".to_string(),
+pub trait RustRaftTransport {
+    fn append_entries(
+        &self,
+        target: u64,
+        request: RustRaftAppendEntriesRequest,
+    ) -> Result<RustRaftAppendEntriesResponse, RustRaftError>;
+    fn vote(
+        &self,
+        target: u64,
+        request: RustRaftVoteRequest,
+    ) -> Result<RustRaftVoteResponse, RustRaftError>;
+    fn install_snapshot(
+        &self,
+        target: u64,
+        request: RustRaftInstallSnapshotRequest,
+    ) -> Result<RustRaftInstallSnapshotResponse, RustRaftError>;
+    fn read_index(
+        &self,
+        target: u64,
+        request: RustRaftReadIndexRequest,
+    ) -> Result<RustRaftReadIndexResponse, RustRaftError>;
+}
+
+pub fn rustraft_parity_contract() -> RustRaftParityContract {
+    RustRaftParityContract {
+        library_name: "rustraft".to_string(),
+        consensus_backend_boundary: "temporalstore_rust::raft::DataRaftConsensusBackend"
+            .to_string(),
+        openraft_dependency_removed: true,
+        requirements: rustraft_requirements(),
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftPublicApiContract {
-    pub storage_trait: String,
-    pub transport_trait: String,
-    pub status_snapshot: String,
-    pub metric_namespace: String,
-    pub rpc_messages: Vec<String>,
 }
 
 pub fn rustraft_public_api_contract() -> RustRaftPublicApiContract {
     RustRaftPublicApiContract {
         storage_trait: "RustRaftStorage".to_string(),
         transport_trait: "RustRaftTransport".to_string(),
-        status_snapshot: "RustRaftStatusSnapshot".to_string(),
-        metric_namespace: "rustraft".to_string(),
         rpc_messages: vec![
             "RustRaftAppendEntriesRequest".to_string(),
             "RustRaftVoteRequest".to_string(),
             "RustRaftInstallSnapshotRequest".to_string(),
             "RustRaftReadIndexRequest".to_string(),
         ],
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftSemanticRequirement {
-    pub id: String,
-    pub description: String,
-    pub readiness_field: String,
-    pub category: RustRaftRequirementCategory,
-    pub required_for_production: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RustRaftRequirementCategory {
-    Safety,
-    Durability,
-    Transport,
-    Snapshot,
-    Membership,
-    Observability,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftParityContract {
-    pub consensus_backend_boundary: String,
-    pub data_node_backend_trait: String,
-    pub metaserver_backend_trait: String,
-    pub openraft_dependency_removed: bool,
-    pub temporal_raft_runtime_available: bool,
-    pub requirements: Vec<RustRaftSemanticRequirement>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftParityReport {
-    pub ready: bool,
-    pub production_status: RustRaftProductionStatus,
-    pub contract: RustRaftParityContract,
-    pub satisfied: Vec<String>,
-    pub missing: Vec<String>,
-    pub production_blockers: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RustRaftProductionStatus {
-    Blocked,
-    FeatureCorrect,
-    ProductionReady,
-}
-
-pub trait RustRaftReadinessEvidence {
-    fn readiness_value(&self, field: &str) -> bool;
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftReadinessSnapshot {
-    pub rustraft_leader_write_authority_present: bool,
-    pub rustraft_operator_observability_present: bool,
-    pub rustraft_rpc_transport_contract_present: bool,
-    pub rustraft_log_retention_snapshot_trigger_present: bool,
-    pub rustraft_apply_snapshot_fence_present: bool,
-    pub raft_storage_apply_fence_present: bool,
-    pub rustraft_snapshot_floor_log_matching_present: bool,
-    pub rustraft_snapshot_tail_catchup_present: bool,
-    pub rustraft_compacted_entry_rejection_present: bool,
-    pub rustraft_metaserver_snapshot_floor_election_present: bool,
-    pub learner_catchup_promotion_present: bool,
-    pub metaserver_membership_workflow_present: bool,
-}
-
-impl RustRaftReadinessEvidence for RustRaftReadinessSnapshot {
-    fn readiness_value(&self, field: &str) -> bool {
-        match field {
-            "rustraft_leader_write_authority_present" => {
-                self.rustraft_leader_write_authority_present
-            }
-            "rustraft_operator_observability_present" => {
-                self.rustraft_operator_observability_present
-            }
-            "rustraft_rpc_transport_contract_present" => {
-                self.rustraft_rpc_transport_contract_present
-            }
-            "rustraft_log_retention_snapshot_trigger_present" => {
-                self.rustraft_log_retention_snapshot_trigger_present
-            }
-            "rustraft_apply_snapshot_fence_present" => self.rustraft_apply_snapshot_fence_present,
-            "raft_storage_apply_fence_present" => self.raft_storage_apply_fence_present,
-            "rustraft_snapshot_floor_log_matching_present" => {
-                self.rustraft_snapshot_floor_log_matching_present
-            }
-            "rustraft_snapshot_tail_catchup_present" => self.rustraft_snapshot_tail_catchup_present,
-            "rustraft_compacted_entry_rejection_present" => {
-                self.rustraft_compacted_entry_rejection_present
-            }
-            "rustraft_metaserver_snapshot_floor_election_present" => {
-                self.rustraft_metaserver_snapshot_floor_election_present
-            }
-            "learner_catchup_promotion_present" => self.learner_catchup_promotion_present,
-            "metaserver_membership_workflow_present" => self.metaserver_membership_workflow_present,
-            _ => false,
-        }
-    }
-}
-
-pub fn rustraft_parity_contract() -> RustRaftParityContract {
-    RustRaftParityContract {
-        consensus_backend_boundary:
-            "temporalstore_rust::raft::DataRaftConsensusBackend".to_string(),
-        data_node_backend_trait: "DataRaftConsensusBackend".to_string(),
-        metaserver_backend_trait: "DataRaftConsensusBackend".to_string(),
-        openraft_dependency_removed: true,
-        temporal_raft_runtime_available: true,
-        requirements: vec![
-            requirement(
-                "leader_write_authority",
-                "Leader-only writes and bounded stale-read authority match RustRaft semantics.",
-                "rustraft_leader_write_authority_present",
-                RustRaftRequirementCategory::Safety,
-            ),
-            requirement(
-                "operator_observability",
-                "Operator-facing status exposes leader, term, commit, apply, and peer state.",
-                "rustraft_operator_observability_present",
-                RustRaftRequirementCategory::Observability,
-            ),
-            requirement(
-                "rpc_transport_contract",
-                "AppendEntries, Vote, InstallSnapshot, and ReadIndex transport contracts exist.",
-                "rustraft_rpc_transport_contract_present",
-                RustRaftRequirementCategory::Transport,
-            ),
-            requirement(
-                "snapshot_trigger",
-                "Log retention can trigger durable snapshots before unbounded growth.",
-                "rustraft_log_retention_snapshot_trigger_present",
-                RustRaftRequirementCategory::Snapshot,
-            ),
-            requirement(
-                "apply_snapshot_fence",
-                "Snapshot install has an apply fence so stale logs cannot overwrite restored state.",
-                "rustraft_apply_snapshot_fence_present",
-                RustRaftRequirementCategory::Snapshot,
-            ),
-            requirement(
-                "storage_apply_fence",
-                "Storage mutation apply is fenced with durable apply index state.",
-                "raft_storage_apply_fence_present",
-                RustRaftRequirementCategory::Durability,
-            ),
-            requirement(
-                "snapshot_floor_log_matching",
-                "Snapshot floor and log matching reject unsafe stale or compacted entries.",
-                "rustraft_snapshot_floor_log_matching_present",
-                RustRaftRequirementCategory::Safety,
-            ),
-            requirement(
-                "snapshot_tail_catchup",
-                "Followers can catch up from snapshot plus tail logs.",
-                "rustraft_snapshot_tail_catchup_present",
-                RustRaftRequirementCategory::Snapshot,
-            ),
-            requirement(
-                "compacted_entry_rejection",
-                "Compacted entries are rejected rather than silently replayed.",
-                "rustraft_compacted_entry_rejection_present",
-                RustRaftRequirementCategory::Safety,
-            ),
-            requirement(
-                "metaserver_snapshot_floor_election",
-                "Metaserver election/readiness respects snapshot floor safety.",
-                "rustraft_metaserver_snapshot_floor_election_present",
-                RustRaftRequirementCategory::Safety,
-            ),
-            requirement(
-                "learner_catchup_promotion",
-                "Learners are promoted only after catch-up and membership workflow checks.",
-                "learner_catchup_promotion_present",
-                RustRaftRequirementCategory::Membership,
-            ),
-            requirement(
-                "metaserver_membership_workflow",
-                "Metaserver owns membership workflow and topology placement transitions.",
-                "metaserver_membership_workflow_present",
-                RustRaftRequirementCategory::Membership,
-            ),
+        safety_helpers: vec![
+            "rustraft_read_safety_decision".to_string(),
+            "rustraft_append_safety_decision".to_string(),
+            "rustraft_learner_promotion_decision".to_string(),
         ],
+        metrics: rustraft_metric_names(),
     }
 }
 
-pub fn rustraft_parity_report<E: RustRaftReadinessEvidence>(readiness: &E) -> RustRaftParityReport {
-    let contract = rustraft_parity_contract();
-    let mut satisfied = Vec::new();
-    let mut missing = Vec::new();
-    let mut production_blockers = Vec::new();
-    for requirement in &contract.requirements {
-        if readiness.readiness_value(&requirement.readiness_field) {
-            satisfied.push(requirement.id.clone());
-        } else {
-            missing.push(requirement.id.clone());
-            if requirement.required_for_production {
-                production_blockers.push(format!(
-                    "{}:{}",
-                    requirement.category.as_str(),
-                    requirement.id
-                ));
-            }
-        }
+pub fn rustraft_metric_names() -> RustRaftMetricNames {
+    RustRaftMetricNames {
+        ready: "rustraft_ready".to_string(),
+        append_latency_ms: "rustraft_append_latency_ms".to_string(),
+        vote_latency_ms: "rustraft_vote_latency_ms".to_string(),
+        read_index_latency_ms: "rustraft_read_index_latency_ms".to_string(),
+        snapshot_install_latency_ms: "rustraft_snapshot_install_latency_ms".to_string(),
+        peer_append_queue_depth: "rustraft_peer_append_queue_depth".to_string(),
+        peer_reorder_queue_depth: "rustraft_peer_reorder_queue_depth".to_string(),
+        peer_snapshot_installed_index: "rustraft_peer_snapshot_installed_index".to_string(),
+        wal_segment_count: "rustraft_wal_segment_count".to_string(),
     }
-    let ready = missing.is_empty() && contract.openraft_dependency_removed;
-    let production_status =
-        if !contract.openraft_dependency_removed || !production_blockers.is_empty() {
-            RustRaftProductionStatus::Blocked
-        } else if ready && contract.temporal_raft_runtime_available {
+}
+
+pub fn rustraft_parity_report(snapshot: &RustRaftReadinessSnapshot) -> RustRaftParityReport {
+    let contract = rustraft_parity_contract();
+    let evidence = rustraft_readiness_evidence(snapshot);
+    let satisfied = evidence
+        .iter()
+        .filter(|item| item.present)
+        .map(|item| item.requirement_id.clone())
+        .collect::<Vec<_>>();
+    let missing = evidence
+        .iter()
+        .filter(|item| !item.present)
+        .map(|item| item.requirement_id.clone())
+        .collect::<Vec<_>>();
+    let production_blockers = contract
+        .requirements
+        .iter()
+        .filter(|requirement| {
+            requirement.required_for_production && missing.iter().any(|id| id == &requirement.id)
+        })
+        .map(|requirement| format!("{:?}:{}", requirement.category, requirement.id).to_lowercase())
+        .collect::<Vec<_>>();
+    let ready = missing.is_empty() && production_blockers.is_empty();
+    RustRaftParityReport {
+        contract,
+        ready,
+        production_status: if ready {
             RustRaftProductionStatus::ProductionReady
         } else {
-            RustRaftProductionStatus::FeatureCorrect
-        };
-    RustRaftParityReport {
-        ready,
-        production_status,
-        contract,
+            RustRaftProductionStatus::Blocked
+        },
         satisfied,
         missing,
         production_blockers,
     }
 }
 
-pub fn rustraft_parity_report_from_snapshot(
-    readiness: &RustRaftReadinessSnapshot,
-) -> RustRaftParityReport {
-    rustraft_parity_report(readiness)
-}
+pub fn rustraft_production_readiness_report(
+    input: &RustRaftProductionReadinessInput,
+) -> RustRaftProductionReadinessReport {
+    let parity = rustraft_parity_report(&input.readiness);
+    let mut satisfied = parity
+        .satisfied
+        .iter()
+        .map(|id| format!("contract:{id}"))
+        .collect::<Vec<_>>();
+    let mut missing = parity
+        .missing
+        .iter()
+        .map(|id| format!("contract:{id}"))
+        .collect::<Vec<_>>();
+    let mut production_blockers = parity.production_blockers.clone();
+    let mut recommended_next_actions = Vec::new();
 
-impl RustRaftRequirementCategory {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RustRaftRequirementCategory::Safety => "safety",
-            RustRaftRequirementCategory::Durability => "durability",
-            RustRaftRequirementCategory::Transport => "transport",
-            RustRaftRequirementCategory::Snapshot => "snapshot",
-            RustRaftRequirementCategory::Membership => "membership",
-            RustRaftRequirementCategory::Observability => "observability",
+    if parity.ready {
+        satisfied.push("contract:all_required_semantics".to_string());
+    } else {
+        recommended_next_actions.push(
+            "fix RustRaft semantic contract/readiness gaps before production rollout".to_string(),
+        );
+    }
+
+    require_option(
+        "pipeline:evidence_present",
+        input.peer_pipeline.as_ref(),
+        &mut satisfied,
+        &mut missing,
+        &mut production_blockers,
+        &mut recommended_next_actions,
+        "attach per-peer pipeline evidence from the running RustRaft group",
+    );
+    if let Some(pipeline) = &input.peer_pipeline {
+        for (present, id, action) in [
+            (
+                pipeline.per_peer_pipeline_state_present,
+                "pipeline:per_peer_state",
+                "export per-peer replication/apply pipeline state",
+            ),
+            (
+                pipeline.append_backpressure_enforced,
+                "pipeline:append_backpressure",
+                "prove append queue backpressure under load",
+            ),
+            (
+                pipeline.apply_backpressure_enforced,
+                "pipeline:apply_backpressure",
+                "prove apply queue backpressure under load",
+            ),
+            (
+                pipeline.memory_replicate_bytes_enforced,
+                "pipeline:memory_replicate_bytes",
+                "prove max_memory_replicate_log_bytes enforcement",
+            ),
+            (
+                pipeline.oversized_log_rejection_present,
+                "pipeline:oversized_log_rejection",
+                "prove oversized log entry rejection",
+            ),
+            (
+                pipeline.out_of_order_append_handling_present,
+                "pipeline:out_of_order_append_handling",
+                "prove out-of-order append handling/rejection",
+            ),
+            (
+                pipeline.reorder_queue_enabled,
+                "pipeline:reorder_queue",
+                "enable and prove reorder queue behavior",
+            ),
+        ] {
+            require_bool(
+                present,
+                id,
+                &mut satisfied,
+                &mut missing,
+                &mut production_blockers,
+                &mut recommended_next_actions,
+                action,
+            );
         }
+    }
+
+    require_option(
+        "snapshot:evidence_present",
+        input.snapshot_lifecycle.as_ref(),
+        &mut satisfied,
+        &mut missing,
+        &mut production_blockers,
+        &mut recommended_next_actions,
+        "attach snapshot send/install lifecycle evidence",
+    );
+    if let Some(snapshot) = &input.snapshot_lifecycle {
+        for (present, id, action) in [
+            (
+                snapshot.sender_lifecycle_present,
+                "snapshot:sender_lifecycle",
+                "prove snapshot sender lifecycle",
+            ),
+            (
+                snapshot.downloader_lifecycle_present,
+                "snapshot:downloader_lifecycle",
+                "prove snapshot downloader/install lifecycle",
+            ),
+            (
+                snapshot.retry_backpressure_present,
+                "snapshot:retry_backpressure",
+                "prove snapshot retry/backpressure behavior",
+            ),
+            (
+                snapshot.rate_limit_present,
+                "snapshot:rate_limit",
+                "prove snapshot rate limiting",
+            ),
+            (
+                snapshot.install_progress_present,
+                "snapshot:install_progress",
+                "export snapshot install progress",
+            ),
+            (
+                snapshot.install_rollback_present,
+                "snapshot:install_rollback",
+                "prove snapshot install rollback",
+            ),
+            (
+                snapshot.membership_change_present,
+                "snapshot:membership_change",
+                "prove snapshot behavior during membership change",
+            ),
+            (
+                snapshot.rejoin_after_compacted_log_present,
+                "snapshot:rejoin_after_compacted_log",
+                "prove rejoin after compacted log",
+            ),
+        ] {
+            require_bool(
+                present,
+                id,
+                &mut satisfied,
+                &mut missing,
+                &mut production_blockers,
+                &mut recommended_next_actions,
+                action,
+            );
+        }
+    }
+
+    require_option(
+        "wal:evidence_present",
+        input.wal_lifecycle.as_ref(),
+        &mut satisfied,
+        &mut missing,
+        &mut production_blockers,
+        &mut recommended_next_actions,
+        "attach WAL segment/range/backpressure evidence",
+    );
+    if let Some(wal) = &input.wal_lifecycle {
+        for (present, id, action) in [
+            (
+                wal.segment_lifecycle_present,
+                "wal:segment_lifecycle",
+                "prove WAL segment lifecycle",
+            ),
+            (
+                wal.retained_range_present,
+                "wal:retained_range",
+                "prove retained WAL range reporting",
+            ),
+            (
+                wal.sequence_range_present,
+                "wal:sequence_range",
+                "prove WAL sequence range reporting",
+            ),
+            (
+                wal.log_index_range_present,
+                "wal:log_index_range",
+                "prove WAL log-index range reporting",
+            ),
+            (
+                wal.compaction_observed,
+                "wal:compaction",
+                "prove WAL compaction/released segment behavior",
+            ),
+            (
+                wal.slow_fsync_backpressure_observed,
+                "wal:slow_fsync_backpressure",
+                "prove slow fsync backpressure behavior",
+            ),
+        ] {
+            require_bool(
+                present,
+                id,
+                &mut satisfied,
+                &mut missing,
+                &mut production_blockers,
+                &mut recommended_next_actions,
+                action,
+            );
+        }
+    }
+
+    require_data_node_rollout(
+        input.data_node_rollout.as_ref(),
+        &mut satisfied,
+        &mut missing,
+        &mut production_blockers,
+        &mut recommended_next_actions,
+    );
+    require_meta_rollout(
+        input.metaserver_rollout.as_ref(),
+        &mut satisfied,
+        &mut missing,
+        &mut production_blockers,
+        &mut recommended_next_actions,
+    );
+    require_membership_transitions(
+        &input.membership_transitions,
+        &mut satisfied,
+        &mut missing,
+        &mut production_blockers,
+        &mut recommended_next_actions,
+    );
+
+    let ready = missing.is_empty() && production_blockers.is_empty();
+    RustRaftProductionReadinessReport {
+        parity,
+        public_api: rustraft_public_api_contract(),
+        ready,
+        production_status: if ready {
+            RustRaftProductionStatus::ProductionReady
+        } else {
+            RustRaftProductionStatus::Blocked
+        },
+        satisfied,
+        missing,
+        production_blockers,
+        recommended_next_actions,
     }
 }
 
-fn requirement(
+pub fn rustraft_membership_readiness_report(
+    transitions: &[RustRaftMembershipTransitionEvidence],
+) -> RustRaftMembershipReadinessReport {
+    let required = [
+        (
+            RustRaftMembershipScope::Metaserver,
+            RustRaftMembershipTransitionKind::Failover,
+        ),
+        (
+            RustRaftMembershipScope::Metaserver,
+            RustRaftMembershipTransitionKind::ScaleUp,
+        ),
+        (
+            RustRaftMembershipScope::Metaserver,
+            RustRaftMembershipTransitionKind::ScaleDown,
+        ),
+        (
+            RustRaftMembershipScope::DataNode,
+            RustRaftMembershipTransitionKind::Failover,
+        ),
+        (
+            RustRaftMembershipScope::DataNode,
+            RustRaftMembershipTransitionKind::ScaleUp,
+        ),
+        (
+            RustRaftMembershipScope::DataNode,
+            RustRaftMembershipTransitionKind::ScaleDown,
+        ),
+    ];
+    let mut satisfied = Vec::new();
+    let mut missing = Vec::new();
+    let mut decisions = Vec::new();
+
+    for (scope, transition) in required {
+        let id = membership_transition_id(scope, transition);
+        let Some(evidence) = transitions
+            .iter()
+            .find(|item| item.scope == scope && item.transition == transition)
+        else {
+            missing.push(format!("{id}:evidence_present"));
+            decisions.push(RustRaftMembershipTransitionDecision {
+                scope,
+                transition,
+                ready: false,
+                missing: vec!["evidence_present".to_string()],
+            });
+            continue;
+        };
+        let transition_missing = rustraft_membership_transition_missing(evidence);
+        if transition_missing.is_empty() {
+            satisfied.push(id);
+            decisions.push(RustRaftMembershipTransitionDecision {
+                scope,
+                transition,
+                ready: true,
+                missing: Vec::new(),
+            });
+        } else {
+            missing.extend(
+                transition_missing
+                    .iter()
+                    .map(|requirement| format!("{id}:{requirement}")),
+            );
+            decisions.push(RustRaftMembershipTransitionDecision {
+                scope,
+                transition,
+                ready: false,
+                missing: transition_missing,
+            });
+        }
+    }
+
+    RustRaftMembershipReadinessReport {
+        ready: missing.is_empty(),
+        satisfied,
+        missing,
+        decisions,
+    }
+}
+
+pub fn rustraft_membership_transition_missing(
+    evidence: &RustRaftMembershipTransitionEvidence,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    let before_majority = majority_size(evidence.before_voters.len());
+    let after_majority = majority_size(evidence.after_voters.len());
+    if evidence.before_voters.len() < 3 {
+        missing.push("before_voter_quorum_size".to_string());
+    }
+    if evidence.after_voters.len() < 3 {
+        missing.push("after_voter_quorum_size".to_string());
+    }
+    if evidence.commit_index_after < evidence.commit_index_before {
+        missing.push("monotonic_commit_index".to_string());
+    }
+    if evidence.applied_index_after < evidence.commit_index_after {
+        missing.push("apply_catches_commit".to_string());
+    }
+    if !evidence.old_majority_preserved {
+        missing.push(format!("old_majority_preserved_{before_majority}"));
+    }
+    if !evidence.new_majority_reached {
+        missing.push(format!("new_majority_reached_{after_majority}"));
+    }
+    if !evidence.stale_leader_rejected {
+        missing.push("stale_leader_rejected".to_string());
+    }
+    if !evidence.read_index_validated_after {
+        missing.push("read_index_after_transition".to_string());
+    }
+    if !evidence.write_validated_after {
+        missing.push("write_after_transition".to_string());
+    }
+    if !evidence.snapshot_floor_preserved {
+        missing.push("snapshot_floor_preserved".to_string());
+    }
+    if !evidence.secondary_replication_visible {
+        missing.push("secondary_replication_visible".to_string());
+    }
+    if matches!(evidence.scope, RustRaftMembershipScope::Metaserver)
+        && !evidence.scheduler_generation_advanced
+    {
+        missing.push("scheduler_generation_advanced".to_string());
+    }
+    match evidence.transition {
+        RustRaftMembershipTransitionKind::Failover => {
+            if evidence.leader_before.is_none() || evidence.leader_after.is_none() {
+                missing.push("leader_before_after_present".to_string());
+            }
+            if evidence.leader_before == evidence.leader_after {
+                missing.push("leader_changed_after_failover".to_string());
+            }
+            if evidence.failed_or_removed_nodes.is_empty() {
+                missing.push("failed_node_recorded".to_string());
+            }
+        }
+        RustRaftMembershipTransitionKind::ScaleUp => {
+            if !evidence.joint_consensus_used {
+                missing.push("joint_consensus_used".to_string());
+            }
+            if evidence.added_nodes.is_empty() {
+                missing.push("added_node_recorded".to_string());
+            }
+            if evidence.after_voters.len() <= evidence.before_voters.len() {
+                missing.push("voter_count_increased".to_string());
+            }
+            if evidence.caught_up_nodes.is_empty() {
+                missing.push("learner_catchup_observed".to_string());
+            }
+        }
+        RustRaftMembershipTransitionKind::ScaleDown => {
+            if !evidence.joint_consensus_used {
+                missing.push("joint_consensus_used".to_string());
+            }
+            if evidence.failed_or_removed_nodes.is_empty() {
+                missing.push("removed_node_recorded".to_string());
+            }
+            if evidence.after_voters.len() >= evidence.before_voters.len() {
+                missing.push("voter_count_decreased".to_string());
+            }
+        }
+    }
+    missing.extend(
+        evidence
+            .blockers
+            .iter()
+            .map(|blocker| format!("blocker:{blocker}")),
+    );
+    missing
+}
+
+pub fn rustraft_pipeline_evidence(
+    peers: &[RustRaftPeerPipelineStatus],
+    limits: RustRaftPipelineLimits,
+) -> RustRaftPipelineEvidence {
+    RustRaftPipelineEvidence {
+        per_peer_pipeline_state_present: !peers.is_empty(),
+        append_backpressure_enforced: peers.iter().any(|peer| {
+            peer.append_queue_limit == limits.max_inflights_replicate
+                && (peer.append_queue_max_depth >= peer.append_queue_limit
+                    || peer.append_queue_depth >= peer.append_queue_limit)
+        }),
+        apply_backpressure_enforced: peers.iter().any(|peer| {
+            peer.apply_inflight_limit == limits.max_inflights_apply_task
+                && (peer.apply_backpressure_rejections > 0
+                    || peer.apply_queue_max_depth >= peer.apply_inflight_limit)
+        }),
+        memory_replicate_bytes_enforced: peers.iter().any(|peer| {
+            peer.inflight_bytes_limit == limits.max_memory_replicate_log_bytes
+                && peer.memory_backpressure_rejections > 0
+        }),
+        oversized_log_rejection_present: peers.iter().any(|peer| peer.oversized_log_rejections > 0),
+        out_of_order_append_handling_present: peers.iter().any(|peer| {
+            peer.out_of_order_append_rejections > 0
+                || peer.reorder_entries_rejected > 0
+                || peer.reorder_entry_timeouts > 0
+                || peer.reorder_dropped_packages > 0
+        }),
+        reorder_queue_enabled: limits.enable_reorder_queue
+            && limits.reorder_window_size > 0
+            && limits.reorder_timeout_us > 0
+            && peers.iter().any(|peer| peer.reorder_queue_depth > 0),
+    }
+}
+
+pub fn rustraft_snapshot_lifecycle_evidence(
+    peers: &[RustRaftPeerPipelineStatus],
+    send_snapshot_timeout_ms: u64,
+    max_inflights_replicate: u64,
+) -> RustRaftSnapshotLifecycleEvidence {
+    RustRaftSnapshotLifecycleEvidence {
+        sender_lifecycle_present: send_snapshot_timeout_ms > 0
+            && peers
+                .iter()
+                .any(|peer| peer.snapshot_sending || peer.snapshot_send_attempts > 0),
+        downloader_lifecycle_present: peers
+            .iter()
+            .any(|peer| peer.snapshot_installing || peer.snapshot_install_total_chunks > 0),
+        retry_backpressure_present: peers.iter().any(|peer| {
+            peer.snapshot_backpressure_rejections > 0
+                || (max_inflights_replicate > 0
+                    && peer.snapshot_send_attempts > max_inflights_replicate)
+        }),
+        rate_limit_present: peers
+            .iter()
+            .any(|peer| peer.snapshot_rate_limit_rejections > 0),
+        install_progress_present: peers.iter().any(|peer| {
+            peer.snapshot_installed_index > 0 || peer.snapshot_install_progress_per_mille > 0
+        }),
+        install_rollback_present: peers
+            .iter()
+            .any(|peer| peer.snapshot_install_rolled_back > 0),
+        membership_change_present: peers
+            .iter()
+            .any(|peer| peer.snapshot_during_membership_change),
+        rejoin_after_compacted_log_present: peers
+            .iter()
+            .any(|peer| peer.snapshot_rejoin_after_compacted_log),
+    }
+}
+
+pub fn rustraft_wal_lifecycle_evidence(
+    status: &RustRaftWalLifecycleStatus,
+) -> RustRaftWalLifecycleEvidence {
+    RustRaftWalLifecycleEvidence {
+        segment_lifecycle_present: status.segment_count > 0
+            && status.active_segment_id >= status.first_retained_segment_id
+            && status.last_retained_segment_id >= status.first_retained_segment_id,
+        retained_range_present: status.first_retained_segment_id <= status.last_retained_segment_id,
+        sequence_range_present: status.first_sequence <= status.last_sequence
+            && status.total_records > 0,
+        log_index_range_present: status.first_log_index <= status.last_log_index
+            && status.last_log_index > 0,
+        compaction_observed: status.released_segment_count > 0,
+        slow_fsync_backpressure_observed: status.slow_fsync_backpressure_observed,
+    }
+}
+
+pub fn rustraft_readiness_evidence(
+    snapshot: &RustRaftReadinessSnapshot,
+) -> Vec<RustRaftReadinessEvidence> {
+    rustraft_requirements()
+        .into_iter()
+        .map(|requirement| RustRaftReadinessEvidence {
+            present: readiness_field_present(snapshot, &requirement.readiness_field),
+            requirement_id: requirement.id,
+            readiness_field: requirement.readiness_field,
+        })
+        .collect()
+}
+
+pub fn rustraft_read_safety_decision(
+    status: &RustRaftStatusSnapshot,
+    request: &RustRaftReadIndexRequest,
+) -> RustRaftReadSafetyDecision {
+    if status.group_id != request.group_id {
+        return RustRaftReadSafetyDecision {
+            safe: false,
+            read_index: status.commit_index,
+            lease_read: false,
+            reason: "group_mismatch".to_string(),
+        };
+    }
+    if !matches!(status.role, RustRaftRole::Leader) {
+        return RustRaftReadSafetyDecision {
+            safe: false,
+            read_index: status.commit_index,
+            lease_read: false,
+            reason: "not_leader".to_string(),
+        };
+    }
+    if status.applied_index < request.min_commit_index {
+        return RustRaftReadSafetyDecision {
+            safe: false,
+            read_index: status.commit_index,
+            lease_read: false,
+            reason: "apply_lag".to_string(),
+        };
+    }
+    RustRaftReadSafetyDecision {
+        safe: true,
+        read_index: status.commit_index,
+        lease_read: request.allow_lease_read,
+        reason: "safe".to_string(),
+    }
+}
+
+pub fn rustraft_learner_promotion_decision(
+    status: &RustRaftStatusSnapshot,
+    learner_id: u64,
+    max_lag: u64,
+) -> RustRaftLearnerPromotionDecision {
+    let Some(peer) = status.peers.iter().find(|peer| peer.node_id == learner_id) else {
+        return RustRaftLearnerPromotionDecision {
+            promotable: false,
+            learner_id,
+            learner_match_index: 0,
+            required_match_index: status.commit_index.saturating_sub(max_lag),
+            reason: "learner_missing".to_string(),
+        };
+    };
+    let required_match_index = status.commit_index.saturating_sub(max_lag);
+    let promotable = peer.learner && peer.healthy && peer.matched >= required_match_index;
+    RustRaftLearnerPromotionDecision {
+        promotable,
+        learner_id,
+        learner_match_index: peer.matched,
+        required_match_index,
+        reason: if promotable {
+            "caught_up".to_string()
+        } else {
+            "not_caught_up".to_string()
+        },
+    }
+}
+
+pub fn rustraft_append_safety_decision(
+    first_retained_log_index: u64,
+    snapshot_index: u64,
+    request: &RustRaftAppendEntriesRequest,
+) -> RustRaftAppendSafetyDecision {
+    let prev_index = request.prev_log_id.as_ref().map(|id| id.index).unwrap_or(0);
+    if prev_index > 0 && prev_index < first_retained_log_index && prev_index <= snapshot_index {
+        return RustRaftAppendSafetyDecision {
+            accepted: false,
+            rejected_compacted_entry: true,
+            reason: "prev_log_compacted".to_string(),
+        };
+    }
+    if request
+        .entries
+        .iter()
+        .any(|entry| entry.log_id.index < first_retained_log_index)
+    {
+        return RustRaftAppendSafetyDecision {
+            accepted: false,
+            rejected_compacted_entry: true,
+            reason: "entry_compacted".to_string(),
+        };
+    }
+    RustRaftAppendSafetyDecision {
+        accepted: true,
+        rejected_compacted_entry: false,
+        reason: "accepted".to_string(),
+    }
+}
+
+fn rustraft_requirements() -> Vec<RustRaftSemanticRequirement> {
+    use RustRaftRequirementCategory::*;
+    [
+        (
+            "leader_write_authority",
+            Safety,
+            "rustraft_leader_write_authority_present",
+        ),
+        (
+            "operator_observability",
+            Observability,
+            "rustraft_operator_observability_present",
+        ),
+        (
+            "rpc_transport_contract",
+            Transport,
+            "rustraft_rpc_transport_contract_present",
+        ),
+        (
+            "snapshot_trigger",
+            Durability,
+            "rustraft_log_retention_snapshot_trigger_present",
+        ),
+        (
+            "apply_snapshot_fence",
+            Durability,
+            "rustraft_apply_snapshot_fence_present",
+        ),
+        (
+            "storage_apply_fence",
+            Durability,
+            "raft_storage_apply_fence_present",
+        ),
+        (
+            "snapshot_floor_log_matching",
+            Durability,
+            "rustraft_snapshot_floor_log_matching_present",
+        ),
+        (
+            "snapshot_tail_catchup",
+            Durability,
+            "rustraft_snapshot_tail_catchup_present",
+        ),
+        (
+            "compacted_entry_rejection",
+            Safety,
+            "rustraft_compacted_entry_rejection_present",
+        ),
+        (
+            "metaserver_snapshot_floor_election",
+            Safety,
+            "rustraft_metaserver_snapshot_floor_election_present",
+        ),
+        (
+            "learner_catchup_promotion",
+            Membership,
+            "learner_catchup_promotion_present",
+        ),
+        (
+            "metaserver_membership_workflow",
+            Membership,
+            "metaserver_membership_workflow_present",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(id, category, readiness_field)| RustRaftSemanticRequirement {
+            id: id.to_string(),
+            category,
+            readiness_field: readiness_field.to_string(),
+            required_for_production: true,
+        },
+    )
+    .collect()
+}
+
+fn require_option<T>(
     id: &str,
-    description: &str,
-    readiness_field: &str,
-    category: RustRaftRequirementCategory,
-) -> RustRaftSemanticRequirement {
-    RustRaftSemanticRequirement {
-        id: id.to_string(),
-        description: description.to_string(),
-        readiness_field: readiness_field.to_string(),
-        category,
-        required_for_production: true,
+    value: Option<&T>,
+    satisfied: &mut Vec<String>,
+    missing: &mut Vec<String>,
+    blockers: &mut Vec<String>,
+    actions: &mut Vec<String>,
+    action: &str,
+) {
+    require_bool(
+        value.is_some(),
+        id,
+        satisfied,
+        missing,
+        blockers,
+        actions,
+        action,
+    );
+}
+
+fn require_bool(
+    present: bool,
+    id: &str,
+    satisfied: &mut Vec<String>,
+    missing: &mut Vec<String>,
+    blockers: &mut Vec<String>,
+    actions: &mut Vec<String>,
+    action: &str,
+) {
+    if present {
+        satisfied.push(id.to_string());
+    } else {
+        missing.push(id.to_string());
+        blockers.push(id.to_string());
+        actions.push(action.to_string());
+    }
+}
+
+fn require_data_node_rollout(
+    rollout: Option<&RustRaftDataNodeProcessRolloutReport>,
+    satisfied: &mut Vec<String>,
+    missing: &mut Vec<String>,
+    blockers: &mut Vec<String>,
+    actions: &mut Vec<String>,
+) {
+    require_option(
+        "data_node:evidence_present",
+        rollout,
+        satisfied,
+        missing,
+        blockers,
+        actions,
+        "attach data-node process rollout evidence",
+    );
+    let Some(rollout) = rollout else {
+        return;
+    };
+    for (present, id, action) in [
+        (
+            rollout.ready,
+            "data_node:ready",
+            "make data-node rollout ready",
+        ),
+        (
+            rollout.blockers.is_empty(),
+            "data_node:no_blockers",
+            "clear data-node rollout blockers",
+        ),
+        (
+            !rollout.nodes.is_empty()
+                && rollout.spawned_process_count as usize >= rollout.nodes.len(),
+            "data_node:processes_spawned",
+            "spawn and observe all data-node RustRaft processes",
+        ),
+        (
+            !rollout.voters.is_empty(),
+            "data_node:voters_present",
+            "run data-node RustRaft with voter membership",
+        ),
+        (
+            rollout.independent_wal_dirs,
+            "data_node:independent_wal_dirs",
+            "use independent WAL dirs per data-node process",
+        ),
+        (
+            rollout.independent_snapshot_dirs,
+            "data_node:independent_snapshot_dirs",
+            "use independent snapshot dirs per data-node process",
+        ),
+        (
+            rollout.write_proposed_through_process_api,
+            "data_node:process_write_path",
+            "prove writes enter through the process API",
+        ),
+        (
+            rollout.read_index_responses_observed > 0,
+            "data_node:read_index",
+            "observe data-node read-index responses",
+        ),
+        (
+            rollout.leader_transfer_validated,
+            "data_node:leader_transfer",
+            "validate data-node leader transfer",
+        ),
+        (
+            rollout.failover_validated,
+            "data_node:failover",
+            "validate data-node failover",
+        ),
+        (
+            rollout.membership_change_validated,
+            "data_node:membership_change",
+            "validate data-node membership add/promote/remove",
+        ),
+        (
+            rollout.follower_lag_validated,
+            "data_node:follower_lag",
+            "validate data-node follower lag handling",
+        ),
+        (
+            rollout.secondary_read_validated,
+            "data_node:secondary_read",
+            "validate data-node secondary read eligibility",
+        ),
+        (
+            rollout.recovered_after_restart && rollout.restart_recovery_validated,
+            "data_node:restart_recovery",
+            "validate data-node restart recovery",
+        ),
+        (
+            rollout.snapshot_install_validated,
+            "data_node:snapshot_install",
+            "validate data-node snapshot install",
+        ),
+        (
+            rollout.applied_fence_validated,
+            "data_node:apply_fence",
+            "validate data-node apply fence",
+        ),
+        (
+            rollout.multi_process_log_store_validated,
+            "data_node:multi_process_log_store",
+            "validate independent multi-process log stores",
+        ),
+        (
+            rollout.operational_semantics.proves_runtime_semantics(),
+            "data_node:operational_semantics",
+            "prove data-node runtime semantics, not only API presence",
+        ),
+    ] {
+        require_bool(present, id, satisfied, missing, blockers, actions, action);
+    }
+    for missing_requirement in rollout.operational_semantics.missing_requirements() {
+        require_bool(
+            false,
+            &format!("data_node:semantics:{missing_requirement}"),
+            satisfied,
+            missing,
+            blockers,
+            actions,
+            "complete data-node operational semantics evidence",
+        );
+    }
+    for blocker in &rollout.blockers {
+        require_bool(
+            false,
+            &format!("data_node:blocker:{blocker}"),
+            satisfied,
+            missing,
+            blockers,
+            actions,
+            "clear data-node rollout blocker",
+        );
+    }
+}
+
+fn require_meta_rollout(
+    rollout: Option<&RustRaftMetaProcessRolloutReport>,
+    satisfied: &mut Vec<String>,
+    missing: &mut Vec<String>,
+    blockers: &mut Vec<String>,
+    actions: &mut Vec<String>,
+) {
+    require_option(
+        "metaserver:evidence_present",
+        rollout,
+        satisfied,
+        missing,
+        blockers,
+        actions,
+        "attach metaserver process rollout evidence",
+    );
+    let Some(rollout) = rollout else {
+        return;
+    };
+    for (present, id, action) in [
+        (
+            rollout.ready,
+            "metaserver:ready",
+            "make metaserver rollout ready",
+        ),
+        (
+            rollout.blockers.is_empty(),
+            "metaserver:no_blockers",
+            "clear metaserver rollout blockers",
+        ),
+        (
+            !rollout.nodes.is_empty()
+                && rollout.spawned_process_count as usize >= rollout.nodes.len(),
+            "metaserver:processes_spawned",
+            "spawn and observe all metaserver RustRaft processes",
+        ),
+        (
+            !rollout.voters.is_empty(),
+            "metaserver:voters_present",
+            "run metaserver RustRaft with voter membership",
+        ),
+        (
+            rollout.independent_wal_dirs,
+            "metaserver:independent_wal_dirs",
+            "use independent WAL dirs per metaserver process",
+        ),
+        (
+            rollout.independent_snapshot_dirs,
+            "metaserver:independent_snapshot_dirs",
+            "use independent snapshot dirs per metaserver process",
+        ),
+        (
+            rollout.mutation_proposed_through_process_api,
+            "metaserver:process_mutation_path",
+            "prove metaserver mutations enter through the process API",
+        ),
+        (
+            rollout.read_index_responses_observed > 0 && rollout.read_index_validated,
+            "metaserver:read_index",
+            "validate metaserver read-index responses",
+        ),
+        (
+            rollout.applied_raft_mutations > 0,
+            "metaserver:applied_mutations",
+            "observe applied metaserver RustRaft mutations",
+        ),
+        (
+            rollout.scheduler_task_replay_validated,
+            "metaserver:scheduler_replay",
+            "validate scheduler task replay from RustRaft log",
+        ),
+        (
+            rollout.data_node_membership_results_ready
+                && rollout.data_node_membership_workflow_report_attached
+                && rollout.data_node_raft_group_results_observed,
+            "metaserver:data_node_membership_workflow",
+            "validate data-node membership workflow through metaserver RustRaft",
+        ),
+        (
+            rollout.failover_validated,
+            "metaserver:failover",
+            "validate metaserver failover",
+        ),
+        (
+            rollout.membership_change_validated,
+            "metaserver:membership_change",
+            "validate metaserver membership change",
+        ),
+        (
+            rollout.follower_lag_validated,
+            "metaserver:follower_lag",
+            "validate metaserver follower lag handling",
+        ),
+        (
+            rollout.secondary_read_validated,
+            "metaserver:secondary_read",
+            "validate metaserver secondary read eligibility",
+        ),
+        (
+            rollout.recovered_after_restart,
+            "metaserver:restart_recovery",
+            "validate metaserver restart recovery",
+        ),
+        (
+            rollout.snapshot_install_validated,
+            "metaserver:snapshot_install",
+            "validate metaserver snapshot install",
+        ),
+        (
+            rollout.multi_process_log_store_validated,
+            "metaserver:multi_process_log_store",
+            "validate independent metaserver log stores",
+        ),
+        (
+            rollout.operational_semantics.proves_runtime_semantics(),
+            "metaserver:operational_semantics",
+            "prove metaserver runtime semantics, not only API presence",
+        ),
+    ] {
+        require_bool(present, id, satisfied, missing, blockers, actions, action);
+    }
+    for missing_requirement in rollout.operational_semantics.missing_requirements() {
+        require_bool(
+            false,
+            &format!("metaserver:semantics:{missing_requirement}"),
+            satisfied,
+            missing,
+            blockers,
+            actions,
+            "complete metaserver operational semantics evidence",
+        );
+    }
+    for blocker in &rollout.blockers {
+        require_bool(
+            false,
+            &format!("metaserver:blocker:{blocker}"),
+            satisfied,
+            missing,
+            blockers,
+            actions,
+            "clear metaserver rollout blocker",
+        );
+    }
+}
+
+fn require_membership_transitions(
+    transitions: &[RustRaftMembershipTransitionEvidence],
+    satisfied: &mut Vec<String>,
+    missing: &mut Vec<String>,
+    blockers: &mut Vec<String>,
+    actions: &mut Vec<String>,
+) {
+    let report = rustraft_membership_readiness_report(transitions);
+    if report.ready {
+        satisfied.push("membership:all_required_transitions".to_string());
+    } else {
+        missing.extend(report.missing.iter().map(|id| format!("membership:{id}")));
+        blockers.extend(report.missing.iter().map(|id| format!("membership:{id}")));
+        actions.push(
+            "run metaserver and data-node RustRaft failover, scale-up, and scale-down transitions"
+                .to_string(),
+        );
+    }
+    for id in report.satisfied {
+        satisfied.push(format!("membership:{id}"));
+    }
+}
+
+fn membership_transition_id(
+    scope: RustRaftMembershipScope,
+    transition: RustRaftMembershipTransitionKind,
+) -> String {
+    format!("{scope:?}:{transition:?}").to_lowercase()
+}
+
+fn majority_size(voters: usize) -> usize {
+    voters / 2 + 1
+}
+
+fn readiness_field_present(snapshot: &RustRaftReadinessSnapshot, field: &str) -> bool {
+    match field {
+        "rustraft_leader_write_authority_present" => {
+            snapshot.rustraft_leader_write_authority_present
+        }
+        "rustraft_operator_observability_present" => {
+            snapshot.rustraft_operator_observability_present
+        }
+        "rustraft_rpc_transport_contract_present" => {
+            snapshot.rustraft_rpc_transport_contract_present
+        }
+        "rustraft_log_retention_snapshot_trigger_present" => {
+            snapshot.rustraft_log_retention_snapshot_trigger_present
+        }
+        "rustraft_apply_snapshot_fence_present" => snapshot.rustraft_apply_snapshot_fence_present,
+        "raft_storage_apply_fence_present" => snapshot.raft_storage_apply_fence_present,
+        "rustraft_snapshot_floor_log_matching_present" => {
+            snapshot.rustraft_snapshot_floor_log_matching_present
+        }
+        "rustraft_snapshot_tail_catchup_present" => snapshot.rustraft_snapshot_tail_catchup_present,
+        "rustraft_compacted_entry_rejection_present" => {
+            snapshot.rustraft_compacted_entry_rejection_present
+        }
+        "rustraft_metaserver_snapshot_floor_election_present" => {
+            snapshot.rustraft_metaserver_snapshot_floor_election_present
+        }
+        "learner_catchup_promotion_present" => snapshot.learner_catchup_promotion_present,
+        "metaserver_membership_workflow_present" => snapshot.metaserver_membership_workflow_present,
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
-    #[derive(Default)]
-    struct MemoryRustRaftStorage {
-        entries: BTreeMap<RustRaftLogIndex, RustRaftLogEntry>,
-        hard_state: RustRaftHardState,
-        snapshots: BTreeMap<String, Vec<u8>>,
-        compacted_through: RustRaftLogIndex,
-    }
-
-    impl RustRaftStorage for MemoryRustRaftStorage {
-        type Error = String;
-
-        fn append_entries(&mut self, entries: &[RustRaftLogEntry]) -> Result<(), Self::Error> {
-            for entry in entries {
-                if entry.log_id.index <= self.compacted_through {
-                    return Err("entry_compacted".to_string());
-                }
-                self.entries.insert(entry.log_id.index, entry.clone());
-            }
-            Ok(())
-        }
-
-        fn read_entries(
-            &self,
-            start: RustRaftLogIndex,
-            end: RustRaftLogIndex,
-        ) -> Result<Vec<RustRaftLogEntry>, Self::Error> {
-            Ok(self
-                .entries
-                .range(start..end)
-                .map(|(_, entry)| entry.clone())
-                .collect())
-        }
-
-        fn save_hard_state(&mut self, hard_state: &RustRaftHardState) -> Result<(), Self::Error> {
-            self.hard_state = hard_state.clone();
-            Ok(())
-        }
-
-        fn load_hard_state(&self) -> Result<RustRaftHardState, Self::Error> {
-            Ok(self.hard_state.clone())
-        }
-
-        fn save_snapshot(
-            &mut self,
-            meta: &RustRaftSnapshotMeta,
-            bytes: &[u8],
-        ) -> Result<(), Self::Error> {
-            self.snapshots
-                .insert(meta.snapshot_id.clone(), bytes.to_vec());
-            Ok(())
-        }
-
-        fn load_snapshot(&self, snapshot_id: &str) -> Result<Vec<u8>, Self::Error> {
-            self.snapshots
-                .get(snapshot_id)
-                .cloned()
-                .ok_or_else(|| "snapshot_not_found".to_string())
-        }
-
-        fn tombstone_compacted_entries(
-            &mut self,
-            compacted_through: RustRaftLogIndex,
-        ) -> Result<(), Self::Error> {
-            self.compacted_through = compacted_through;
-            self.entries
-                .retain(|index, _| *index > self.compacted_through);
-            Ok(())
-        }
-    }
-
-    struct LoopbackRustRaftTransport;
-
-    impl RustRaftTransport for LoopbackRustRaftTransport {
-        type Error = String;
-
-        fn append_entries(
-            &self,
-            _target: RustRaftNodeId,
-            request: RustRaftAppendEntriesRequest,
-        ) -> Result<RustRaftAppendEntriesResponse, Self::Error> {
-            Ok(RustRaftAppendEntriesResponse {
-                term: request.term,
-                success: true,
-                match_index: request
-                    .entries
-                    .last()
-                    .map(|entry| entry.log_id.index)
-                    .unwrap_or_else(|| request.prev_log_id.map(|log| log.index).unwrap_or(0)),
-                conflict_index: None,
-            })
-        }
-
-        fn vote(
-            &self,
-            _target: RustRaftNodeId,
-            request: RustRaftVoteRequest,
-        ) -> Result<RustRaftVoteResponse, Self::Error> {
-            Ok(RustRaftVoteResponse {
-                term: request.term,
-                vote_granted: request.last_log_id.is_some(),
-                reason: if request.pre_vote {
-                    "pre_vote_checked".to_string()
-                } else {
-                    "vote_checked".to_string()
-                },
-            })
-        }
-
-        fn install_snapshot(
-            &self,
-            _target: RustRaftNodeId,
-            request: RustRaftInstallSnapshotRequest,
-        ) -> Result<RustRaftInstallSnapshotResponse, Self::Error> {
-            Ok(RustRaftInstallSnapshotResponse {
-                term: request.term,
-                accepted: request.chunk.done,
-                next_offset: request.chunk.offset + request.chunk.bytes.len() as u64,
-                reason: "snapshot_chunk_checked".to_string(),
-            })
-        }
-
-        fn read_index(
-            &self,
-            _target: RustRaftNodeId,
-            request: RustRaftReadIndexRequest,
-        ) -> Result<RustRaftReadIndexResponse, Self::Error> {
-            Ok(RustRaftReadIndexResponse {
-                term: 7,
-                read_index: request.min_commit_index,
-                lease_read: request.allow_lease_read,
-                safe: true,
-                reason: "read_index_checked".to_string(),
-            })
-        }
-    }
-
-    #[test]
-    fn contract_contains_production_semantics_without_openraft() {
-        let contract = rustraft_parity_contract();
-        assert!(contract.openraft_dependency_removed);
-        assert!(contract
-            .requirements
-            .iter()
-            .any(|requirement| requirement.id == "leader_write_authority"));
-        assert!(contract
-            .requirements
-            .iter()
-            .all(|requirement| requirement.required_for_production));
-    }
-
-    #[test]
-    fn report_lists_missing_fields() {
-        let mut readiness = RustRaftReadinessSnapshot::default();
-        readiness.rustraft_leader_write_authority_present = true;
-
-        let report = rustraft_parity_report(&readiness);
-        assert!(!report.ready);
-        assert!(report
-            .satisfied
-            .contains(&"leader_write_authority".to_string()));
-        assert!(report
-            .missing
-            .contains(&"operator_observability".to_string()));
-        assert_eq!(report.production_status, RustRaftProductionStatus::Blocked);
-        assert!(report
-            .production_blockers
-            .iter()
-            .any(|blocker| { blocker == "observability:operator_observability" }));
-    }
-
-    #[test]
-    fn report_marks_complete_readiness_as_production_ready() {
-        let readiness = RustRaftReadinessSnapshot {
+    fn ready_snapshot() -> RustRaftReadinessSnapshot {
+        RustRaftReadinessSnapshot {
             rustraft_leader_write_authority_present: true,
             rustraft_operator_observability_present: true,
             rustraft_rpc_transport_contract_present: true,
@@ -1147,377 +2029,460 @@ mod tests {
             rustraft_metaserver_snapshot_floor_election_present: true,
             learner_catchup_promotion_present: true,
             metaserver_membership_workflow_present: true,
-        };
+        }
+    }
 
-        let report = rustraft_parity_report(&readiness);
-        assert!(report.ready);
+    fn ready_operational_semantics() -> RustRaftProcessOperationalSemanticsEvidence {
+        RustRaftProcessOperationalSemanticsEvidence {
+            api_presence_only_rejected: true,
+            process_path_validated: true,
+            read_index_validated: true,
+            leader_lease_validated: true,
+            stale_leader_lease_rejection_observed: true,
+            follower_lease_expiration_observed: true,
+            lagging_follower_read_rejected: true,
+            bounded_stale_read_acceptance_observed: true,
+            bounded_stale_read_rejection_observed: true,
+            minority_partition_read_rejection_observed: true,
+            healed_follower_catchup_observed: true,
+            stale_follower_write_rejected: true,
+            leader_transfer_exact_once_validated: true,
+            leader_transfer_under_load_validated: true,
+            snapshot_bootstrap_validated: true,
+            snapshot_install_restart_validated: true,
+            membership_rescale_validated: true,
+            membership_add_promote_remove_validated: true,
+            follower_rejoin_after_compaction_validated: true,
+            secondary_read_eligibility_validated: true,
+            apply_pipeline_converged: true,
+            wal_persistence_observed: true,
+            fsm_apply_idempotent_replay_observed: true,
+            storage_mutation_wal_fence_atomicity_observed: true,
+            snapshot_install_apply_fence_atomicity_observed: true,
+            process_restart_after_apply_crash_recovered: true,
+            ready: true,
+            blockers: Vec::new(),
+        }
+    }
+
+    fn ready_process_nodes() -> Vec<RustRaftProcessNodeEvidence> {
+        vec![
+            RustRaftProcessNodeEvidence {
+                node_id: 1,
+                addr: "127.0.0.1:19001".to_string(),
+                wal_dir: "/tmp/rustraft/node1/wal".to_string(),
+                snapshot_dir: "/tmp/rustraft/node1/snapshots".to_string(),
+                commit_index: 42,
+                applied_index: 42,
+                snapshot_id: Some("snap-40".to_string()),
+                restarted: true,
+                log_store_validated: true,
+            },
+            RustRaftProcessNodeEvidence {
+                node_id: 2,
+                addr: "127.0.0.1:19002".to_string(),
+                wal_dir: "/tmp/rustraft/node2/wal".to_string(),
+                snapshot_dir: "/tmp/rustraft/node2/snapshots".to_string(),
+                commit_index: 42,
+                applied_index: 42,
+                snapshot_id: Some("snap-40".to_string()),
+                restarted: true,
+                log_store_validated: true,
+            },
+        ]
+    }
+
+    fn ready_data_node_rollout() -> RustRaftDataNodeProcessRolloutReport {
+        RustRaftDataNodeProcessRolloutReport {
+            shard_id: 7,
+            voters: vec![1, 2, 3],
+            learners: vec![4],
+            nodes: ready_process_nodes(),
+            spawned_process_count: 2,
+            independent_wal_dirs: true,
+            independent_snapshot_dirs: true,
+            observed_process_requests: 16,
+            read_index_responses_observed: 8,
+            restarted_node_count: 2,
+            per_node_log_store_inspection_count: 2,
+            write_proposed_through_process_api: true,
+            leader_transfer_validated: true,
+            failover_validated: true,
+            secondary_lag_observed: true,
+            lagging_follower_read_rejection_observed: true,
+            stale_follower_write_rejection_observed: true,
+            catchup_read_eligibility_observed: true,
+            minority_partition_rejection_observed: true,
+            bounded_stale_read_eligibility_observed: true,
+            healed_follower_catchup_observed: true,
+            lagging_follower_observed_lag: 3,
+            membership_change_validated: true,
+            follower_lag_validated: true,
+            secondary_read_validated: true,
+            recovered_after_restart: true,
+            restart_recovery_validated: true,
+            snapshot_install_validated: true,
+            applied_fence_validated: true,
+            crash_after_storage_mutation_recovered: true,
+            crash_after_wal_persist_recovered: true,
+            crash_during_snapshot_install_recovered: true,
+            apply_fence_recovered_after_restart: true,
+            multi_process_log_store_validated: true,
+            operational_semantics: ready_operational_semantics(),
+            ready: true,
+            blockers: Vec::new(),
+        }
+    }
+
+    fn ready_meta_rollout() -> RustRaftMetaProcessRolloutReport {
+        RustRaftMetaProcessRolloutReport {
+            voters: vec![1, 2, 3],
+            learners: vec![4],
+            nodes: ready_process_nodes(),
+            spawned_process_count: 2,
+            independent_wal_dirs: true,
+            independent_snapshot_dirs: true,
+            observed_process_requests: 20,
+            read_index_responses_observed: 10,
+            restarted_node_count: 2,
+            per_node_log_store_inspection_count: 2,
+            mutation_proposed_through_process_api: true,
+            applied_raft_mutations: 12,
+            generated_scheduler_tasks: 4,
+            scheduler_retries: 1,
+            stale_scheduler_token_rejected: true,
+            data_node_membership_results_ready: true,
+            scheduler_mutations_proposed_through_process_api: true,
+            scheduler_task_replay_from_raft_log_observed: true,
+            membership_mutations_proposed_through_process_api: true,
+            data_node_membership_workflow_report_attached: true,
+            data_node_raft_group_results_observed: true,
+            failover_validated: true,
+            membership_change_validated: true,
+            follower_lag_validated: true,
+            secondary_read_validated: true,
+            read_index_validated: true,
+            snapshot_install_validated: true,
+            recovered_after_restart: true,
+            scheduler_task_replay_validated: true,
+            crash_after_meta_mutation_recovered: true,
+            crash_after_meta_wal_persist_recovered: true,
+            crash_during_meta_snapshot_install_recovered: true,
+            meta_apply_fence_recovered_after_restart: true,
+            multi_process_log_store_validated: true,
+            operational_semantics: ready_operational_semantics(),
+            ready: true,
+            blockers: Vec::new(),
+        }
+    }
+
+    fn membership_transition(
+        scope: RustRaftMembershipScope,
+        transition: RustRaftMembershipTransitionKind,
+    ) -> RustRaftMembershipTransitionEvidence {
+        match transition {
+            RustRaftMembershipTransitionKind::Failover => RustRaftMembershipTransitionEvidence {
+                scope,
+                transition,
+                before_voters: vec![1, 2, 3],
+                after_voters: vec![1, 2, 3],
+                before_learners: Vec::new(),
+                after_learners: Vec::new(),
+                leader_before: Some(1),
+                leader_after: Some(2),
+                failed_or_removed_nodes: vec![1],
+                added_nodes: Vec::new(),
+                caught_up_nodes: vec![2, 3],
+                commit_index_before: 100,
+                commit_index_after: 104,
+                applied_index_after: 104,
+                joint_consensus_used: false,
+                old_majority_preserved: true,
+                new_majority_reached: true,
+                stale_leader_rejected: true,
+                read_index_validated_after: true,
+                write_validated_after: true,
+                snapshot_floor_preserved: true,
+                secondary_replication_visible: true,
+                scheduler_generation_advanced: matches!(scope, RustRaftMembershipScope::Metaserver),
+                blockers: Vec::new(),
+            },
+            RustRaftMembershipTransitionKind::ScaleUp => RustRaftMembershipTransitionEvidence {
+                scope,
+                transition,
+                before_voters: vec![1, 2, 3],
+                after_voters: vec![1, 2, 3, 4],
+                before_learners: vec![4],
+                after_learners: Vec::new(),
+                leader_before: Some(1),
+                leader_after: Some(1),
+                failed_or_removed_nodes: Vec::new(),
+                added_nodes: vec![4],
+                caught_up_nodes: vec![4],
+                commit_index_before: 100,
+                commit_index_after: 108,
+                applied_index_after: 108,
+                joint_consensus_used: true,
+                old_majority_preserved: true,
+                new_majority_reached: true,
+                stale_leader_rejected: true,
+                read_index_validated_after: true,
+                write_validated_after: true,
+                snapshot_floor_preserved: true,
+                secondary_replication_visible: true,
+                scheduler_generation_advanced: matches!(scope, RustRaftMembershipScope::Metaserver),
+                blockers: Vec::new(),
+            },
+            RustRaftMembershipTransitionKind::ScaleDown => RustRaftMembershipTransitionEvidence {
+                scope,
+                transition,
+                before_voters: vec![1, 2, 3, 4],
+                after_voters: vec![1, 2, 3],
+                before_learners: Vec::new(),
+                after_learners: Vec::new(),
+                leader_before: Some(1),
+                leader_after: Some(1),
+                failed_or_removed_nodes: vec![4],
+                added_nodes: Vec::new(),
+                caught_up_nodes: vec![1, 2, 3],
+                commit_index_before: 108,
+                commit_index_after: 112,
+                applied_index_after: 112,
+                joint_consensus_used: true,
+                old_majority_preserved: true,
+                new_majority_reached: true,
+                stale_leader_rejected: true,
+                read_index_validated_after: true,
+                write_validated_after: true,
+                snapshot_floor_preserved: true,
+                secondary_replication_visible: true,
+                scheduler_generation_advanced: matches!(scope, RustRaftMembershipScope::Metaserver),
+                blockers: Vec::new(),
+            },
+        }
+    }
+
+    fn ready_membership_transitions() -> Vec<RustRaftMembershipTransitionEvidence> {
+        [
+            RustRaftMembershipScope::Metaserver,
+            RustRaftMembershipScope::DataNode,
+        ]
+        .into_iter()
+        .flat_map(|scope| {
+            [
+                RustRaftMembershipTransitionKind::Failover,
+                RustRaftMembershipTransitionKind::ScaleUp,
+                RustRaftMembershipTransitionKind::ScaleDown,
+            ]
+            .into_iter()
+            .map(move |transition| membership_transition(scope, transition))
+        })
+        .collect()
+    }
+
+    fn ready_production_input() -> RustRaftProductionReadinessInput {
+        RustRaftProductionReadinessInput {
+            readiness: ready_snapshot(),
+            peer_pipeline: Some(RustRaftPipelineEvidence {
+                per_peer_pipeline_state_present: true,
+                append_backpressure_enforced: true,
+                apply_backpressure_enforced: true,
+                memory_replicate_bytes_enforced: true,
+                oversized_log_rejection_present: true,
+                out_of_order_append_handling_present: true,
+                reorder_queue_enabled: true,
+            }),
+            snapshot_lifecycle: Some(RustRaftSnapshotLifecycleEvidence {
+                sender_lifecycle_present: true,
+                downloader_lifecycle_present: true,
+                retry_backpressure_present: true,
+                rate_limit_present: true,
+                install_progress_present: true,
+                install_rollback_present: true,
+                membership_change_present: true,
+                rejoin_after_compacted_log_present: true,
+            }),
+            wal_lifecycle: Some(RustRaftWalLifecycleEvidence {
+                segment_lifecycle_present: true,
+                retained_range_present: true,
+                sequence_range_present: true,
+                log_index_range_present: true,
+                compaction_observed: true,
+                slow_fsync_backpressure_observed: true,
+            }),
+            data_node_rollout: Some(ready_data_node_rollout()),
+            metaserver_rollout: Some(ready_meta_rollout()),
+            membership_transitions: ready_membership_transitions(),
+        }
+    }
+
+    #[test]
+    fn contract_is_openraft_free_and_complete() {
+        let contract = rustraft_parity_contract();
+        assert!(contract.openraft_dependency_removed);
+        assert_eq!(contract.requirements.len(), 12);
+    }
+
+    #[test]
+    fn crate_readme_documents_open_source_contract_surface() {
+        let readme = include_str!("../README.md");
+        assert!(readme.contains("RustRaft"));
+        assert!(readme.contains("rustraft_parity_report"));
+        assert!(readme.contains("rustraft_production_readiness_report"));
+        assert!(readme.contains("OpenRaft-free"));
+        assert!(readme.contains("Apache-2.0"));
+    }
+
+    #[test]
+    fn report_fails_closed() {
+        let mut snapshot = ready_snapshot();
+        snapshot.raft_storage_apply_fence_present = false;
+        let report = rustraft_parity_report(&snapshot);
+        assert!(!report.ready);
+        assert_eq!(report.production_status, RustRaftProductionStatus::Blocked);
+        assert_eq!(report.missing, vec!["storage_apply_fence".to_string()]);
+    }
+
+    #[test]
+    fn production_readiness_gate_accepts_complete_evidence() {
+        let report = rustraft_production_readiness_report(&ready_production_input());
+        assert!(report.ready, "{report:#?}");
         assert_eq!(
             report.production_status,
             RustRaftProductionStatus::ProductionReady
         );
+        assert!(report.missing.is_empty());
         assert!(report.production_blockers.is_empty());
+        assert_eq!(report.public_api.storage_trait, "RustRaftStorage");
     }
 
     #[test]
-    fn public_api_contract_exposes_storage_transport_status_and_metrics() {
-        let api = rustraft_public_api_contract();
-        assert_eq!(api.storage_trait, "RustRaftStorage");
-        assert_eq!(api.transport_trait, "RustRaftTransport");
-        assert_eq!(api.status_snapshot, "RustRaftStatusSnapshot");
-        assert!(api
-            .rpc_messages
-            .contains(&"RustRaftAppendEntriesRequest".to_string()));
-
-        let metrics = rustraft_metric_names();
-        assert_eq!(metrics.apply_lag, "rustraft_apply_lag");
-        assert!(metrics
-            .transport_errors_total
-            .starts_with(&api.metric_namespace));
+    fn production_readiness_gate_fails_closed_without_runtime_evidence() {
+        let report = rustraft_production_readiness_report(&RustRaftProductionReadinessInput {
+            readiness: ready_snapshot(),
+            peer_pipeline: None,
+            snapshot_lifecycle: None,
+            wal_lifecycle: None,
+            data_node_rollout: None,
+            metaserver_rollout: None,
+            membership_transitions: Vec::new(),
+        });
+        assert!(!report.ready);
+        assert_eq!(report.production_status, RustRaftProductionStatus::Blocked);
+        assert!(report
+            .missing
+            .contains(&"pipeline:evidence_present".to_string()));
+        assert!(report
+            .missing
+            .contains(&"snapshot:evidence_present".to_string()));
+        assert!(report.missing.contains(&"wal:evidence_present".to_string()));
+        assert!(report
+            .missing
+            .contains(&"data_node:evidence_present".to_string()));
+        assert!(report
+            .missing
+            .contains(&"metaserver:evidence_present".to_string()));
+        assert!(report
+            .missing
+            .iter()
+            .any(|item| item == "membership:datanode:scaledown:evidence_present"));
     }
 
     #[test]
-    fn storage_trait_covers_hard_state_log_snapshot_and_compaction() {
-        let mut storage = MemoryRustRaftStorage::default();
-        storage
-            .save_hard_state(&RustRaftHardState {
-                current_term: 3,
-                voted_for: Some(2),
-                committed: 4,
-                applied: 3,
-            })
-            .unwrap();
-        assert_eq!(storage.load_hard_state().unwrap().current_term, 3);
-
-        storage
-            .append_entries(&[
-                RustRaftLogEntry {
-                    log_id: RustRaftLogId { term: 3, index: 4 },
-                    payload: b"set a".to_vec(),
-                },
-                RustRaftLogEntry {
-                    log_id: RustRaftLogId { term: 3, index: 5 },
-                    payload: b"set b".to_vec(),
-                },
-            ])
-            .unwrap();
-        assert_eq!(storage.read_entries(4, 6).unwrap().len(), 2);
-
-        let meta = RustRaftSnapshotMeta {
-            snapshot_id: "snap-5".to_string(),
-            last_included: RustRaftLogId { term: 3, index: 5 },
-            membership_generation: 9,
-            checksum: "sha256:demo".to_string(),
-        };
-        storage.save_snapshot(&meta, b"snapshot").unwrap();
-        assert_eq!(storage.load_snapshot("snap-5").unwrap(), b"snapshot");
-
-        storage.tombstone_compacted_entries(4).unwrap();
-        assert_eq!(storage.read_entries(1, 6).unwrap().len(), 1);
-        assert!(storage
-            .append_entries(&[RustRaftLogEntry {
-                log_id: RustRaftLogId { term: 3, index: 4 },
-                payload: b"stale".to_vec(),
-            }])
-            .is_err());
-    }
-
-    #[test]
-    fn transport_trait_covers_append_vote_snapshot_and_read_index() {
-        let transport = LoopbackRustRaftTransport;
-        let append = transport
-            .append_entries(
-                2,
-                RustRaftAppendEntriesRequest {
-                    group_id: 1,
-                    term: 8,
-                    leader_id: 1,
-                    prev_log_id: Some(RustRaftLogId { term: 7, index: 11 }),
-                    entries: vec![RustRaftLogEntry {
-                        log_id: RustRaftLogId { term: 8, index: 12 },
-                        payload: b"write".to_vec(),
-                    }],
-                    leader_commit: 12,
-                },
-            )
-            .unwrap();
-        assert!(append.success);
-        assert_eq!(append.match_index, 12);
-
-        let vote = transport
-            .vote(
-                2,
-                RustRaftVoteRequest {
-                    group_id: 1,
-                    term: 9,
-                    candidate_id: 3,
-                    last_log_id: Some(RustRaftLogId { term: 8, index: 12 }),
-                    pre_vote: true,
-                },
-            )
-            .unwrap();
-        assert!(vote.vote_granted);
-
-        let snapshot = transport
-            .install_snapshot(
-                2,
-                RustRaftInstallSnapshotRequest {
-                    group_id: 1,
-                    term: 9,
-                    leader_id: 1,
-                    chunk: RustRaftSnapshotChunk {
-                        meta: RustRaftSnapshotMeta {
-                            snapshot_id: "snap-12".to_string(),
-                            last_included: RustRaftLogId { term: 8, index: 12 },
-                            membership_generation: 1,
-                            checksum: "sha256:demo".to_string(),
-                        },
-                        offset: 0,
-                        bytes: b"chunk".to_vec(),
-                        done: true,
-                    },
-                },
-            )
-            .unwrap();
-        assert!(snapshot.accepted);
-
-        let read = transport
-            .read_index(
-                2,
-                RustRaftReadIndexRequest {
-                    group_id: 1,
-                    requester_id: 2,
-                    min_commit_index: 12,
-                    allow_lease_read: false,
-                },
-            )
-            .unwrap();
-        assert!(read.safe);
-        assert_eq!(read.read_index, 12);
-    }
-
-    #[test]
-    fn read_safety_policy_rejects_unapplied_or_compacted_reads() {
-        let status = RustRaftStatusSnapshot {
-            group_id: 1,
-            node_id: 1,
-            role: RustRaftRole::Leader,
-            term: 4,
-            leader_id: Some(1),
-            commit_index: 20,
-            applied_index: 18,
-            last_log_index: 20,
-            last_snapshot_index: 9,
-            peers: Vec::new(),
-        };
-        assert_eq!(status.apply_lag(), 2);
-
-        let lagging = rustraft_read_safety_decision(
-            &status,
-            &RustRaftReadIndexRequest {
-                group_id: 1,
-                requester_id: 1,
-                min_commit_index: 19,
-                allow_lease_read: true,
-            },
-        );
-        assert!(!lagging.safe);
-        assert_eq!(lagging.reason, "apply_lag_too_high");
-
-        let compacted = rustraft_read_safety_decision(
-            &status,
-            &RustRaftReadIndexRequest {
-                group_id: 1,
-                requester_id: 1,
-                min_commit_index: 8,
-                allow_lease_read: true,
-            },
-        );
-        assert!(!compacted.safe);
-        assert_eq!(compacted.reason, "read_before_snapshot_floor");
-
-        let safe = rustraft_read_safety_decision(
-            &status,
-            &RustRaftReadIndexRequest {
-                group_id: 1,
-                requester_id: 1,
-                min_commit_index: 18,
-                allow_lease_read: true,
-            },
-        );
-        assert!(safe.safe);
-        assert!(safe.lease_read);
-    }
-
-    #[test]
-    fn learner_promotion_requires_health_and_low_lag() {
-        let status = RustRaftStatusSnapshot {
-            group_id: 1,
-            node_id: 1,
-            role: RustRaftRole::Leader,
-            term: 4,
-            leader_id: Some(1),
-            commit_index: 20,
-            applied_index: 20,
-            last_log_index: 20,
-            last_snapshot_index: 9,
-            peers: vec![RustRaftPeerStatus {
-                node_id: 3,
-                matched: 19,
-                next_index: 20,
-                learner: true,
-                healthy: true,
-                lag: 1,
-            }],
-        };
-
-        let ok = rustraft_learner_promotion_decision(&status, 3, 2);
-        assert!(ok.promotable);
-        assert_eq!(ok.reason, "learner_caught_up");
-
-        let too_lagged = rustraft_learner_promotion_decision(&status, 3, 0);
-        assert!(!too_lagged.promotable);
-        assert_eq!(too_lagged.reason, "learner_lag_too_high");
-    }
-
-    #[test]
-    fn append_safety_rejects_entries_before_snapshot_or_compaction_floor() {
-        let safe_request = RustRaftAppendEntriesRequest {
-            group_id: 1,
-            term: 5,
-            leader_id: 1,
-            prev_log_id: Some(RustRaftLogId { term: 4, index: 10 }),
-            entries: vec![RustRaftLogEntry {
-                log_id: RustRaftLogId { term: 5, index: 11 },
-                payload: b"write".to_vec(),
-            }],
-            leader_commit: 11,
-        };
-        assert!(rustraft_append_safety_decision(9, 10, &safe_request).accepted);
-
-        let stale_prev = RustRaftAppendEntriesRequest {
-            prev_log_id: Some(RustRaftLogId { term: 3, index: 8 }),
-            ..safe_request.clone()
-        };
-        let decision = rustraft_append_safety_decision(9, 10, &stale_prev);
-        assert!(!decision.accepted);
-        assert_eq!(decision.reason, "prev_log_before_snapshot_floor");
-
-        let compacted_entry = RustRaftAppendEntriesRequest {
-            prev_log_id: Some(RustRaftLogId { term: 4, index: 10 }),
-            entries: vec![RustRaftLogEntry {
-                log_id: RustRaftLogId { term: 4, index: 9 },
-                payload: b"old".to_vec(),
-            }],
-            ..safe_request
-        };
-        let decision = rustraft_append_safety_decision(8, 10, &compacted_entry);
-        assert!(!decision.accepted);
-        assert_eq!(decision.reason, "entry_compacted:9");
-    }
-
-    #[test]
-    fn pipeline_evidence_requires_active_backpressure_and_reorder_observation() {
-        let peers = vec![
-            RustRaftPeerPipelineStatus {
-                peer_id: 2,
-                match_index: 10,
-                next_index: 11,
-                append_requests: 3,
-                append_rejected: 1,
-                inflight_entries: 1,
-                inflight_bytes: 512,
-                append_queue_depth: 1,
-                append_queue_limit: 1,
-                append_queue_max_depth: 1,
-                inflight_bytes_limit: 512,
-                memory_backpressure_rejections: 1,
-                oversized_log_rejections: 1,
-                out_of_order_append_rejections: 1,
-                reorder_entries_rejected: 1,
-                ..RustRaftPeerPipelineStatus::default()
-            },
-            RustRaftPeerPipelineStatus {
-                peer_id: 3,
-                match_index: 10,
-                next_index: 11,
-                append_requests: 2,
-                apply_inflight_limit: 1,
-                apply_queue_depth: 1,
-                apply_queue_max_depth: 1,
-                apply_batch_bytes_limit: 16,
-                apply_backpressure_rejections: 1,
-                ..RustRaftPeerPipelineStatus::default()
-            },
-        ];
-
-        let evidence = rustraft_pipeline_evidence(
-            &peers,
-            RustRaftPipelineLimits {
-                max_inflights_replicate: 1,
-                max_memory_replicate_log_bytes: 512,
-                max_inflights_apply_task: 1,
-                max_apply_batch_bytes: 16,
-                enable_reorder_queue: true,
-                reorder_window_size: 4,
-                reorder_timeout_us: 1_000,
-            },
-        );
-        assert!(evidence.ready);
-        assert!(evidence.append_backpressure_enforced);
-        assert!(evidence.apply_backpressure_enforced);
-        assert!(evidence.memory_replicate_bytes_enforced);
-        assert!(evidence.oversized_log_rejection_present);
-        assert!(evidence.out_of_order_append_handling_present);
-    }
-
-    #[test]
-    fn snapshot_lifecycle_evidence_tracks_sender_downloader_and_rollback() {
-        let peers = vec![RustRaftPeerPipelineStatus {
-            peer_id: 2,
-            next_index: 11,
-            snapshot_sending: true,
-            snapshot_installing: true,
-            snapshot_installed_index: 10,
-            snapshot_send_attempts: 2,
-            snapshot_install_total_chunks: 4,
-            snapshot_install_progress_per_mille: 750,
-            snapshot_backpressure_rejections: 1,
-            snapshot_rate_limit_rejections: 1,
-            snapshot_install_rolled_back: 1,
-            snapshot_during_membership_change: true,
-            snapshot_rejoin_after_compacted_log: true,
-            ..RustRaftPeerPipelineStatus::default()
-        }];
-
-        let evidence = rustraft_snapshot_lifecycle_evidence(&peers, 60_000, 2);
-        assert!(evidence.ready);
-        assert!(evidence.sender_lifecycle_present);
-        assert!(evidence.downloader_lifecycle_present);
-        assert!(evidence.retry_backpressure_present);
-        assert!(evidence.install_rollback_present);
-    }
-
-    #[test]
-    fn wal_lifecycle_evidence_exposes_segment_release_and_index_status() {
-        let evidence = rustraft_wal_lifecycle_evidence(&RustRaftWalLifecycleStatus {
-            segment_count: 2,
-            active_segment_id: 2,
-            first_retained_segment_id: 1,
-            last_retained_segment_id: 2,
-            total_bytes: 4096,
-            active_segment_bytes: 1024,
-            total_records: 7,
-            first_sequence: 1,
-            last_sequence: 7,
-            first_log_index: 1,
-            last_log_index: 7,
-            released_segment_count: 1,
+    fn production_readiness_gate_reports_specific_wal_blocker() {
+        let mut input = ready_production_input();
+        input.wal_lifecycle = Some(RustRaftWalLifecycleEvidence {
+            segment_lifecycle_present: true,
+            retained_range_present: true,
+            sequence_range_present: true,
+            log_index_range_present: true,
+            compaction_observed: false,
             slow_fsync_backpressure_observed: true,
         });
-        assert!(evidence.ready);
-        assert!(evidence.segment_lifecycle_present);
-        assert!(evidence.release_rules_observed);
-        assert!(evidence.first_last_index_status_present);
-        assert!(evidence.slow_fsync_backpressure_observed);
+        let report = rustraft_production_readiness_report(&input);
+        assert!(!report.ready);
+        assert!(report.missing.contains(&"wal:compaction".to_string()));
+        assert!(report
+            .recommended_next_actions
+            .contains(&"prove WAL compaction/released segment behavior".to_string()));
+    }
+
+    #[test]
+    fn safety_helpers_accept_healthy_state() {
+        let status = RustRaftStatusSnapshot {
+            group_id: 1,
+            node_id: 1,
+            role: RustRaftRole::Leader,
+            term: 2,
+            leader_id: Some(1),
+            commit_index: 10,
+            applied_index: 10,
+            last_log_index: 10,
+            last_snapshot_index: 4,
+            peers: vec![RustRaftPeerStatus {
+                node_id: 2,
+                matched: 10,
+                next_index: 11,
+                learner: true,
+                healthy: true,
+                lag: 0,
+            }],
+        };
+        assert!(
+            rustraft_read_safety_decision(
+                &status,
+                &RustRaftReadIndexRequest {
+                    group_id: 1,
+                    requester_id: 1,
+                    min_commit_index: 10,
+                    allow_lease_read: true,
+                },
+            )
+            .safe
+        );
+        assert!(rustraft_learner_promotion_decision(&status, 2, 0).promotable);
+    }
+
+    #[test]
+    fn membership_readiness_requires_failover_scale_up_and_scale_down_for_meta_and_data_nodes() {
+        let report = rustraft_membership_readiness_report(&ready_membership_transitions());
+        assert!(report.ready, "{report:#?}");
+        assert!(report
+            .satisfied
+            .contains(&"metaserver:failover".to_string()));
+        assert!(report.satisfied.contains(&"metaserver:scaleup".to_string()));
+        assert!(report
+            .satisfied
+            .contains(&"metaserver:scaledown".to_string()));
+        assert!(report.satisfied.contains(&"datanode:failover".to_string()));
+        assert!(report.satisfied.contains(&"datanode:scaleup".to_string()));
+        assert!(report.satisfied.contains(&"datanode:scaledown".to_string()));
+    }
+
+    #[test]
+    fn membership_readiness_fails_closed_when_transition_evidence_is_missing() {
+        let transitions = ready_membership_transitions()
+            .into_iter()
+            .filter(|item| {
+                !(item.scope == RustRaftMembershipScope::DataNode
+                    && item.transition == RustRaftMembershipTransitionKind::ScaleDown)
+            })
+            .collect::<Vec<_>>();
+        let report = rustraft_membership_readiness_report(&transitions);
+        assert!(!report.ready);
+        assert!(report
+            .missing
+            .contains(&"datanode:scaledown:evidence_present".to_string()));
+    }
+
+    #[test]
+    fn membership_readiness_rejects_unsafe_scale_up_without_joint_consensus() {
+        let mut transition = membership_transition(
+            RustRaftMembershipScope::Metaserver,
+            RustRaftMembershipTransitionKind::ScaleUp,
+        );
+        transition.joint_consensus_used = false;
+        let missing = rustraft_membership_transition_missing(&transition);
+        assert!(missing.contains(&"joint_consensus_used".to_string()));
     }
 }
