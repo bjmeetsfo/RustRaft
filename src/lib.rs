@@ -167,6 +167,8 @@ pub struct RustRaftPeerPipelineStatus {
     pub reorder_entries_rejected: u64,
     pub reorder_entry_timeouts: u64,
     pub reorder_dropped_packages: u64,
+    #[serde(default)]
+    pub stale_term_rejections: u64,
     pub snapshot_sending: bool,
     pub snapshot_installing: bool,
     pub snapshot_installed_index: u64,
@@ -176,6 +178,10 @@ pub struct RustRaftPeerPipelineStatus {
     pub snapshot_backpressure_rejections: u64,
     pub snapshot_rate_limit_rejections: u64,
     pub snapshot_install_rolled_back: u64,
+    #[serde(default)]
+    pub snapshot_chunk_retry_count: u64,
+    #[serde(default)]
+    pub snapshot_send_timeouts: u64,
     pub snapshot_during_membership_change: bool,
     pub snapshot_rejoin_after_compacted_log: bool,
     pub transfer_leader_target: bool,
@@ -205,6 +211,8 @@ pub struct RustRaftPipelineEvidence {
     pub memory_replicate_bytes_enforced: bool,
     pub oversized_log_rejection_present: bool,
     pub out_of_order_append_handling_present: bool,
+    pub reorder_timeout_drop_present: bool,
+    pub stale_term_rejection_present: bool,
     pub reorder_queue_enabled: bool,
 }
 
@@ -213,6 +221,8 @@ pub struct RustRaftSnapshotLifecycleEvidence {
     pub sender_lifecycle_present: bool,
     pub downloader_lifecycle_present: bool,
     pub retry_backpressure_present: bool,
+    pub chunk_retry_present: bool,
+    pub send_timeout_present: bool,
     pub rate_limit_present: bool,
     pub install_progress_present: bool,
     pub install_rollback_present: bool,
@@ -1051,6 +1061,16 @@ pub fn rustraft_production_readiness_report(
                 "prove snapshot retry/backpressure behavior",
             ),
             (
+                snapshot.chunk_retry_present,
+                "snapshot:chunk_retry",
+                "prove snapshot chunk retry behavior",
+            ),
+            (
+                snapshot.send_timeout_present,
+                "snapshot:send_timeout",
+                "prove snapshot send timeout behavior",
+            ),
+            (
                 snapshot.rate_limit_present,
                 "snapshot:rate_limit",
                 "prove snapshot rate limiting",
@@ -1379,6 +1399,10 @@ pub fn rustraft_pipeline_evidence(
                 || peer.reorder_entry_timeouts > 0
                 || peer.reorder_dropped_packages > 0
         }),
+        reorder_timeout_drop_present: peers
+            .iter()
+            .any(|peer| peer.reorder_entry_timeouts > 0 && peer.reorder_dropped_packages > 0),
+        stale_term_rejection_present: peers.iter().any(|peer| peer.stale_term_rejections > 0),
         reorder_queue_enabled: limits.enable_reorder_queue
             && limits.reorder_window_size > 0
             && limits.reorder_timeout_us > 0
@@ -1404,6 +1428,8 @@ pub fn rustraft_snapshot_lifecycle_evidence(
                 || (max_inflights_replicate > 0
                     && peer.snapshot_send_attempts > max_inflights_replicate)
         }),
+        chunk_retry_present: peers.iter().any(|peer| peer.snapshot_chunk_retry_count > 0),
+        send_timeout_present: peers.iter().any(|peer| peer.snapshot_send_timeouts > 0),
         rate_limit_present: peers
             .iter()
             .any(|peer| peer.snapshot_rate_limit_rejections > 0),
@@ -2290,12 +2316,16 @@ mod tests {
                 memory_replicate_bytes_enforced: true,
                 oversized_log_rejection_present: true,
                 out_of_order_append_handling_present: true,
+                reorder_timeout_drop_present: true,
+                stale_term_rejection_present: true,
                 reorder_queue_enabled: true,
             }),
             snapshot_lifecycle: Some(RustRaftSnapshotLifecycleEvidence {
                 sender_lifecycle_present: true,
                 downloader_lifecycle_present: true,
                 retry_backpressure_present: true,
+                chunk_retry_present: true,
+                send_timeout_present: true,
                 rate_limit_present: true,
                 install_progress_present: true,
                 install_rollback_present: true,
