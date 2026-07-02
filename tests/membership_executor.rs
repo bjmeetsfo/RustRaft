@@ -86,3 +86,60 @@ fn membership_executor_runs_full_runtime_workflow() {
     assert_eq!(executor.reports().len(), 6);
     assert!(!executor.reports()[1].success);
 }
+
+#[test]
+fn membership_executor_validates_reports_joint_changes_and_rolls_back() {
+    let mut cluster = RaftCluster::new(
+        67,
+        Default::default(),
+        vec![
+            peer(1, RustRaftReplicaRole::Voter),
+            peer(2, RustRaftReplicaRole::Voter),
+            peer(3, RustRaftReplicaRole::Voter),
+        ],
+    )
+    .expect("cluster");
+    cluster.start().expect("start");
+    cluster.propose(b"a".to_vec()).expect("write");
+
+    let mut executor = RaftMembershipExecutor::new();
+    let add_voter = executor
+        .execute(
+            &mut cluster,
+            RaftMembershipOperation::AddVoter(peer(4, RustRaftReplicaRole::Learner)),
+        )
+        .expect("add voter");
+    assert!(add_voter.validation_passed);
+    assert!(add_voter.success);
+    assert!(add_voter.joint_consensus.is_some());
+    assert!(cluster.membership().voters.contains(&4));
+
+    let remove_leader = executor
+        .execute(&mut cluster, RaftMembershipOperation::Remove(1))
+        .expect_err("leader removal should be blocked");
+    assert!(remove_leader
+        .to_string()
+        .contains("cannot_remove_current_leader_without_transfer"));
+    let failed_report = executor.reports().last().expect("failed report");
+    assert!(!failed_report.validation_passed);
+    assert!(!failed_report.success);
+    assert!(failed_report
+        .blockers
+        .contains(&"cannot_remove_current_leader_without_transfer".to_string()));
+
+    let voters_before = cluster.membership().voters;
+    let rollback = executor.execute_all_with_rollback(
+        &mut cluster,
+        vec![
+            RaftMembershipOperation::TransferLeader(4),
+            RaftMembershipOperation::Remove(1),
+            RaftMembershipOperation::Remove(4),
+        ],
+    );
+    assert!(rollback.is_err());
+    assert_eq!(cluster.membership().voters, voters_before);
+    assert_eq!(cluster.leader_id(), Some(1));
+    let rollback_report = executor.reports().last().expect("rollback report");
+    assert!(rollback_report.rolled_back);
+    assert!(rollback_report.reason.contains("rolled_back"));
+}
