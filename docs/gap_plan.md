@@ -32,6 +32,12 @@ startup, object/page storage, and admin endpoints.
 - Data-node and metaserver process-rollout evidence can be validated directly
   with `rustraft_data_node_process_rollout_readiness_report()` and
   `rustraft_meta_process_rollout_readiness_report()`.
+- ByteRaft-derived runtime capability evidence can be validated with
+  `rustraft_byteraft_runtime_capability_report()`, which fails closed on
+  missing process-path rollout proof, per-peer pipeline state, reorder queue
+  semantics, snapshot sender/downloader lifecycle, WAL segment lifecycle,
+  read-index/lease safety, membership role semantics, FSM apply atomicity, and
+  admin/metrics observability.
 - `rustraft_temporalstore_adapter_shape()` records the desired consumer shape:
   `TemporalRaftConsensusBackend` owns a
   `rustraft::node::RaftNodeRuntime<TemporalStoreStateMachine, TemporalTransport>`
@@ -104,6 +110,9 @@ The public process-rollout readiness helpers are the matching fail-closed
 contract for spawned-process rollout evidence, including independent WAL and
 snapshot dirs, process API writes/mutations, read-index responses, restart
 recovery, log-store inspection, and operational semantics.
+The public ByteRaft runtime capability report is the matching family-level
+contract for operational parity claims; it names exact missing evidence fields
+instead of accepting coarse API-presence booleans.
 TemporalStore adapter docs should live with TemporalStore and show how
 `TemporalRaftConsensusBackend` wires command encoding, apply semantics, the
 storage engine, and process/admin integration around the RustRaft-owned runtime.

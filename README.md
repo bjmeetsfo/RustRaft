@@ -38,6 +38,7 @@ License: Apache-2.0.
 - `rustraft_production_readiness_report`
 - `rustraft_data_node_process_rollout_readiness_report`
 - `rustraft_meta_process_rollout_readiness_report`
+- `rustraft_byteraft_runtime_capability_report`
 - `rustraft_public_api_contract`
 - `rustraft_open_source_surface`
 - `rustraft_temporalstore_adapter_shape`
@@ -71,6 +72,11 @@ snapshot lifecycle, WAL lifecycle, data-node rollout, and metaserver rollout.
 The data-node and metaserver rollout report helpers expose the same fail-closed
 process-path checks independently, so TemporalStore and downstream adopters can
 validate spawned-process evidence before composing the full production report.
+`rustraft_byteraft_runtime_capability_report` groups the same evidence into
+ByteRaft-derived runtime capability families: process-path rollout proof,
+per-peer replication pipeline state, reorder queues, snapshot sender/downloader
+lifecycle, WAL segment lifecycle, read-index/lease safety, membership role
+semantics, FSM apply atomicity, and admin/metrics observability.
 
 ## Why It Lives Separately
 

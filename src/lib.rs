@@ -957,6 +957,15 @@ pub struct RaftRuntimeAdminReport {
     pub blockers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftByteRaftRuntimeCapabilityReport {
+    pub ready: bool,
+    pub capability_evidence: Vec<RaftCapabilityEvidence>,
+    pub satisfied: Vec<String>,
+    pub missing: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RustRaftBlockerSeverity {
@@ -7260,6 +7269,7 @@ pub fn rustraft_compatibility_report_names() -> Vec<String> {
         "rustraft_production_readiness_report",
         "rustraft_data_node_process_rollout_readiness_report",
         "rustraft_meta_process_rollout_readiness_report",
+        "rustraft_byteraft_runtime_capability_report",
         "rustraft_runtime_local_status_report",
         "rustraft_runtime_admin_report",
         "rustraft_fatal_blocker_report",
@@ -8146,6 +8156,395 @@ pub fn rustraft_production_readiness_report(
     }
 }
 
+pub fn rustraft_byteraft_runtime_capability_report(
+    input: &RustRaftProductionReadinessInput,
+) -> RustRaftByteRaftRuntimeCapabilityReport {
+    let data_semantics = input
+        .data_node_rollout
+        .as_ref()
+        .map(|rollout| &rollout.operational_semantics);
+    let meta_semantics = input
+        .metaserver_rollout
+        .as_ref()
+        .map(|rollout| &rollout.operational_semantics);
+    let membership_report = rustraft_membership_readiness_report(&input.membership_transitions);
+
+    let mut capability_evidence = Vec::new();
+    capability_evidence.push(runtime_capability(
+        "process_path_rollout_evidence",
+        "RustRaftProductionReadinessInput::{data_node_rollout,metaserver_rollout}",
+        &[
+            (
+                input
+                    .data_node_rollout
+                    .as_ref()
+                    .is_some_and(|rollout| rollout.ready),
+                "data_node.ready",
+            ),
+            (
+                input
+                    .data_node_rollout
+                    .as_ref()
+                    .is_some_and(|rollout| rollout.observed_process_requests > 0),
+                "data_node.observed_process_requests",
+            ),
+            (
+                input.data_node_rollout.as_ref().is_some_and(|rollout| {
+                    rollout.independent_wal_dirs && rollout.independent_snapshot_dirs
+                }),
+                "data_node.independent_wal_and_snapshot_dirs",
+            ),
+            (
+                input.data_node_rollout.as_ref().is_some_and(|rollout| {
+                    !rollout.nodes.is_empty()
+                        && rollout.per_node_log_store_inspection_count as usize
+                            >= rollout.nodes.len()
+                }),
+                "data_node.per_node_log_store_inspection",
+            ),
+            (
+                input
+                    .metaserver_rollout
+                    .as_ref()
+                    .is_some_and(|rollout| rollout.ready),
+                "metaserver.ready",
+            ),
+            (
+                input
+                    .metaserver_rollout
+                    .as_ref()
+                    .is_some_and(|rollout| rollout.observed_process_requests > 0),
+                "metaserver.observed_process_requests",
+            ),
+            (
+                input.metaserver_rollout.as_ref().is_some_and(|rollout| {
+                    rollout.independent_wal_dirs && rollout.independent_snapshot_dirs
+                }),
+                "metaserver.independent_wal_and_snapshot_dirs",
+            ),
+            (
+                input.metaserver_rollout.as_ref().is_some_and(|rollout| {
+                    !rollout.nodes.is_empty()
+                        && rollout.per_node_log_store_inspection_count as usize
+                            >= rollout.nodes.len()
+                }),
+                "metaserver.per_node_log_store_inspection",
+            ),
+        ],
+    ));
+
+    let pipeline = input.peer_pipeline.as_ref();
+    capability_evidence.push(runtime_capability(
+        "per_peer_replication_pipeline_state",
+        "RustRaftPipelineEvidence",
+        &[
+            (
+                pipeline.is_some_and(|evidence| evidence.per_peer_pipeline_state_present),
+                "pipeline.per_peer_pipeline_state_present",
+            ),
+            (
+                pipeline.is_some_and(|evidence| evidence.append_backpressure_enforced),
+                "pipeline.append_backpressure_enforced",
+            ),
+            (
+                pipeline.is_some_and(|evidence| evidence.apply_backpressure_enforced),
+                "pipeline.apply_backpressure_enforced",
+            ),
+            (
+                pipeline.is_some_and(|evidence| evidence.memory_replicate_bytes_enforced),
+                "pipeline.memory_replicate_bytes_enforced",
+            ),
+            (
+                pipeline.is_some_and(|evidence| evidence.oversized_log_rejection_present),
+                "pipeline.oversized_log_rejection_present",
+            ),
+        ],
+    ));
+    capability_evidence.push(runtime_capability(
+        "reorder_queue_semantics",
+        "RustRaftPipelineEvidence",
+        &[
+            (
+                pipeline.is_some_and(|evidence| evidence.reorder_queue_enabled),
+                "pipeline.reorder_queue_enabled",
+            ),
+            (
+                pipeline.is_some_and(|evidence| evidence.out_of_order_append_handling_present),
+                "pipeline.out_of_order_append_handling_present",
+            ),
+            (
+                pipeline.is_some_and(|evidence| evidence.reorder_timeout_drop_present),
+                "pipeline.reorder_timeout_drop_present",
+            ),
+            (
+                pipeline.is_some_and(|evidence| evidence.stale_term_rejection_present),
+                "pipeline.stale_term_rejection_present",
+            ),
+        ],
+    ));
+
+    let snapshot = input.snapshot_lifecycle.as_ref();
+    capability_evidence.push(runtime_capability(
+        "snapshot_sender_downloader_lifecycle",
+        "RustRaftSnapshotLifecycleEvidence",
+        &[
+            (
+                snapshot.is_some_and(|evidence| evidence.sender_lifecycle_present),
+                "snapshot.sender_lifecycle_present",
+            ),
+            (
+                snapshot.is_some_and(|evidence| evidence.downloader_lifecycle_present),
+                "snapshot.downloader_lifecycle_present",
+            ),
+            (
+                snapshot.is_some_and(|evidence| evidence.retry_backpressure_present),
+                "snapshot.retry_backpressure_present",
+            ),
+            (
+                snapshot.is_some_and(|evidence| evidence.chunk_retry_present),
+                "snapshot.chunk_retry_present",
+            ),
+            (
+                snapshot.is_some_and(|evidence| evidence.send_timeout_present),
+                "snapshot.send_timeout_present",
+            ),
+            (
+                snapshot.is_some_and(|evidence| evidence.rate_limit_present),
+                "snapshot.rate_limit_present",
+            ),
+            (
+                snapshot.is_some_and(|evidence| evidence.install_progress_present),
+                "snapshot.install_progress_present",
+            ),
+            (
+                snapshot.is_some_and(|evidence| evidence.install_rollback_present),
+                "snapshot.install_rollback_present",
+            ),
+            (
+                snapshot.is_some_and(|evidence| evidence.membership_change_present),
+                "snapshot.membership_change_present",
+            ),
+            (
+                snapshot.is_some_and(|evidence| evidence.rejoin_after_compacted_log_present),
+                "snapshot.rejoin_after_compacted_log_present",
+            ),
+        ],
+    ));
+
+    let wal = input.wal_lifecycle.as_ref();
+    capability_evidence.push(runtime_capability(
+        "wal_segment_lifecycle",
+        "RustRaftWalLifecycleEvidence",
+        &[
+            (
+                wal.is_some_and(|evidence| evidence.segment_lifecycle_present),
+                "wal.segment_lifecycle_present",
+            ),
+            (
+                wal.is_some_and(|evidence| evidence.retained_range_present),
+                "wal.retained_range_present",
+            ),
+            (
+                wal.is_some_and(|evidence| evidence.sequence_range_present),
+                "wal.sequence_range_present",
+            ),
+            (
+                wal.is_some_and(|evidence| evidence.log_index_range_present),
+                "wal.log_index_range_present",
+            ),
+            (
+                wal.is_some_and(|evidence| evidence.compaction_observed),
+                "wal.compaction_observed",
+            ),
+            (
+                wal.is_some_and(|evidence| evidence.slow_fsync_backpressure_observed),
+                "wal.slow_fsync_backpressure_observed",
+            ),
+        ],
+    ));
+
+    capability_evidence.push(runtime_capability(
+        "read_index_and_lease_safety",
+        "RustRaftProcessOperationalSemanticsEvidence",
+        &[
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.read_index_validated
+                }),
+                "semantics.read_index_validated",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.leader_lease_validated
+                }),
+                "semantics.leader_lease_validated",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.stale_leader_lease_rejection_observed
+                }),
+                "semantics.stale_leader_lease_rejection_observed",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.follower_lease_expiration_observed
+                }),
+                "semantics.follower_lease_expiration_observed",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.lagging_follower_read_rejected
+                }),
+                "semantics.lagging_follower_read_rejected",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.bounded_stale_read_acceptance_observed
+                        && evidence.bounded_stale_read_rejection_observed
+                }),
+                "semantics.bounded_stale_read_acceptance_and_rejection",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.minority_partition_read_rejection_observed
+                }),
+                "semantics.minority_partition_read_rejection_observed",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.stale_follower_write_rejected
+                        && evidence.healed_follower_catchup_observed
+                }),
+                "semantics.stale_write_rejection_and_healed_catchup",
+            ),
+        ],
+    ));
+
+    capability_evidence.push(runtime_capability(
+        "membership_role_semantics",
+        "RustRaftMembershipTransitionEvidence",
+        &[
+            (
+                membership_report.ready,
+                "membership.required_transitions_ready",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.membership_rescale_validated
+                }),
+                "semantics.membership_rescale_validated",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.membership_add_promote_remove_validated
+                }),
+                "semantics.membership_add_promote_remove_validated",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.leader_transfer_exact_once_validated
+                        && evidence.leader_transfer_under_load_validated
+                }),
+                "semantics.leader_transfer_exact_once_under_load",
+            ),
+        ],
+    ));
+
+    capability_evidence.push(runtime_capability(
+        "fsm_apply_atomicity",
+        "RustRaftProcessOperationalSemanticsEvidence",
+        &[
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.apply_pipeline_converged
+                }),
+                "semantics.apply_pipeline_converged",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.wal_persistence_observed
+                }),
+                "semantics.wal_persistence_observed",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.fsm_apply_idempotent_replay_observed
+                }),
+                "semantics.fsm_apply_idempotent_replay_observed",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.storage_mutation_wal_fence_atomicity_observed
+                }),
+                "semantics.storage_mutation_wal_fence_atomicity_observed",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.snapshot_install_apply_fence_atomicity_observed
+                }),
+                "semantics.snapshot_install_apply_fence_atomicity_observed",
+            ),
+            (
+                all_semantics(data_semantics, meta_semantics, |evidence| {
+                    evidence.process_restart_after_apply_crash_recovered
+                }),
+                "semantics.process_restart_after_apply_crash_recovered",
+            ),
+        ],
+    ));
+
+    capability_evidence.push(runtime_capability(
+        "admin_metrics_surface",
+        "RustRaftReadinessSnapshot",
+        &[
+            (
+                input.readiness.rustraft_operator_observability_present,
+                "readiness.rustraft_operator_observability_present",
+            ),
+            (
+                input.peer_pipeline.is_some(),
+                "status.peer_pipeline_evidence_attached",
+            ),
+            (
+                input.snapshot_lifecycle.is_some(),
+                "status.snapshot_lifecycle_evidence_attached",
+            ),
+            (
+                input.wal_lifecycle.is_some(),
+                "status.wal_lifecycle_evidence_attached",
+            ),
+        ],
+    ));
+
+    let satisfied = capability_evidence
+        .iter()
+        .filter(|item| item.present)
+        .map(|item| item.capability.clone())
+        .collect::<Vec<_>>();
+    let missing = capability_evidence
+        .iter()
+        .filter(|item| !item.present)
+        .map(|item| item.capability.clone())
+        .collect::<Vec<_>>();
+    let blockers = capability_evidence
+        .iter()
+        .filter(|item| !item.present)
+        .flat_map(|item| {
+            item.evidence
+                .iter()
+                .filter(|field| field.starts_with("missing:"))
+                .map(move |field| format!("{}:{}", item.capability, field))
+        })
+        .collect::<Vec<_>>();
+    RustRaftByteRaftRuntimeCapabilityReport {
+        ready: missing.is_empty() && blockers.is_empty(),
+        capability_evidence,
+        satisfied,
+        missing,
+        blockers,
+    }
+}
+
 pub fn rustraft_data_node_process_rollout_readiness_report(
     rollout: &RustRaftDataNodeProcessRolloutReport,
 ) -> RustRaftProcessRolloutReadinessReport {
@@ -8882,6 +9281,39 @@ fn require_bool(
         missing.push(id.to_string());
         blockers.push(id.to_string());
         actions.push(action.to_string());
+    }
+}
+
+fn runtime_capability(
+    capability: &str,
+    source_reference: &str,
+    fields: &[(bool, &str)],
+) -> RaftCapabilityEvidence {
+    RaftCapabilityEvidence {
+        capability: capability.to_string(),
+        present: fields.iter().all(|(present, _)| *present),
+        evidence: fields
+            .iter()
+            .map(|(present, field)| {
+                if *present {
+                    format!("present:{field}")
+                } else {
+                    format!("missing:{field}")
+                }
+            })
+            .collect(),
+        source_reference: source_reference.to_string(),
+    }
+}
+
+fn all_semantics(
+    data_node: Option<&RustRaftProcessOperationalSemanticsEvidence>,
+    metaserver: Option<&RustRaftProcessOperationalSemanticsEvidence>,
+    predicate: impl Fn(&RustRaftProcessOperationalSemanticsEvidence) -> bool,
+) -> bool {
+    match (data_node, metaserver) {
+        (Some(data_node), Some(metaserver)) => predicate(data_node) && predicate(metaserver),
+        _ => false,
     }
 }
 
