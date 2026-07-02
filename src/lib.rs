@@ -25,6 +25,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use thiserror::Error;
 
 pub mod benchmark;
@@ -1383,6 +1384,8 @@ pub struct RustRaftAppendEntriesRequest {
     pub leader_commit: RustRaftLogIndex,
 }
 
+pub type AppendEntriesRequest = RustRaftAppendEntriesRequest;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftAppendEntriesResponse {
     pub term: RustRaftTerm,
@@ -1390,6 +1393,8 @@ pub struct RustRaftAppendEntriesResponse {
     pub match_index: RustRaftLogIndex,
     pub rejection_hint: Option<RustRaftLogIndex>,
 }
+
+pub type AppendEntriesResponse = RustRaftAppendEntriesResponse;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftVoteRequest {
@@ -1400,12 +1405,16 @@ pub struct RustRaftVoteRequest {
     pub pre_vote: bool,
 }
 
+pub type VoteRequest = RustRaftVoteRequest;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftVoteResponse {
     pub term: RustRaftTerm,
     pub vote_granted: bool,
     pub reason: String,
 }
+
+pub type VoteResponse = RustRaftVoteResponse;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftSnapshotMeta {
@@ -1421,6 +1430,8 @@ pub struct RustRaftSnapshotChunk {
     pub data: RustRaftSnapshotPayload,
     pub done: bool,
 }
+
+pub type SnapshotChunk = RustRaftSnapshotChunk;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftGenericSnapshot<G = RustRaftGroupId, P = RustRaftSnapshotPayload> {
@@ -1497,6 +1508,8 @@ pub struct RustRaftInstallSnapshotRequest {
     pub chunk: RustRaftSnapshotChunk,
 }
 
+pub type InstallSnapshotRequest = RustRaftInstallSnapshotRequest;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftInstallSnapshotResponse {
     pub term: RustRaftTerm,
@@ -1504,6 +1517,8 @@ pub struct RustRaftInstallSnapshotResponse {
     pub next_offset: u64,
     pub reason: String,
 }
+
+pub type InstallSnapshotResponse = RustRaftInstallSnapshotResponse;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftReadIndexRequest {
@@ -1513,6 +1528,8 @@ pub struct RustRaftReadIndexRequest {
     pub allow_lease_read: bool,
 }
 
+pub type ReadIndexRequest = RustRaftReadIndexRequest;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftReadIndexResponse {
     pub safe: bool,
@@ -1520,6 +1537,8 @@ pub struct RustRaftReadIndexResponse {
     pub lease_read: bool,
     pub reason: String,
 }
+
+pub type ReadIndexResponse = RustRaftReadIndexResponse;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftReadSafetyDecision {
@@ -2130,6 +2149,48 @@ impl RaftCluster {
         Ok(())
     }
 
+    pub fn install_snapshot_chunk_to(
+        &mut self,
+        target: RustRaftNodeId,
+        request: InstallSnapshotRequest,
+    ) -> Result<InstallSnapshotResponse, RaftError> {
+        if request.group_id != self.group_id {
+            return Err(RaftError::InvalidRequest(
+                "snapshot install group id mismatch".to_string(),
+            ));
+        }
+        let next_offset = request.chunk.offset + request.chunk.data.len() as u64;
+        if !request.chunk.done {
+            return Ok(InstallSnapshotResponse {
+                term: self.current_term.max(request.term),
+                accepted: true,
+                next_offset,
+                reason: "snapshot_chunk_accepted".to_string(),
+            });
+        }
+
+        let mut install = RaftSnapshotInstallState::new(request.chunk.meta.clone());
+        install.install_chunk(request.chunk)?;
+        let snapshot = install.finish(self.group_id)?;
+        let snapshot_index = snapshot.meta.last_log_id.index;
+        self.install_snapshot_to(
+            target,
+            snapshot,
+            RustRaftApplySnapshotFence {
+                applied_index: snapshot_index,
+                commit_index: snapshot_index,
+                installed_snapshot_index: snapshot_index,
+                first_retained_log_index: snapshot_index + 1,
+            },
+        )?;
+        Ok(InstallSnapshotResponse {
+            term: self.current_term.max(request.term),
+            accepted: true,
+            next_offset,
+            reason: "snapshot_installed".to_string(),
+        })
+    }
+
     pub fn status(&self, node_id: RustRaftNodeId) -> Result<RustRaftStatusSnapshot, RaftError> {
         let node = self
             .nodes
@@ -2346,6 +2407,169 @@ pub trait RustRaftTransport {
     ) -> Result<RustRaftReadIndexResponse, RustRaftError>;
 }
 
+pub trait RaftTransport: RustRaftTransport {}
+
+impl<T> RaftTransport for T where T: RustRaftTransport + ?Sized {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthenticatedRaftRpc<M, A = String> {
+    pub auth: A,
+    pub message: M,
+}
+
+pub trait RaftAuthPolicy<A = String> {
+    fn token_for(&self, target: RustRaftNodeId) -> A;
+    fn validate(&self, target: RustRaftNodeId, auth: &A) -> Result<(), RaftError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StaticRaftAuthToken {
+    pub token: String,
+}
+
+impl StaticRaftAuthToken {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+        }
+    }
+}
+
+impl RaftAuthPolicy<String> for StaticRaftAuthToken {
+    fn token_for(&self, _target: RustRaftNodeId) -> String {
+        self.token.clone()
+    }
+
+    fn validate(&self, _target: RustRaftNodeId, auth: &String) -> Result<(), RaftError> {
+        if auth == &self.token {
+            Ok(())
+        } else {
+            Err(RaftError::Transport(
+                "raft transport authentication failed".to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthenticatedRaftTransport<T, A = String, P = StaticRaftAuthToken> {
+    inner: T,
+    policy: P,
+    _auth: PhantomData<A>,
+}
+
+impl<T, A, P> AuthenticatedRaftTransport<T, A, P>
+where
+    P: RaftAuthPolicy<A>,
+{
+    pub fn new(inner: T, policy: P) -> Self {
+        Self {
+            inner,
+            policy,
+            _auth: PhantomData,
+        }
+    }
+
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+
+    pub fn wrap_request<M>(
+        &self,
+        target: RustRaftNodeId,
+        message: M,
+    ) -> AuthenticatedRaftRpc<M, A> {
+        AuthenticatedRaftRpc {
+            auth: self.policy.token_for(target),
+            message,
+        }
+    }
+}
+
+impl<T, A, P> AuthenticatedRaftTransport<T, A, P>
+where
+    T: RustRaftTransport,
+    P: RaftAuthPolicy<A>,
+{
+    pub fn append_entries_authenticated(
+        &self,
+        target: RustRaftNodeId,
+        request: AuthenticatedRaftRpc<AppendEntriesRequest, A>,
+    ) -> Result<AppendEntriesResponse, RaftError> {
+        self.policy.validate(target, &request.auth)?;
+        self.inner.append_entries(target, request.message)
+    }
+
+    pub fn vote_authenticated(
+        &self,
+        target: RustRaftNodeId,
+        request: AuthenticatedRaftRpc<VoteRequest, A>,
+    ) -> Result<VoteResponse, RaftError> {
+        self.policy.validate(target, &request.auth)?;
+        self.inner.vote(target, request.message)
+    }
+
+    pub fn install_snapshot_authenticated(
+        &self,
+        target: RustRaftNodeId,
+        request: AuthenticatedRaftRpc<InstallSnapshotRequest, A>,
+    ) -> Result<InstallSnapshotResponse, RaftError> {
+        self.policy.validate(target, &request.auth)?;
+        self.inner.install_snapshot(target, request.message)
+    }
+
+    pub fn read_index_authenticated(
+        &self,
+        target: RustRaftNodeId,
+        request: AuthenticatedRaftRpc<ReadIndexRequest, A>,
+    ) -> Result<ReadIndexResponse, RaftError> {
+        self.policy.validate(target, &request.auth)?;
+        self.inner.read_index(target, request.message)
+    }
+}
+
+impl<T, A, P> RustRaftTransport for AuthenticatedRaftTransport<T, A, P>
+where
+    T: RustRaftTransport,
+    P: RaftAuthPolicy<A>,
+{
+    fn append_entries(
+        &self,
+        target: u64,
+        request: RustRaftAppendEntriesRequest,
+    ) -> Result<RustRaftAppendEntriesResponse, RustRaftError> {
+        self.inner.append_entries(target, request)
+    }
+
+    fn vote(
+        &self,
+        target: u64,
+        request: RustRaftVoteRequest,
+    ) -> Result<RustRaftVoteResponse, RustRaftError> {
+        self.inner.vote(target, request)
+    }
+
+    fn install_snapshot(
+        &self,
+        target: u64,
+        request: RustRaftInstallSnapshotRequest,
+    ) -> Result<RustRaftInstallSnapshotResponse, RustRaftError> {
+        self.inner.install_snapshot(target, request)
+    }
+
+    fn read_index(
+        &self,
+        target: u64,
+        request: RustRaftReadIndexRequest,
+    ) -> Result<RustRaftReadIndexResponse, RustRaftError> {
+        self.inner.read_index(target, request)
+    }
+}
+
 pub fn rustraft_wal_checksum(record: &RaftWalRecord) -> String {
     let mut hash = 14_695_981_039_346_656_037_u64;
     let mut mix = |value: u64| {
@@ -2501,12 +2725,13 @@ pub fn rustraft_parity_contract() -> RustRaftParityContract {
 pub fn rustraft_public_api_contract() -> RustRaftPublicApiContract {
     RustRaftPublicApiContract {
         storage_trait: "RustRaftStorage".to_string(),
-        transport_trait: "RustRaftTransport".to_string(),
+        transport_trait: "RaftTransport".to_string(),
         rpc_messages: vec![
-            "RustRaftAppendEntriesRequest".to_string(),
-            "RustRaftVoteRequest".to_string(),
-            "RustRaftInstallSnapshotRequest".to_string(),
-            "RustRaftReadIndexRequest".to_string(),
+            "AppendEntriesRequest".to_string(),
+            "VoteRequest".to_string(),
+            "InstallSnapshotRequest".to_string(),
+            "ReadIndexRequest".to_string(),
+            "AuthenticatedRaftRpc".to_string(),
         ],
         safety_helpers: vec![
             "rustraft_read_safety_decision".to_string(),
