@@ -33,6 +33,63 @@ fn small_limits() -> RustRaftPipelineLimits {
 }
 
 #[test]
+fn replication_pipeline_batches_retries_backoff_and_lag() {
+    let mut pipeline = RaftReplicationPipeline::new(
+        2,
+        1,
+        RustRaftPipelineLimits {
+            max_inflights_replicate: 8,
+            max_memory_replicate_log_bytes: 1024,
+            max_inflights_apply_task: 2,
+            max_apply_batch_bytes: 256,
+            enable_reorder_queue: true,
+            reorder_window_size: 8,
+            reorder_timeout_us: 10,
+        },
+    );
+
+    pipeline.queue_append(entry(1, b"one")).expect("queue one");
+    pipeline.queue_append(entry(2, b"two")).expect("queue two");
+    pipeline
+        .queue_append(entry(3, b"three"))
+        .expect("queue three");
+
+    let flushed = pipeline.flush_append_batch(3, 1024);
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].entry_count, 3);
+    assert_eq!(flushed[0].first_log_id.index, 1);
+    assert_eq!(flushed[0].last_log_id.index, 3);
+    assert_eq!(pipeline.status().append_batches, 1);
+    assert_eq!(pipeline.status().max_append_batch_entries, 3);
+
+    assert!(pipeline
+        .handle_append_response(&RustRaftAppendEntriesResponse {
+            term: 1,
+            success: false,
+            match_index: 0,
+            rejection_hint: Some(0),
+        })
+        .is_err());
+    assert_eq!(pipeline.status().retry_attempts, 1);
+    assert!(pipeline.status().backoff_ms > 0);
+    assert!(!pipeline.record_retry_backoff_tick(1));
+    let remaining = pipeline.status().next_retry_after_ms;
+    assert!(pipeline.record_retry_backoff_tick(remaining));
+
+    pipeline
+        .handle_append_response(&RustRaftAppendEntriesResponse {
+            term: 1,
+            success: true,
+            match_index: 3,
+            rejection_hint: None,
+        })
+        .expect("ack batch");
+    assert_eq!(pipeline.status().retry_attempts, 0);
+    assert_eq!(pipeline.status().inflight_entries, 0);
+    assert_eq!(pipeline.update_follower_lag(5), 2);
+}
+
+#[test]
 fn replication_pipeline_enforces_windows_and_memory_backpressure() {
     let mut pipeline = RaftReplicationPipeline::new(2, 1, small_limits());
 
@@ -185,4 +242,46 @@ fn raft_cluster_updates_live_peer_pipelines_during_replication() {
             .snapshot_installed_index,
         5
     );
+}
+
+#[test]
+fn raft_cluster_runs_learner_catchup_and_witness_quorum_accounting() {
+    let mut cluster =
+        RaftCluster::new(99, Default::default(), vec![peer(1), peer(2), peer(3)]).expect("cluster");
+    cluster.start().expect("start");
+    cluster.propose(b"a".to_vec()).expect("first write");
+    cluster.propose(b"b".to_vec()).expect("second write");
+
+    let mut learner = peer(4);
+    learner.role = RustRaftReplicaRole::Learner;
+    cluster.add_learner(learner).expect("add learner");
+    let catchup = cluster.learner_catch_up_loop(4).expect("catch up");
+    assert!(catchup.caught_up);
+    assert_eq!(
+        catchup.learner_match_index_after,
+        catchup.leader_commit_index
+    );
+    assert!(
+        cluster
+            .catchup_report(4)
+            .expect("catchup report")
+            .promotable
+    );
+    let learner_pipeline = cluster.peer_pipeline_status(4).expect("learner pipeline");
+    assert_eq!(learner_pipeline.learner_catchup_rounds, 1);
+    assert!(learner_pipeline.learner_caught_up);
+    assert_eq!(learner_pipeline.follower_lag, 0);
+
+    let mut witness = peer(5);
+    witness.role = RustRaftReplicaRole::Witness;
+    cluster.add_witness(witness).expect("add witness");
+    let quorum = cluster.witness_quorum_report([1, 2, 5]);
+    assert_eq!(quorum.required, 3);
+    assert_eq!(quorum.acknowledged, 3);
+    assert!(quorum.reached);
+    assert_eq!(quorum.witnesses, vec![5]);
+    let witness_pipeline = cluster.peer_pipeline_status(5).expect("witness pipeline");
+    assert_eq!(witness_pipeline.witness_quorum_required, 3);
+    assert_eq!(witness_pipeline.witness_quorum_acked, 3);
+    assert!(witness_pipeline.witness_quorum_reached);
 }

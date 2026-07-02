@@ -206,8 +206,20 @@ pub struct RustRaftPeerPipelineStatus {
     pub match_index: u64,
     pub next_index: u64,
     pub append_requests: u64,
+    #[serde(default)]
+    pub append_batches: u64,
+    #[serde(default)]
+    pub max_append_batch_entries: u64,
+    #[serde(default)]
+    pub max_append_batch_bytes: u64,
     pub append_accepted: u64,
     pub append_rejected: u64,
+    #[serde(default)]
+    pub retry_attempts: u64,
+    #[serde(default)]
+    pub backoff_ms: u64,
+    #[serde(default)]
+    pub next_retry_after_ms: u64,
     pub inflight_entries: u64,
     pub inflight_bytes: u64,
     pub append_queue_depth: u64,
@@ -250,6 +262,18 @@ pub struct RustRaftPeerPipelineStatus {
     pub election_rejections: u64,
     pub offline_timeout_reached: bool,
     pub offline_timeout_rejections: u64,
+    #[serde(default)]
+    pub follower_lag: RustRaftLogIndex,
+    #[serde(default)]
+    pub learner_catchup_rounds: u64,
+    #[serde(default)]
+    pub learner_caught_up: bool,
+    #[serde(default)]
+    pub witness_quorum_required: u64,
+    #[serde(default)]
+    pub witness_quorum_acked: u64,
+    #[serde(default)]
+    pub witness_quorum_reached: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,8 +333,14 @@ impl RustRaftPeerPipelineStatus {
             match_index: next_index.saturating_sub(1),
             next_index,
             append_requests: 0,
+            append_batches: 0,
+            max_append_batch_entries: 0,
+            max_append_batch_bytes: 0,
             append_accepted: 0,
             append_rejected: 0,
+            retry_attempts: 0,
+            backoff_ms: 0,
+            next_retry_after_ms: 0,
             inflight_entries: 0,
             inflight_bytes: 0,
             append_queue_depth: 0,
@@ -350,6 +380,12 @@ impl RustRaftPeerPipelineStatus {
             election_rejections: 0,
             offline_timeout_reached: false,
             offline_timeout_rejections: 0,
+            follower_lag: 0,
+            learner_catchup_rounds: 0,
+            learner_caught_up: false,
+            witness_quorum_required: 0,
+            witness_quorum_acked: 0,
+            witness_quorum_reached: false,
         }
     }
 }
@@ -381,6 +417,26 @@ pub struct RaftReplicationPipeline {
     inflight: VecDeque<RaftInflightAppend>,
     reorder_queue: BTreeMap<RustRaftLogIndex, RustRaftLogEntry>,
     snapshot_transfer: Option<RaftSnapshotTransferState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftLearnerCatchUpLoopReport {
+    pub learner_id: RustRaftNodeId,
+    pub leader_commit_index: RustRaftLogIndex,
+    pub learner_match_index_before: RustRaftLogIndex,
+    pub learner_match_index_after: RustRaftLogIndex,
+    pub rounds: u64,
+    pub caught_up: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftWitnessQuorumReport {
+    pub required: u64,
+    pub acknowledged: u64,
+    pub reached: bool,
+    pub voters: Vec<RustRaftNodeId>,
+    pub witnesses: Vec<RustRaftNodeId>,
 }
 
 impl RaftReplicationPipeline {
@@ -440,24 +496,58 @@ impl RaftReplicationPipeline {
     }
 
     pub fn flush_append_window(&mut self) -> Vec<RaftInflightAppend> {
+        self.flush_append_batch(1, self.limits.max_apply_batch_bytes)
+    }
+
+    pub fn flush_append_batch(
+        &mut self,
+        max_entries: u64,
+        max_bytes: u64,
+    ) -> Vec<RaftInflightAppend> {
         let mut flushed = Vec::new();
+        let max_entries = max_entries.max(1);
+        let max_bytes = max_bytes.max(1);
         while self.status.inflight_entries < self.limits.max_inflights_replicate {
-            let Some(entry) = self.append_queue.pop_front() else {
+            let Some(first) = self.append_queue.front().cloned() else {
                 break;
             };
-            let bytes = entry.payload.len() as u64;
-            if self.status.inflight_bytes + bytes > self.limits.max_memory_replicate_log_bytes {
-                self.append_queue.push_front(entry);
+            let mut entries = Vec::new();
+            let mut bytes = 0;
+            while entries.len() < max_entries as usize {
+                let Some(entry) = self.append_queue.front().cloned() else {
+                    break;
+                };
+                let entry_bytes = entry.payload.len() as u64;
+                if !entries.is_empty() && bytes + entry_bytes > max_bytes {
+                    break;
+                }
+                if self.status.inflight_bytes + bytes + entry_bytes
+                    > self.limits.max_memory_replicate_log_bytes
+                {
+                    break;
+                }
+                bytes += entry_bytes;
+                entries.push(self.append_queue.pop_front().expect("front exists"));
+            }
+            if entries.is_empty() {
                 self.status.memory_backpressure_rejections += 1;
                 break;
             }
+            let last = entries.last().expect("batch has entries").clone();
             let inflight = RaftInflightAppend {
-                first_log_id: entry.log_id.clone(),
-                last_log_id: entry.log_id,
-                entry_count: 1,
+                first_log_id: first.log_id,
+                last_log_id: last.log_id,
+                entry_count: entries.len() as u64,
                 bytes,
             };
             self.status.append_requests += 1;
+            self.status.append_batches += 1;
+            self.status.max_append_batch_entries = self
+                .status
+                .max_append_batch_entries
+                .max(inflight.entry_count);
+            self.status.max_append_batch_bytes =
+                self.status.max_append_batch_bytes.max(inflight.bytes);
             self.status.inflight_entries += inflight.entry_count;
             self.status.inflight_bytes += inflight.bytes;
             self.inflight.push_back(inflight.clone());
@@ -480,9 +570,15 @@ impl RaftReplicationPipeline {
             self.status.next_index = self.status.match_index + 1;
             self.release_inflight_through(response.match_index);
             self.drain_reorder_queue();
+            self.status.retry_attempts = 0;
+            self.status.backoff_ms = 0;
+            self.status.next_retry_after_ms = 0;
             Ok(())
         } else {
             self.status.append_rejected += 1;
+            self.status.retry_attempts += 1;
+            self.status.backoff_ms = next_backoff_ms(self.status.retry_attempts);
+            self.status.next_retry_after_ms = self.status.backoff_ms;
             self.status.next_index = response
                 .rejection_hint
                 .unwrap_or(self.status.match_index)
@@ -491,6 +587,34 @@ impl RaftReplicationPipeline {
                 "append rejected by peer pipeline".to_string(),
             ))
         }
+    }
+
+    pub fn record_retry_backoff_tick(&mut self, elapsed_ms: u64) -> bool {
+        self.status.next_retry_after_ms =
+            self.status.next_retry_after_ms.saturating_sub(elapsed_ms);
+        self.status.next_retry_after_ms == 0 && self.status.retry_attempts > 0
+    }
+
+    pub fn update_follower_lag(
+        &mut self,
+        leader_commit_index: RustRaftLogIndex,
+    ) -> RustRaftLogIndex {
+        self.status.follower_lag = leader_commit_index.saturating_sub(self.status.match_index);
+        self.status.follower_lag
+    }
+
+    pub fn record_learner_catchup_round(&mut self, leader_commit_index: RustRaftLogIndex) -> bool {
+        self.status.learner_catchup_rounds += 1;
+        self.update_follower_lag(leader_commit_index);
+        self.status.learner_caught_up = self.status.match_index >= leader_commit_index;
+        self.status.learner_caught_up
+    }
+
+    pub fn record_witness_quorum(&mut self, acknowledged: u64, required: u64) -> bool {
+        self.status.witness_quorum_acked = acknowledged;
+        self.status.witness_quorum_required = required;
+        self.status.witness_quorum_reached = acknowledged >= required;
+        self.status.witness_quorum_reached
     }
 
     pub fn receive_out_of_order(&mut self, entry: RustRaftLogEntry) -> Result<(), RaftError> {
@@ -688,6 +812,11 @@ impl RaftReplicationPipeline {
         self.status.next_index = self.status.match_index + 1;
         Ok(())
     }
+}
+
+fn next_backoff_ms(retry_attempts: u64) -> u64 {
+    let shift = retry_attempts.saturating_sub(1).min(10) as u32;
+    10_u64.saturating_mul(1_u64 << shift).min(5_000)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3607,7 +3736,7 @@ impl RaftCluster {
             }
             let response = if let Some(pipeline) = self.peer_pipelines.get_mut(&node_id) {
                 pipeline.queue_append(entry.clone())?;
-                let _ = pipeline.flush_append_window();
+                let _ = pipeline.flush_append_batch(64, self.config.max_payload_bytes.max(1));
                 if node.healthy {
                     node.append_entry(entry.clone());
                     let match_index = node.match_index();
@@ -3937,6 +4066,106 @@ impl RaftCluster {
         Ok(self
             .membership()
             .catchup_report(learner_id, node.match_index(), self.commit_index))
+    }
+
+    pub fn learner_catch_up_loop(
+        &mut self,
+        learner_id: RustRaftNodeId,
+    ) -> Result<RaftLearnerCatchUpLoopReport, RaftError> {
+        let leader_id = self.leader_id.ok_or(RaftError::NoLeader)?;
+        let leader = self
+            .nodes
+            .get(&leader_id)
+            .ok_or(RaftError::NodeNotFound(leader_id))?;
+        let leader_log = leader.log.clone();
+        let leader_snapshot = leader.installed_snapshot.clone();
+        let leader_commit_index = self.commit_index;
+
+        let learner = self
+            .nodes
+            .get_mut(&learner_id)
+            .ok_or(RaftError::NodeNotFound(learner_id))?;
+        if learner.replica_role != RustRaftReplicaRole::Learner {
+            return Err(RaftError::InvalidRequest(format!(
+                "node {} is not a learner",
+                learner_id
+            )));
+        }
+        let learner_match_index_before = learner.match_index();
+        if let Some(snapshot) = leader_snapshot {
+            if snapshot.last_log_id.index > learner.match_index() {
+                learner.installed_snapshot = Some(snapshot);
+            }
+        }
+        let current_match = learner.match_index();
+        for entry in leader_log
+            .into_iter()
+            .filter(|entry| entry.log_id.index > current_match)
+        {
+            learner.append_entry(entry);
+        }
+        learner.advance_commit(leader_commit_index.min(learner.match_index()));
+        let learner_match_index_after = learner.match_index();
+
+        let caught_up = if let Some(pipeline) = self.peer_pipelines.get_mut(&learner_id) {
+            let response = RustRaftAppendEntriesResponse {
+                term: self.current_term,
+                success: true,
+                match_index: learner_match_index_after,
+                rejection_hint: None,
+            };
+            let _ = pipeline.handle_append_response(&response);
+            pipeline.record_learner_catchup_round(leader_commit_index)
+        } else {
+            learner_match_index_after >= leader_commit_index
+        };
+        self.refresh_cluster_indexes();
+
+        Ok(RaftLearnerCatchUpLoopReport {
+            learner_id,
+            leader_commit_index,
+            learner_match_index_before,
+            learner_match_index_after,
+            rounds: self
+                .peer_pipelines
+                .get(&learner_id)
+                .map(|pipeline| pipeline.status().learner_catchup_rounds)
+                .unwrap_or_default(),
+            caught_up,
+            reason: if caught_up {
+                "learner_caught_up".to_string()
+            } else {
+                "learner_still_lagging".to_string()
+            },
+        })
+    }
+
+    pub fn witness_quorum_report<I>(&mut self, acknowledgements: I) -> RaftWitnessQuorumReport
+    where
+        I: IntoIterator<Item = RustRaftNodeId>,
+    {
+        let membership = self.membership();
+        let acknowledgements: Vec<_> = acknowledgements.into_iter().collect();
+        let acknowledged = membership
+            .voters
+            .iter()
+            .chain(membership.witnesses.iter())
+            .filter(|node_id| acknowledgements.contains(node_id))
+            .count() as u64;
+        let required = membership.quorum_size() as u64;
+        let reached = acknowledged >= required;
+        for witness_id in &membership.witnesses {
+            if let Some(pipeline) = self.peer_pipelines.get_mut(witness_id) {
+                pipeline.record_witness_quorum(acknowledged, required);
+            }
+        }
+        RaftWitnessQuorumReport {
+            required,
+            acknowledged,
+            reached,
+            voters: membership.voters,
+            witnesses: membership.witnesses,
+        }
     }
 
     pub fn install_snapshot_to(

@@ -50,8 +50,14 @@ fn local_status_report_tracks_replication_apply_and_pipeline_health() {
         match_index: 8,
         next_index: 9,
         append_requests: 10,
+        append_batches: 4,
+        max_append_batch_entries: 3,
+        max_append_batch_bytes: 192,
         append_accepted: 8,
         append_rejected: 2,
+        retry_attempts: 1,
+        backoff_ms: 20,
+        next_retry_after_ms: 10,
         inflight_entries: 1,
         inflight_bytes: 64,
         append_queue_depth: 1,
@@ -91,6 +97,12 @@ fn local_status_report_tracks_replication_apply_and_pipeline_health() {
         election_rejections: 0,
         offline_timeout_reached: false,
         offline_timeout_rejections: 0,
+        follower_lag: 2,
+        learner_catchup_rounds: 0,
+        learner_caught_up: false,
+        witness_quorum_required: 0,
+        witness_quorum_acked: 0,
+        witness_quorum_reached: false,
     }];
 
     let report = rustraft_runtime_local_status_report(status, pipeline, ready_snapshot());
