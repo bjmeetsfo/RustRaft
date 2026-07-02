@@ -1877,6 +1877,24 @@ impl LocalRaftWal {
             .collect()
     }
 
+    pub fn retained_log_range(&self) -> RaftLogRetainedRange {
+        wal_retained_range(&self.segments)
+    }
+
+    pub fn segment_index(&self) -> Vec<RaftWalSegmentIndex> {
+        self.segments
+            .iter()
+            .map(|segment| RaftWalSegmentIndex {
+                segment_id: segment.segment_id,
+                first_log_index: segment.first_index,
+                last_log_index: segment.last_index,
+                record_count: segment.records.len() as u64,
+                sealed: segment.sealed,
+                bytes: 0,
+            })
+            .collect()
+    }
+
     pub fn recover(&mut self) -> Result<RaftWalRecoveryReport, RaftError> {
         let mut records = self.records();
         let original_len = records.len();
@@ -1893,6 +1911,9 @@ impl LocalRaftWal {
             truncated_corrupt_tail,
             surviving_records: records.len(),
             removed_records: original_len.saturating_sub(records.len()),
+            segments_scanned: self.segments.len() as u64,
+            checksum_format: Some(rustraft_wal_checksum_format()),
+            retained_range: Some(wal_retained_range(&self.segments)),
         })
     }
 
@@ -2005,8 +2026,16 @@ impl PersistentRaftWal {
         })
     }
 
-    pub fn append(&mut self, mut record: RaftWalRecord) -> Result<String, RaftError> {
+    pub fn append(&mut self, record: RaftWalRecord) -> Result<String, RaftError> {
+        Ok(self.append_with_report(record)?.checksum)
+    }
+
+    pub fn append_with_report(
+        &mut self,
+        mut record: RaftWalRecord,
+    ) -> Result<RaftWalWriteReport, RaftError> {
         record.checksum = rustraft_wal_checksum(&record);
+        let hard_state_persisted = rustraft_validate_hard_state_persistence(&record).is_ok();
         let encoded = serde_json::to_string(&record)
             .map_err(|err| RaftError::Storage(format!("failed to encode WAL record: {err}")))?;
         let record_bytes = encoded.len() as u64 + 1;
@@ -2022,10 +2051,12 @@ impl PersistentRaftWal {
             .last()
             .map(|segment| segment.records.len())
             .unwrap_or_default();
+        let mut segment_rolled = false;
         if active_records >= self.options.max_records_per_segment
             || (active_records > 0 && active_len + record_bytes > self.options.max_segment_bytes)
         {
             self.roll_segment()?;
+            segment_rolled = true;
         }
 
         self.active_segment
@@ -2048,7 +2079,18 @@ impl PersistentRaftWal {
         }
         segment.last_index = record_index;
         segment.records.push(record);
-        Ok(checksum)
+        let segment_id = segment.segment_id;
+        Ok(RaftWalWriteReport {
+            segment_id,
+            log_index: record_index,
+            checksum,
+            checksum_format: rustraft_wal_checksum_format(),
+            bytes_written: record_bytes,
+            fsync_on_append: self.options.fsync_on_append,
+            segment_rolled,
+            hard_state_persisted,
+            retained_range: wal_retained_range(&self.segments),
+        })
     }
 
     pub fn recover(&mut self) -> Result<RaftWalRecoveryReport, RaftError> {
@@ -2086,6 +2128,9 @@ impl PersistentRaftWal {
             truncated_corrupt_tail: observed_corrupt_tail,
             surviving_records: records.len(),
             removed_records: original_len.saturating_sub(records.len()),
+            segments_scanned: self.segments.len() as u64,
+            checksum_format: Some(rustraft_wal_checksum_format()),
+            retained_range: Some(wal_retained_range(&self.segments)),
         })
     }
 
@@ -2123,6 +2168,39 @@ impl PersistentRaftWal {
             self.released_segment_count += removable_ids.len() as u64;
         }
         Ok(removable_ids.len() as u64)
+    }
+
+    pub fn compact_through_with_fence(
+        &mut self,
+        log_index: RustRaftLogIndex,
+        fence: &RustRaftStorageApplyFence,
+    ) -> Result<RaftWalCompactionReport, RaftError> {
+        if let Err(error) = rustraft_validate_storage_apply_fence(fence) {
+            return Ok(RaftWalCompactionReport {
+                requested_log_index: log_index,
+                released_segments: 0,
+                retained_range: self.retained_log_range(),
+                fence_valid: false,
+                blocker: Some(error.to_string()),
+            });
+        }
+        if fence.durable_applied_index < log_index || fence.storage_flushed_index < log_index {
+            return Ok(RaftWalCompactionReport {
+                requested_log_index: log_index,
+                released_segments: 0,
+                retained_range: self.retained_log_range(),
+                fence_valid: false,
+                blocker: Some("compaction fence is behind requested log index".to_string()),
+            });
+        }
+        let released_segments = self.compact_through(log_index)?;
+        Ok(RaftWalCompactionReport {
+            requested_log_index: log_index,
+            released_segments,
+            retained_range: self.retained_log_range(),
+            fence_valid: true,
+            blocker: None,
+        })
     }
 
     pub fn status(&self) -> RustRaftWalLifecycleStatus {
@@ -2193,6 +2271,18 @@ impl PersistentRaftWal {
         &self.segments
     }
 
+    pub fn segment_index(&self) -> Vec<RaftWalSegmentIndex> {
+        wal_segment_index(&self.options.dir, &self.segments)
+    }
+
+    pub fn retained_log_range(&self) -> RaftLogRetainedRange {
+        wal_retained_range(&self.segments)
+    }
+
+    pub fn checksum_format(&self) -> RaftWalChecksumFormat {
+        rustraft_wal_checksum_format()
+    }
+
     pub fn records(&self) -> Vec<RaftWalRecord> {
         self.segments
             .iter()
@@ -2244,6 +2334,50 @@ fn wal_record_index(record: &RaftWalRecord) -> RustRaftLogIndex {
         .map(|log_id| log_id.index)
         .or_else(|| record.entries.last().map(|entry| entry.log_id.index))
         .unwrap_or_default()
+}
+
+fn wal_retained_range(segments: &[RaftWalSegment]) -> RaftLogRetainedRange {
+    RaftLogRetainedRange {
+        first_log_index: segments
+            .iter()
+            .find(|segment| segment.first_index > 0)
+            .map(|segment| segment.first_index)
+            .unwrap_or_default(),
+        last_log_index: segments
+            .iter()
+            .rev()
+            .find(|segment| segment.last_index > 0)
+            .map(|segment| segment.last_index)
+            .unwrap_or_default(),
+        first_segment_id: segments
+            .first()
+            .map(|segment| segment.segment_id)
+            .unwrap_or(0),
+        last_segment_id: segments
+            .last()
+            .map(|segment| segment.segment_id)
+            .unwrap_or(0),
+        record_count: segments
+            .iter()
+            .map(|segment| segment.records.len() as u64)
+            .sum(),
+    }
+}
+
+fn wal_segment_index(dir: &Path, segments: &[RaftWalSegment]) -> Vec<RaftWalSegmentIndex> {
+    segments
+        .iter()
+        .map(|segment| RaftWalSegmentIndex {
+            segment_id: segment.segment_id,
+            first_log_index: segment.first_index,
+            last_log_index: segment.last_index,
+            record_count: segment.records.len() as u64,
+            sealed: segment.sealed,
+            bytes: fs::metadata(wal_segment_path(dir, segment.segment_id))
+                .map(|metadata| metadata.len())
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn open_segment_for_append(dir: &Path, segment_id: u64) -> Result<File, RaftError> {
@@ -6168,6 +6302,24 @@ pub fn rustraft_wal_checksum(record: &RaftWalRecord) -> String {
     mix(record.apply_snapshot_fence.installed_snapshot_index);
     mix(record.apply_snapshot_fence.first_retained_log_index);
     format!("{hash:016x}")
+}
+
+pub fn rustraft_wal_checksum_format() -> RaftWalChecksumFormat {
+    RaftWalChecksumFormat {
+        algorithm: "fnv1a64-rustraft-v1".to_string(),
+        encoding: "lower_hex_16".to_string(),
+        covered_fields: vec![
+            "group_id".to_string(),
+            "node_id".to_string(),
+            "hard_state.current_term".to_string(),
+            "hard_state.voted_for".to_string(),
+            "hard_state.committed".to_string(),
+            "entries.log_id".to_string(),
+            "entries.payload_len".to_string(),
+            "installed_snapshot.last_log_id".to_string(),
+            "apply_snapshot_fence".to_string(),
+        ],
+    }
 }
 
 pub fn rustraft_wal_checksum_valid(record: &RaftWalRecord) -> bool {

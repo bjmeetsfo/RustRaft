@@ -1,7 +1,7 @@
 use rustraft::{
-    rustraft_wal_lifecycle_evidence, PersistentRaftWal, PersistentRaftWalOptions, RaftWalRecord,
-    RustRaftApplySnapshotFence, RustRaftHardState, RustRaftLogEntry, RustRaftLogId,
-    RustRaftMembership,
+    rustraft_wal_checksum_format, rustraft_wal_lifecycle_evidence, PersistentRaftWal,
+    PersistentRaftWalOptions, RaftWalRecord, RustRaftApplySnapshotFence, RustRaftHardState,
+    RustRaftLogEntry, RustRaftLogId, RustRaftMembership, RustRaftStorageApplyFence,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -88,6 +88,41 @@ fn persistent_wal_rolls_segments_and_recovers_after_restart() {
 }
 
 #[test]
+fn persistent_wal_writer_reports_checksum_segment_index_and_retained_range() {
+    let dir = temp_wal_dir("writer-report");
+    let options = wal_options(dir.clone());
+    let mut wal = PersistentRaftWal::open(options).expect("open wal");
+
+    let first = wal.append_with_report(wal_record(1)).expect("append first");
+    assert_eq!(first.segment_id, 0);
+    assert_eq!(first.log_index, 1);
+    assert_eq!(first.checksum_format, rustraft_wal_checksum_format());
+    assert!(first.hard_state_persisted);
+    assert!(first.fsync_on_append);
+    assert_eq!(first.retained_range.first_log_index, 1);
+    assert_eq!(first.retained_range.last_log_index, 1);
+
+    wal.append_with_report(wal_record(2))
+        .expect("append second");
+    let third = wal
+        .append_with_report(wal_record(3))
+        .expect("append third rolls segment");
+    assert!(third.segment_rolled);
+    assert_eq!(third.segment_id, 1);
+
+    let index = wal.segment_index();
+    assert_eq!(index.len(), 2);
+    assert_eq!(index[0].record_count, 2);
+    assert!(index[0].sealed);
+    assert!(index[0].bytes > 0);
+    assert_eq!(wal.retained_log_range().first_log_index, 1);
+    assert_eq!(wal.retained_log_range().last_log_index, 3);
+    assert_eq!(wal.checksum_format().algorithm, "fnv1a64-rustraft-v1");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn persistent_wal_truncates_corrupt_tail_on_recovery() {
     let dir = temp_wal_dir("corrupt-tail");
     let options = wal_options(dir.clone());
@@ -102,6 +137,18 @@ fn persistent_wal_truncates_corrupt_tail_on_recovery() {
     let report = reopened.recover().expect("recover");
     assert!(report.truncated_corrupt_tail);
     assert_eq!(report.surviving_records, 2);
+    assert_eq!(report.segments_scanned, 1);
+    assert_eq!(
+        report.checksum_format.expect("checksum format"),
+        rustraft_wal_checksum_format()
+    );
+    assert_eq!(
+        report
+            .retained_range
+            .expect("retained range")
+            .last_log_index,
+        2
+    );
     assert_eq!(reopened.records().len(), 2);
 
     let _ = fs::remove_dir_all(dir);
@@ -146,6 +193,57 @@ fn persistent_wal_compacts_released_segments_and_reports_lifecycle_evidence() {
             .index,
         5
     );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn persistent_wal_compaction_fence_blocks_unsafe_release_and_reports_range() {
+    let dir = temp_wal_dir("compaction-fence");
+    let options = wal_options(dir.clone());
+    let mut wal = PersistentRaftWal::open(options).expect("open wal");
+    for index in 1..=5 {
+        wal.append(wal_record(index)).expect("append");
+    }
+
+    let blocked = wal
+        .compact_through_with_fence(
+            4,
+            &RustRaftStorageApplyFence {
+                group_id: 9,
+                node_id: 1,
+                committed_index: 5,
+                applied_index: 5,
+                durable_applied_index: 3,
+                storage_flushed_index: 5,
+                installed_snapshot_index: 0,
+                first_retained_log_index: 1,
+            },
+        )
+        .expect("blocked report");
+    assert!(!blocked.fence_valid);
+    assert_eq!(blocked.released_segments, 0);
+    assert!(blocked.blocker.expect("blocker").contains("behind"));
+
+    let released = wal
+        .compact_through_with_fence(
+            4,
+            &RustRaftStorageApplyFence {
+                group_id: 9,
+                node_id: 1,
+                committed_index: 5,
+                applied_index: 5,
+                durable_applied_index: 4,
+                storage_flushed_index: 4,
+                installed_snapshot_index: 0,
+                first_retained_log_index: 1,
+            },
+        )
+        .expect("safe compaction");
+    assert!(released.fence_valid);
+    assert_eq!(released.released_segments, 2);
+    assert_eq!(released.retained_range.first_log_index, 5);
+    assert_eq!(released.retained_range.last_log_index, 5);
 
     let _ = fs::remove_dir_all(dir);
 }
