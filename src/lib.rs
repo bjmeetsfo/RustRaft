@@ -252,6 +252,79 @@ pub struct RustRaftPipelineEvidence {
     pub reorder_queue_enabled: bool,
 }
 
+pub type RaftPeerPipelineState = RustRaftPeerPipelineStatus;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RaftHealthStatus {
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftReplicationHealth {
+    pub status: RaftHealthStatus,
+    pub leader_id: Option<RustRaftNodeId>,
+    pub commit_index: RustRaftLogIndex,
+    pub replicated_peer_count: u64,
+    pub lagging_peer_count: u64,
+    pub max_peer_lag: RustRaftLogIndex,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftApplyHealth {
+    pub status: RaftHealthStatus,
+    pub commit_index: RustRaftLogIndex,
+    pub applied_index: RustRaftLogIndex,
+    pub apply_lag: RustRaftLogIndex,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftCapabilityEvidence {
+    pub capability: String,
+    pub present: bool,
+    pub evidence: Vec<String>,
+    pub source_reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftRuntimeLocalStatusReport {
+    pub node_status: RustRaftStatusSnapshot,
+    pub peer_pipeline: Vec<RaftPeerPipelineState>,
+    pub replication_health: RaftReplicationHealth,
+    pub apply_health: RaftApplyHealth,
+    pub readiness: RustRaftReadinessSnapshot,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftClusterStatusReport {
+    pub group_id: RustRaftGroupId,
+    pub leader_id: Option<RustRaftNodeId>,
+    pub nodes: Vec<RustRaftStatusSnapshot>,
+    pub replication_health: RaftReplicationHealth,
+    pub apply_health: RaftApplyHealth,
+    pub ready: bool,
+    pub health: RaftHealthStatus,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftRuntimeAdminReport {
+    pub cluster_status: RaftClusterStatusReport,
+    pub readiness: RustRaftReadinessSnapshot,
+    pub parity: RustRaftParityReport,
+    pub public_api: RustRaftPublicApiContract,
+    pub capability_evidence: Vec<RaftCapabilityEvidence>,
+    pub ready: bool,
+    pub health: RaftHealthStatus,
+    pub blockers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftSnapshotLifecycleEvidence {
     pub sender_lifecycle_present: bool,
@@ -2226,6 +2299,19 @@ impl RaftCluster {
         })
     }
 
+    pub fn cluster_status_report(&self) -> Result<RaftClusterStatusReport, RaftError> {
+        let nodes = self
+            .node_ids()
+            .into_iter()
+            .map(|node_id| self.status(node_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rustraft_cluster_status_report(
+            self.group_id,
+            self.leader_id,
+            nodes,
+        ))
+    }
+
     pub fn node_ids(&self) -> Vec<RustRaftNodeId> {
         self.nodes.keys().copied().collect()
     }
@@ -2753,6 +2839,218 @@ pub fn rustraft_metric_names() -> RustRaftMetricNames {
         peer_reorder_queue_depth: "rustraft_peer_reorder_queue_depth".to_string(),
         peer_snapshot_installed_index: "rustraft_peer_snapshot_installed_index".to_string(),
         wal_segment_count: "rustraft_wal_segment_count".to_string(),
+    }
+}
+
+pub fn rustraft_replication_health(
+    status: &RustRaftStatusSnapshot,
+    peer_pipeline: &[RaftPeerPipelineState],
+) -> RaftReplicationHealth {
+    let max_status_lag = status
+        .peers
+        .iter()
+        .map(|peer| peer.lag)
+        .max()
+        .unwrap_or_default();
+    let max_pipeline_lag = peer_pipeline
+        .iter()
+        .map(|peer| status.commit_index.saturating_sub(peer.match_index))
+        .max()
+        .unwrap_or_default();
+    let max_peer_lag = max_status_lag.max(max_pipeline_lag);
+    let lagging_peer_count = status.peers.iter().filter(|peer| peer.lag > 0).count() as u64
+        + peer_pipeline
+            .iter()
+            .filter(|peer| peer.match_index < status.commit_index)
+            .count() as u64;
+    let replicated_peer_count = status.peers.iter().filter(|peer| peer.healthy).count() as u64;
+    let status_value = if status.leader_id.is_none() {
+        RaftHealthStatus::Unavailable
+    } else if lagging_peer_count > 0 {
+        RaftHealthStatus::Degraded
+    } else {
+        RaftHealthStatus::Healthy
+    };
+    RaftReplicationHealth {
+        status: status_value,
+        leader_id: status.leader_id,
+        commit_index: status.commit_index,
+        replicated_peer_count,
+        lagging_peer_count,
+        max_peer_lag,
+        reason: match status_value {
+            RaftHealthStatus::Healthy => "replication_healthy".to_string(),
+            RaftHealthStatus::Degraded => "replication_lagging".to_string(),
+            RaftHealthStatus::Unavailable => "leader_unavailable".to_string(),
+        },
+    }
+}
+
+pub fn rustraft_apply_health(status: &RustRaftStatusSnapshot) -> RaftApplyHealth {
+    let apply_lag = status.commit_index.saturating_sub(status.applied_index);
+    let status_value = if status.leader_id.is_none() {
+        RaftHealthStatus::Unavailable
+    } else if apply_lag > 0 {
+        RaftHealthStatus::Degraded
+    } else {
+        RaftHealthStatus::Healthy
+    };
+    RaftApplyHealth {
+        status: status_value,
+        commit_index: status.commit_index,
+        applied_index: status.applied_index,
+        apply_lag,
+        reason: match status_value {
+            RaftHealthStatus::Healthy => "apply_healthy".to_string(),
+            RaftHealthStatus::Degraded => "apply_lagging".to_string(),
+            RaftHealthStatus::Unavailable => "leader_unavailable".to_string(),
+        },
+    }
+}
+
+pub fn rustraft_runtime_local_status_report(
+    node_status: RustRaftStatusSnapshot,
+    peer_pipeline: Vec<RaftPeerPipelineState>,
+    readiness: RustRaftReadinessSnapshot,
+) -> RaftRuntimeLocalStatusReport {
+    let replication_health = rustraft_replication_health(&node_status, &peer_pipeline);
+    let apply_health = rustraft_apply_health(&node_status);
+    let mut blockers = Vec::new();
+    if replication_health.status != RaftHealthStatus::Healthy {
+        blockers.push(replication_health.reason.clone());
+    }
+    if apply_health.status != RaftHealthStatus::Healthy {
+        blockers.push(apply_health.reason.clone());
+    }
+    if !readiness.rustraft_operator_observability_present {
+        blockers.push("operator_observability_missing".to_string());
+    }
+    let ready = blockers.is_empty();
+    RaftRuntimeLocalStatusReport {
+        node_status,
+        peer_pipeline,
+        replication_health,
+        apply_health,
+        readiness,
+        ready,
+        blockers,
+    }
+}
+
+pub fn rustraft_cluster_status_report(
+    group_id: RustRaftGroupId,
+    leader_id: Option<RustRaftNodeId>,
+    nodes: Vec<RustRaftStatusSnapshot>,
+) -> RaftClusterStatusReport {
+    let representative = nodes
+        .iter()
+        .find(|node| Some(node.node_id) == leader_id)
+        .or_else(|| nodes.first());
+    let (replication_health, apply_health) = if let Some(status) = representative {
+        (
+            rustraft_replication_health(status, &[]),
+            rustraft_apply_health(status),
+        )
+    } else {
+        (
+            RaftReplicationHealth {
+                status: RaftHealthStatus::Unavailable,
+                leader_id,
+                commit_index: 0,
+                replicated_peer_count: 0,
+                lagging_peer_count: 0,
+                max_peer_lag: 0,
+                reason: "cluster_has_no_nodes".to_string(),
+            },
+            RaftApplyHealth {
+                status: RaftHealthStatus::Unavailable,
+                commit_index: 0,
+                applied_index: 0,
+                apply_lag: 0,
+                reason: "cluster_has_no_nodes".to_string(),
+            },
+        )
+    };
+    let mut blockers = Vec::new();
+    if leader_id.is_none() {
+        blockers.push("leader_unavailable".to_string());
+    }
+    if replication_health.status != RaftHealthStatus::Healthy {
+        blockers.push(replication_health.reason.clone());
+    }
+    if apply_health.status != RaftHealthStatus::Healthy {
+        blockers.push(apply_health.reason.clone());
+    }
+    let health = if blockers.is_empty() {
+        RaftHealthStatus::Healthy
+    } else if leader_id.is_some() {
+        RaftHealthStatus::Degraded
+    } else {
+        RaftHealthStatus::Unavailable
+    };
+    RaftClusterStatusReport {
+        group_id,
+        leader_id,
+        nodes,
+        replication_health,
+        apply_health,
+        ready: blockers.is_empty(),
+        health,
+        blockers,
+    }
+}
+
+pub fn rustraft_capability_evidence(
+    readiness: &RustRaftReadinessSnapshot,
+) -> Vec<RaftCapabilityEvidence> {
+    rustraft_readiness_evidence(readiness)
+        .into_iter()
+        .map(|evidence| RaftCapabilityEvidence {
+            capability: evidence.requirement_id,
+            present: evidence.present,
+            evidence: vec![evidence.readiness_field],
+            source_reference: "rustraft_readiness_snapshot".to_string(),
+        })
+        .collect()
+}
+
+pub fn rustraft_runtime_admin_report(
+    cluster_status: RaftClusterStatusReport,
+    readiness: RustRaftReadinessSnapshot,
+    capability_evidence: Vec<RaftCapabilityEvidence>,
+) -> RaftRuntimeAdminReport {
+    let parity = rustraft_parity_report(&readiness);
+    let public_api = rustraft_public_api_contract();
+    let mut blockers = cluster_status.blockers.clone();
+    blockers.extend(
+        capability_evidence
+            .iter()
+            .filter(|evidence| !evidence.present)
+            .map(|evidence| format!("capability_missing:{}", evidence.capability)),
+    );
+    blockers.extend(parity.production_blockers.iter().cloned());
+    blockers.sort();
+    blockers.dedup();
+    let ready = cluster_status.ready
+        && parity.ready
+        && capability_evidence.iter().all(|evidence| evidence.present)
+        && blockers.is_empty();
+    let health = if ready {
+        RaftHealthStatus::Healthy
+    } else if cluster_status.leader_id.is_some() {
+        RaftHealthStatus::Degraded
+    } else {
+        RaftHealthStatus::Unavailable
+    };
+    RaftRuntimeAdminReport {
+        cluster_status,
+        readiness,
+        parity,
+        public_api,
+        capability_evidence,
+        ready,
+        health,
+        blockers,
     }
 }
 
