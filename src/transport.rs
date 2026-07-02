@@ -2,11 +2,11 @@
 
 pub use crate::{
     AppendEntriesRequest, AppendEntriesResponse, AuthenticatedRaftRpc, AuthenticatedRaftTransport,
-    ClusterRaftTransport, InstallSnapshotRequest, InstallSnapshotResponse, RaftAuthPolicy,
-    RaftTransport, ReadIndexRequest, ReadIndexResponse, RustRaftAppendEntriesRequest,
-    RustRaftAppendEntriesResponse, RustRaftInstallSnapshotRequest, RustRaftInstallSnapshotResponse,
-    RustRaftReadIndexRequest, RustRaftReadIndexResponse, RustRaftTransport, RustRaftVoteRequest,
-    RustRaftVoteResponse, StaticRaftAuthToken, TcpRaftRpcResult, TcpRaftTransport,
-    TcpRaftTransportRequest, TcpRaftTransportResponse, TcpRaftTransportServer, VoteRequest,
-    VoteResponse,
+    ClusterRaftTransport, InstallSnapshotRequest, InstallSnapshotResponse, PreVoteRequest,
+    PreVoteResponse, RaftAuthPolicy, RaftTransport, ReadIndexRequest, ReadIndexResponse,
+    RustRaftAppendEntriesRequest, RustRaftAppendEntriesResponse, RustRaftInstallSnapshotRequest,
+    RustRaftInstallSnapshotResponse, RustRaftReadIndexRequest, RustRaftReadIndexResponse,
+    RustRaftSnapshotChunk, RustRaftTransport, RustRaftVoteRequest, RustRaftVoteResponse,
+    StaticRaftAuthToken, TcpRaftRpcResult, TcpRaftTransport, TcpRaftTransportRequest,
+    TcpRaftTransportResponse, TcpRaftTransportServer, VoteRequest, VoteResponse,
 };

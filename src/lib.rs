@@ -189,12 +189,15 @@ pub struct RustRaftMetricNames {
     pub ready: String,
     pub append_latency_ms: String,
     pub vote_latency_ms: String,
+    pub pre_vote_latency_ms: String,
     pub read_index_latency_ms: String,
     pub snapshot_install_latency_ms: String,
     pub peer_append_queue_depth: String,
     pub peer_reorder_queue_depth: String,
     pub peer_snapshot_installed_index: String,
     pub wal_segment_count: String,
+    pub blocker_total: String,
+    pub fatal_total: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -756,6 +759,31 @@ pub struct RaftRuntimeAdminReport {
     pub ready: bool,
     pub health: RaftHealthStatus,
     pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustRaftBlockerSeverity {
+    Blocker,
+    Fatal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftBlocker {
+    pub id: String,
+    pub source: String,
+    pub severity: RustRaftBlockerSeverity,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftFatalBlockerReport {
+    pub ready: bool,
+    pub fatal: bool,
+    pub source: String,
+    pub blockers: Vec<RustRaftBlocker>,
+    pub blocker_count: u64,
+    pub fatal_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2509,6 +2537,7 @@ pub trait RustRaftConsensus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftByteRaftParitySurface {
     pub node_lifecycle: Vec<String>,
+    pub transport_api: Vec<String>,
     pub write_api: Vec<String>,
     pub read_api: Vec<String>,
     pub membership_api: Vec<String>,
@@ -2524,6 +2553,13 @@ pub fn rustraft_byteraft_parity_surface() -> RustRaftByteRaftParitySurface {
             "restart".to_string(),
             "stop".to_string(),
             "shutdown".to_string(),
+        ],
+        transport_api: vec![
+            "append_entries_rpc".to_string(),
+            "vote_rpc".to_string(),
+            "pre_vote_rpc".to_string(),
+            "install_snapshot_chunk_rpc".to_string(),
+            "read_index_rpc".to_string(),
         ],
         write_api: vec![
             "propose".to_string(),
@@ -2547,8 +2583,12 @@ pub fn rustraft_byteraft_parity_surface() -> RustRaftByteRaftParitySurface {
         ],
         observability_api: vec![
             "status".to_string(),
+            "status_snapshot".to_string(),
             "local_status".to_string(),
+            "admin_report".to_string(),
+            "readiness_report".to_string(),
             "metrics".to_string(),
+            "blocker_report".to_string(),
             "fatal_events".to_string(),
         ],
     }
@@ -2610,6 +2650,7 @@ pub struct RustRaftVoteRequest {
 }
 
 pub type VoteRequest = RustRaftVoteRequest;
+pub type PreVoteRequest = RustRaftVoteRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftVoteResponse {
@@ -2619,6 +2660,7 @@ pub struct RustRaftVoteResponse {
 }
 
 pub type VoteResponse = RustRaftVoteResponse;
+pub type PreVoteResponse = RustRaftVoteResponse;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftSnapshotMeta {
@@ -5671,15 +5713,23 @@ pub fn rustraft_public_api_contract() -> RustRaftPublicApiContract {
         transport_trait: "RaftTransport".to_string(),
         rpc_messages: vec![
             "AppendEntriesRequest".to_string(),
+            "AppendEntriesResponse".to_string(),
             "VoteRequest".to_string(),
+            "VoteResponse".to_string(),
+            "PreVoteRequest".to_string(),
+            "PreVoteResponse".to_string(),
             "InstallSnapshotRequest".to_string(),
+            "InstallSnapshotResponse".to_string(),
+            "RustRaftSnapshotChunk".to_string(),
             "ReadIndexRequest".to_string(),
+            "ReadIndexResponse".to_string(),
             "AuthenticatedRaftRpc".to_string(),
         ],
         safety_helpers: vec![
             "rustraft_read_safety_decision".to_string(),
             "rustraft_append_safety_decision".to_string(),
             "rustraft_learner_promotion_decision".to_string(),
+            "rustraft_fatal_blocker_report".to_string(),
         ],
         metrics: rustraft_metric_names(),
     }
@@ -5690,13 +5740,63 @@ pub fn rustraft_metric_names() -> RustRaftMetricNames {
         ready: "rustraft_ready".to_string(),
         append_latency_ms: "rustraft_append_latency_ms".to_string(),
         vote_latency_ms: "rustraft_vote_latency_ms".to_string(),
+        pre_vote_latency_ms: "rustraft_pre_vote_latency_ms".to_string(),
         read_index_latency_ms: "rustraft_read_index_latency_ms".to_string(),
         snapshot_install_latency_ms: "rustraft_snapshot_install_latency_ms".to_string(),
         peer_append_queue_depth: "rustraft_peer_append_queue_depth".to_string(),
         peer_reorder_queue_depth: "rustraft_peer_reorder_queue_depth".to_string(),
         peer_snapshot_installed_index: "rustraft_peer_snapshot_installed_index".to_string(),
         wal_segment_count: "rustraft_wal_segment_count".to_string(),
+        blocker_total: "rustraft_blocker_total".to_string(),
+        fatal_total: "rustraft_fatal_total".to_string(),
     }
+}
+
+pub fn rustraft_fatal_blocker_report(
+    source: impl Into<String>,
+    blockers: Vec<String>,
+    fatal_blockers: Vec<String>,
+) -> RustRaftFatalBlockerReport {
+    let source = source.into();
+    let blockers = blockers
+        .into_iter()
+        .map(|id| {
+            let severity = if fatal_blockers.iter().any(|fatal| fatal == &id) {
+                RustRaftBlockerSeverity::Fatal
+            } else {
+                RustRaftBlockerSeverity::Blocker
+            };
+            RustRaftBlocker {
+                detail: format!("{source}:{id}"),
+                id,
+                source: source.clone(),
+                severity,
+            }
+        })
+        .collect::<Vec<_>>();
+    let fatal_count = blockers
+        .iter()
+        .filter(|blocker| blocker.severity == RustRaftBlockerSeverity::Fatal)
+        .count() as u64;
+    RustRaftFatalBlockerReport {
+        ready: blockers.is_empty(),
+        fatal: fatal_count > 0,
+        source,
+        blocker_count: blockers.len() as u64,
+        fatal_count,
+        blockers,
+    }
+}
+
+pub fn rustraft_admin_fatal_blocker_report(
+    report: &RaftRuntimeAdminReport,
+    fatal_blockers: Vec<String>,
+) -> RustRaftFatalBlockerReport {
+    rustraft_fatal_blocker_report(
+        "rustraft_admin_report",
+        report.blockers.clone(),
+        fatal_blockers,
+    )
 }
 
 pub fn rustraft_replication_health(
