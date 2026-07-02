@@ -1476,6 +1476,35 @@ pub struct RustRaftApplySnapshotFence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftStorageApplyFence {
+    pub group_id: RustRaftGroupId,
+    pub node_id: RustRaftNodeId,
+    pub committed_index: RustRaftLogIndex,
+    pub applied_index: RustRaftLogIndex,
+    pub durable_applied_index: RustRaftLogIndex,
+    pub storage_flushed_index: RustRaftLogIndex,
+    pub installed_snapshot_index: RustRaftLogIndex,
+    pub first_retained_log_index: RustRaftLogIndex,
+}
+
+pub type RaftStorageApplyFence = RustRaftStorageApplyFence;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftDurabilityParityReport {
+    pub ready: bool,
+    pub hard_state_persisted: bool,
+    pub wal_record_valid: bool,
+    pub segmented_wal_recovered: bool,
+    pub corrupt_tail_truncated: bool,
+    pub snapshot_install_valid: bool,
+    pub snapshot_floor_preserved: bool,
+    pub snapshot_tail_catchup_valid: bool,
+    pub apply_snapshot_fence_valid: bool,
+    pub storage_apply_fence_valid: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftWalRecord {
     pub group_id: RustRaftGroupId,
     pub node_id: RustRaftNodeId,
@@ -5374,6 +5403,34 @@ pub fn rustraft_wal_checksum_valid(record: &RaftWalRecord) -> bool {
     record.checksum == rustraft_wal_checksum(record)
 }
 
+pub fn rustraft_validate_hard_state_persistence(
+    record: &RustRaftWalRecord,
+) -> Result<(), RustRaftError> {
+    if let Some(committed) = &record.hard_state.committed {
+        if committed.term > record.hard_state.current_term {
+            return Err(RustRaftError::Storage(
+                "committed term is ahead of persisted current term".to_string(),
+            ));
+        }
+        let last_entry_index = record
+            .entries
+            .last()
+            .map(|entry| entry.log_id.index)
+            .unwrap_or_default();
+        let snapshot_index = record
+            .installed_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.last_log_id.index)
+            .unwrap_or_default();
+        if committed.index > last_entry_index.max(snapshot_index) {
+            return Err(RustRaftError::Storage(
+                "committed index is ahead of persisted log and snapshot".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn rustraft_validate_apply_snapshot_fence(
     record: &RustRaftWalRecord,
 ) -> Result<(), RustRaftError> {
@@ -5407,6 +5464,39 @@ pub fn rustraft_validate_apply_snapshot_fence(
                 "first retained log index overlaps installed snapshot".to_string(),
             ));
         }
+    }
+    Ok(())
+}
+
+pub fn rustraft_validate_storage_apply_fence(
+    fence: &RustRaftStorageApplyFence,
+) -> Result<(), RustRaftError> {
+    if fence.applied_index > fence.committed_index {
+        return Err(RustRaftError::Storage(
+            "storage apply fence is ahead of committed index".to_string(),
+        ));
+    }
+    if fence.durable_applied_index > fence.applied_index {
+        return Err(RustRaftError::Storage(
+            "durable applied index is ahead of in-memory applied index".to_string(),
+        ));
+    }
+    if fence.storage_flushed_index < fence.durable_applied_index {
+        return Err(RustRaftError::Storage(
+            "storage flush is behind durable applied index".to_string(),
+        ));
+    }
+    if fence.installed_snapshot_index > fence.applied_index {
+        return Err(RustRaftError::Storage(
+            "installed snapshot is ahead of applied index".to_string(),
+        ));
+    }
+    if fence.installed_snapshot_index > 0
+        && fence.first_retained_log_index <= fence.installed_snapshot_index
+    {
+        return Err(RustRaftError::Storage(
+            "first retained log index overlaps installed snapshot".to_string(),
+        ));
     }
     Ok(())
 }
@@ -5454,6 +5544,27 @@ pub fn rustraft_validate_snapshot_install(
     )
 }
 
+pub fn rustraft_validate_snapshot_tail_catchup(
+    snapshot: &RustRaftSnapshotMeta,
+    tail_entries: &[RustRaftLogEntry],
+) -> Result<(), RustRaftError> {
+    let mut expected_index = snapshot.last_log_id.index + 1;
+    for entry in tail_entries {
+        if entry.log_id.index <= snapshot.last_log_id.index {
+            return Err(RaftError::Storage(
+                "tail catch-up entry overlaps installed snapshot".to_string(),
+            ));
+        }
+        if entry.log_id.index != expected_index {
+            return Err(RaftError::Storage(
+                "tail catch-up entries are not contiguous after snapshot".to_string(),
+            ));
+        }
+        expected_index += 1;
+    }
+    Ok(())
+}
+
 pub fn rustraft_recover_latest_wal_record(
     records: &[RustRaftWalRecord],
 ) -> Result<RustRaftWalRecord, RustRaftError> {
@@ -5463,7 +5574,10 @@ pub fn rustraft_recover_latest_wal_record(
         .collect::<Vec<_>>();
     let Some(record) = valid_records
         .into_iter()
-        .filter(|record| rustraft_validate_apply_snapshot_fence(record).is_ok())
+        .filter(|record| {
+            rustraft_validate_hard_state_persistence(record).is_ok()
+                && rustraft_validate_apply_snapshot_fence(record).is_ok()
+        })
         .max_by_key(|record| {
             record
                 .hard_state
@@ -5478,6 +5592,67 @@ pub fn rustraft_recover_latest_wal_record(
         ));
     };
     Ok(record.clone())
+}
+
+pub fn rustraft_durability_parity_report(
+    wal_record: &RustRaftWalRecord,
+    recovery_report: &RaftWalRecoveryReport,
+    snapshot: Option<&RaftSnapshot>,
+    tail_entries: &[RustRaftLogEntry],
+    storage_fence: &RustRaftStorageApplyFence,
+) -> RustRaftDurabilityParityReport {
+    let hard_state_persisted = rustraft_validate_hard_state_persistence(wal_record).is_ok();
+    let wal_record_valid = rustraft_wal_checksum_valid(wal_record);
+    let segmented_wal_recovered = recovery_report.recovered.is_some();
+    let corrupt_tail_truncated =
+        recovery_report.truncated_corrupt_tail || recovery_report.removed_records > 0;
+    let apply_snapshot_fence_valid = rustraft_validate_apply_snapshot_fence(wal_record).is_ok();
+    let storage_apply_fence_valid = rustraft_validate_storage_apply_fence(storage_fence).is_ok();
+    let (snapshot_install_valid, snapshot_floor_preserved, snapshot_tail_catchup_valid) =
+        if let Some(snapshot) = snapshot {
+            (
+                rustraft_validate_snapshot_install(snapshot, &wal_record.apply_snapshot_fence)
+                    .is_ok(),
+                rustraft_validate_snapshot_floor_log_matching(
+                    &snapshot.meta,
+                    wal_record.apply_snapshot_fence.first_retained_log_index,
+                    Some(&snapshot.meta.last_log_id),
+                )
+                .is_ok(),
+                rustraft_validate_snapshot_tail_catchup(&snapshot.meta, tail_entries).is_ok(),
+            )
+        } else {
+            (true, true, tail_entries.is_empty())
+        };
+
+    let checks = [
+        ("hard_state_persisted", hard_state_persisted),
+        ("wal_record_valid", wal_record_valid),
+        ("segmented_wal_recovered", segmented_wal_recovered),
+        ("corrupt_tail_truncated", corrupt_tail_truncated),
+        ("snapshot_install_valid", snapshot_install_valid),
+        ("snapshot_floor_preserved", snapshot_floor_preserved),
+        ("snapshot_tail_catchup_valid", snapshot_tail_catchup_valid),
+        ("apply_snapshot_fence_valid", apply_snapshot_fence_valid),
+        ("storage_apply_fence_valid", storage_apply_fence_valid),
+    ];
+    let blockers = checks
+        .into_iter()
+        .filter_map(|(name, passed)| (!passed).then(|| name.to_string()))
+        .collect::<Vec<_>>();
+    RustRaftDurabilityParityReport {
+        ready: blockers.is_empty(),
+        hard_state_persisted,
+        wal_record_valid,
+        segmented_wal_recovered,
+        corrupt_tail_truncated,
+        snapshot_install_valid,
+        snapshot_floor_preserved,
+        snapshot_tail_catchup_valid,
+        apply_snapshot_fence_valid,
+        storage_apply_fence_valid,
+        blockers,
+    }
 }
 
 pub fn rustraft_parity_contract() -> RustRaftParityContract {

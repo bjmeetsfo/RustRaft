@@ -1,6 +1,7 @@
 use rustraft::{
     rustraft_wal_lifecycle_evidence, PersistentRaftWal, PersistentRaftWalOptions, RaftWalRecord,
-    RustRaftApplySnapshotFence, RustRaftHardState, RustRaftLogId, RustRaftMembership,
+    RustRaftApplySnapshotFence, RustRaftHardState, RustRaftLogEntry, RustRaftLogId,
+    RustRaftMembership,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -40,7 +41,10 @@ fn wal_record(index: u64) -> RaftWalRecord {
             witnesses: Vec::new(),
             epoch: 3,
         },
-        entries: Vec::new(),
+        entries: vec![RustRaftLogEntry {
+            log_id: RustRaftLogId { term: 3, index },
+            payload: format!("entry-{index}").into_bytes(),
+        }],
         installed_snapshot: None,
         apply_snapshot_fence: RustRaftApplySnapshotFence {
             applied_index: index,
