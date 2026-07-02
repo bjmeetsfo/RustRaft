@@ -111,6 +111,12 @@ fn observability_contract_exports_metrics_parity_readiness_and_blocker_reports()
         .rpc_messages
         .contains(&"RustRaftSnapshotChunk".to_string()));
     assert!(api
+        .rpc_messages
+        .contains(&"RustRaftTransportValidationReport".to_string()));
+    assert!(api
+        .rpc_messages
+        .contains(&"InMemoryRaftTransport".to_string()));
+    assert!(api
         .safety_helpers
         .contains(&"rustraft_fatal_blocker_report".to_string()));
 
@@ -119,6 +125,15 @@ fn observability_contract_exports_metrics_parity_readiness_and_blocker_reports()
     assert!(surface
         .transport_api
         .contains(&"install_snapshot_chunk_rpc".to_string()));
+    assert!(surface
+        .transport_api
+        .contains(&"request_response_validation".to_string()));
+    assert!(surface
+        .transport_api
+        .contains(&"in_memory_transport".to_string()));
+    assert!(surface
+        .transport_api
+        .contains(&"tcp_reference_transport".to_string()));
     assert!(surface
         .observability_api
         .contains(&"blocker_report".to_string()));

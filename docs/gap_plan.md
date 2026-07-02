@@ -38,6 +38,8 @@ startup, object/page storage, and admin endpoints.
   - generic membership, joint membership, WAL record, and snapshot fence types
   - `RustRaftStorage`
   - `RustRaftTransport`
+  - transport request/response validation reports
+  - generic in-memory transport routing for library tests and harness adapters
   - AppendEntries, Vote, InstallSnapshot, and ReadIndex request/response messages
   - `RustRaftStatusSnapshot`
   - `RustRaftMetricNames`
@@ -78,7 +80,7 @@ if production_status != production_ready:
 | Gap | Why It Matters | Target Implementation | Shared Gate |
 |---|---|---|---|
 | Native log runtime | The contract is now separate, but most live runtime code still lives inside `temporalstore-rust`. | Move reusable log entry, hard-state, membership, snapshot-floor, and process-observed read-path primitives into this repo; keep only FSM adapters in TemporalStore. | RustRaft unit tests plus TemporalStore integration tests. |
-| Transport abstraction | Stable RustRaft transport API exists; production data-node and metaserver paths still need to implement it directly. | Wire `RustRaftTransport` into TemporalStore data-node and metaserver RPC paths. | Shared Raft transport contract cases. |
+| Transport abstraction | Stable RustRaft transport API, validators, and in-memory routing exist; production data-node and metaserver paths still need to implement the same contracts directly. | Wire `RustRaftTransport` into TemporalStore data-node and metaserver RPC paths. | Shared Raft transport contract cases. |
 | Snapshot lifecycle | Snapshot floor, chunk retry, stale chunk rejection, and tail catch-up are still tested mostly through TemporalStore. | Add library-level snapshot state machine and fault tests. | `raft_rustraft_snapshot_lifecycle_depth`. |
 | Membership workflow | Learner catch-up, promote, remove, transfer leader, and joint membership need a reusable library state model. | Add membership planner/state transitions to this repo; TemporalStore metaserver consumes it. | `raft_rustraft_leader_transfer_high_write_fault_harness` and membership cases. |
 | Metrics model | RustRaft metric names and status snapshots exist; runtime exporters still need to emit them everywhere. | Wire `RustRaftMetricNames` and `RustRaftStatusSnapshot` into TemporalStore metrics/admin endpoints. | Grafana/Prometheus parity checks. |

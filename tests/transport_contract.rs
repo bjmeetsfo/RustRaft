@@ -1,10 +1,13 @@
 use rustraft::{
-    AppendEntriesRequest, AppendEntriesResponse, AuthenticatedRaftTransport, ClusterRaftTransport,
+    rustraft_validate_read_index_response, rustraft_validate_tcp_transport_request,
+    rustraft_validate_vote_request, AppendEntriesRequest, AppendEntriesResponse,
+    AuthenticatedRaftTransport, ClusterRaftTransport, InMemoryRaftTransport,
     InstallSnapshotRequest, InstallSnapshotResponse, RaftCluster, RaftError, RaftTransport,
     ReadIndexRequest, ReadIndexResponse, RustRaftAppendEntriesRequest,
     RustRaftInstallSnapshotRequest, RustRaftLogEntry, RustRaftLogId, RustRaftPeer,
     RustRaftReplicaRole, RustRaftSnapshotChunk, RustRaftSnapshotMeta, RustRaftTransport,
-    StaticRaftAuthToken, TcpRaftTransport, TcpRaftTransportServer, VoteRequest, VoteResponse,
+    StaticRaftAuthToken, TcpRaftTransport, TcpRaftTransportRequest, TcpRaftTransportServer,
+    VoteRequest, VoteResponse,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -151,6 +154,137 @@ fn authenticated_transport_wrapper_accepts_and_rejects_tokens() {
         },
     );
     assert!(matches!(rejected, Err(RaftError::Transport(_))));
+}
+
+#[test]
+fn transport_validation_reports_bad_requests_and_responses() {
+    let bad_vote = VoteRequest {
+        group_id: 0,
+        term: 1,
+        candidate_id: 0,
+        last_log_id: Some(RustRaftLogId { term: 1, index: 0 }),
+        pre_vote: true,
+    };
+    let vote_report = rustraft_validate_vote_request(&bad_vote);
+    assert!(!vote_report.valid);
+    assert!(vote_report
+        .blockers
+        .iter()
+        .any(|blocker| blocker.contains("group_id")));
+    assert!(vote_report
+        .blockers
+        .iter()
+        .any(|blocker| blocker.contains("candidate_id")));
+
+    let bad_read_response = ReadIndexResponse {
+        safe: false,
+        read_index: 5,
+        lease_read: true,
+        reason: "".to_string(),
+    };
+    let read_report = rustraft_validate_read_index_response(&bad_read_response);
+    assert!(!read_report.valid);
+    assert!(read_report
+        .blockers
+        .iter()
+        .any(|blocker| blocker.contains("lease_read")));
+
+    let bad_tcp = TcpRaftTransportRequest::Vote {
+        target: 0,
+        request: bad_vote,
+    };
+    let tcp_report = rustraft_validate_tcp_transport_request(&bad_tcp);
+    assert!(!tcp_report.valid);
+    assert!(tcp_report
+        .blockers
+        .iter()
+        .any(|blocker| blocker.contains("target")));
+}
+
+#[test]
+fn in_memory_transport_forwards_and_validates_all_rpc_messages() {
+    let transport = InMemoryRaftTransport::new();
+    transport.register(2, EchoTransport).expect("register peer");
+    assert_raft_transport(&transport);
+
+    let append = transport
+        .append_entries(
+            2,
+            AppendEntriesRequest {
+                group_id: 3,
+                term: 1,
+                leader_id: 1,
+                prev_log_id: None,
+                entries: vec![RustRaftLogEntry {
+                    log_id: RustRaftLogId { term: 1, index: 1 },
+                    payload: b"x".to_vec(),
+                }],
+                leader_commit: 1,
+            },
+        )
+        .expect("append through memory transport");
+    assert!(append.success);
+
+    let vote = transport
+        .vote(
+            2,
+            VoteRequest {
+                group_id: 3,
+                term: 2,
+                candidate_id: 2,
+                last_log_id: Some(RustRaftLogId { term: 1, index: 1 }),
+                pre_vote: true,
+            },
+        )
+        .expect("vote through memory transport");
+    assert!(vote.vote_granted);
+
+    let snapshot = transport
+        .install_snapshot(
+            2,
+            InstallSnapshotRequest {
+                group_id: 3,
+                term: 2,
+                leader_id: 1,
+                chunk: RustRaftSnapshotChunk {
+                    meta: RustRaftSnapshotMeta {
+                        snapshot_id: "memory-snap".to_string(),
+                        last_log_id: RustRaftLogId { term: 2, index: 4 },
+                        membership: vec![1, 2, 3],
+                    },
+                    offset: 0,
+                    data: b"snapshot".to_vec(),
+                    done: true,
+                },
+            },
+        )
+        .expect("snapshot through memory transport");
+    assert!(snapshot.accepted);
+
+    let read = transport
+        .read_index(
+            2,
+            ReadIndexRequest {
+                group_id: 3,
+                requester_id: 1,
+                min_commit_index: 4,
+                allow_lease_read: true,
+            },
+        )
+        .expect("read-index through memory transport");
+    assert!(read.safe);
+    assert!(read.lease_read);
+
+    let rejected = transport.read_index(
+        2,
+        ReadIndexRequest {
+            group_id: 0,
+            requester_id: 1,
+            min_commit_index: 4,
+            allow_lease_read: false,
+        },
+    );
+    assert!(matches!(rejected, Err(RaftError::InvalidRequest(_))));
 }
 
 #[test]

@@ -2928,6 +2928,10 @@ pub fn rustraft_byteraft_parity_surface() -> RustRaftByteRaftParitySurface {
             "pre_vote_rpc".to_string(),
             "install_snapshot_chunk_rpc".to_string(),
             "read_index_rpc".to_string(),
+            "request_response_validation".to_string(),
+            "in_memory_transport".to_string(),
+            "tcp_reference_transport".to_string(),
+            "auth_wrapper".to_string(),
         ],
         write_api: vec![
             "propose".to_string(),
@@ -3523,6 +3527,183 @@ pub struct RustRaftReadIndexResponse {
 }
 
 pub type ReadIndexResponse = RustRaftReadIndexResponse;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftTransportValidationReport {
+    pub rpc: String,
+    pub valid: bool,
+    pub blockers: Vec<String>,
+}
+
+impl RustRaftTransportValidationReport {
+    fn new(rpc: impl Into<String>, blockers: Vec<String>) -> Self {
+        Self {
+            rpc: rpc.into(),
+            valid: blockers.is_empty(),
+            blockers,
+        }
+    }
+}
+
+fn validate_positive_id(blockers: &mut Vec<String>, field: &str, value: u64) {
+    if value == 0 {
+        blockers.push(format!("{field} must be greater than zero"));
+    }
+}
+
+fn validate_log_id(blockers: &mut Vec<String>, field: &str, log_id: &RustRaftLogId) {
+    if log_id.index == 0 {
+        blockers.push(format!("{field}.index must be greater than zero"));
+    }
+}
+
+fn validate_non_empty_reason(blockers: &mut Vec<String>, field: &str, reason: &str) {
+    if reason.trim().is_empty() {
+        blockers.push(format!("{field}.reason must not be empty"));
+    }
+}
+
+fn require_transport_validation(
+    report: RustRaftTransportValidationReport,
+) -> Result<(), RaftError> {
+    if report.valid {
+        Ok(())
+    } else {
+        Err(RaftError::InvalidRequest(format!(
+            "{} validation failed: {}",
+            report.rpc,
+            report.blockers.join("; ")
+        )))
+    }
+}
+
+pub fn rustraft_validate_append_entries_request(
+    request: &AppendEntriesRequest,
+) -> RustRaftTransportValidationReport {
+    let mut blockers = Vec::new();
+    validate_positive_id(&mut blockers, "group_id", request.group_id);
+    validate_positive_id(&mut blockers, "leader_id", request.leader_id);
+    if let Some(prev_log_id) = &request.prev_log_id {
+        validate_log_id(&mut blockers, "prev_log_id", prev_log_id);
+    }
+    let mut expected_index = request
+        .prev_log_id
+        .as_ref()
+        .map_or(1, |log_id| log_id.index + 1);
+    for entry in &request.entries {
+        validate_log_id(&mut blockers, "entries[].log_id", &entry.log_id);
+        if entry.log_id.index != expected_index {
+            blockers.push(format!(
+                "entries must be contiguous: expected index {expected_index}, got {}",
+                entry.log_id.index
+            ));
+        }
+        expected_index = entry.log_id.index + 1;
+    }
+    RustRaftTransportValidationReport::new("append_entries_request", blockers)
+}
+
+pub fn rustraft_validate_append_entries_response(
+    response: &AppendEntriesResponse,
+) -> RustRaftTransportValidationReport {
+    let mut blockers = Vec::new();
+    if response.success && response.rejection_hint.is_some() {
+        blockers.push("successful append response must not include rejection_hint".to_string());
+    }
+    RustRaftTransportValidationReport::new("append_entries_response", blockers)
+}
+
+pub fn rustraft_validate_vote_request(request: &VoteRequest) -> RustRaftTransportValidationReport {
+    let mut blockers = Vec::new();
+    validate_positive_id(&mut blockers, "group_id", request.group_id);
+    validate_positive_id(&mut blockers, "candidate_id", request.candidate_id);
+    if let Some(last_log_id) = &request.last_log_id {
+        validate_log_id(&mut blockers, "last_log_id", last_log_id);
+    }
+    RustRaftTransportValidationReport::new("vote_request", blockers)
+}
+
+pub fn rustraft_validate_vote_response(
+    response: &VoteResponse,
+) -> RustRaftTransportValidationReport {
+    let mut blockers = Vec::new();
+    validate_non_empty_reason(&mut blockers, "vote_response", &response.reason);
+    RustRaftTransportValidationReport::new("vote_response", blockers)
+}
+
+pub fn rustraft_validate_install_snapshot_request(
+    request: &InstallSnapshotRequest,
+) -> RustRaftTransportValidationReport {
+    let mut blockers = Vec::new();
+    validate_positive_id(&mut blockers, "group_id", request.group_id);
+    validate_positive_id(&mut blockers, "leader_id", request.leader_id);
+    validate_log_id(
+        &mut blockers,
+        "chunk.meta.last_log_id",
+        &request.chunk.meta.last_log_id,
+    );
+    if request.chunk.meta.snapshot_id.trim().is_empty() {
+        blockers.push("chunk.meta.snapshot_id must not be empty".to_string());
+    }
+    if request.chunk.meta.membership.is_empty() {
+        blockers.push("chunk.meta.membership must not be empty".to_string());
+    }
+    RustRaftTransportValidationReport::new("install_snapshot_request", blockers)
+}
+
+pub fn rustraft_validate_install_snapshot_response(
+    response: &InstallSnapshotResponse,
+) -> RustRaftTransportValidationReport {
+    let mut blockers = Vec::new();
+    validate_non_empty_reason(&mut blockers, "install_snapshot_response", &response.reason);
+    RustRaftTransportValidationReport::new("install_snapshot_response", blockers)
+}
+
+pub fn rustraft_validate_read_index_request(
+    request: &ReadIndexRequest,
+) -> RustRaftTransportValidationReport {
+    let mut blockers = Vec::new();
+    validate_positive_id(&mut blockers, "group_id", request.group_id);
+    validate_positive_id(&mut blockers, "requester_id", request.requester_id);
+    RustRaftTransportValidationReport::new("read_index_request", blockers)
+}
+
+pub fn rustraft_validate_read_index_response(
+    response: &ReadIndexResponse,
+) -> RustRaftTransportValidationReport {
+    let mut blockers = Vec::new();
+    validate_non_empty_reason(&mut blockers, "read_index_response", &response.reason);
+    if !response.safe && response.lease_read {
+        blockers.push("unsafe read-index response must not grant lease_read".to_string());
+    }
+    RustRaftTransportValidationReport::new("read_index_response", blockers)
+}
+
+pub fn rustraft_validate_tcp_transport_request(
+    request: &TcpRaftTransportRequest,
+) -> RustRaftTransportValidationReport {
+    let mut report = match request {
+        TcpRaftTransportRequest::AppendEntries { request, .. } => {
+            rustraft_validate_append_entries_request(request)
+        }
+        TcpRaftTransportRequest::Vote { request, .. } => rustraft_validate_vote_request(request),
+        TcpRaftTransportRequest::InstallSnapshot { request, .. } => {
+            rustraft_validate_install_snapshot_request(request)
+        }
+        TcpRaftTransportRequest::ReadIndex { request, .. } => {
+            rustraft_validate_read_index_request(request)
+        }
+    };
+    let target = match request {
+        TcpRaftTransportRequest::AppendEntries { target, .. }
+        | TcpRaftTransportRequest::Vote { target, .. }
+        | TcpRaftTransportRequest::InstallSnapshot { target, .. }
+        | TcpRaftTransportRequest::ReadIndex { target, .. } => *target,
+    };
+    validate_positive_id(&mut report.blockers, "target", target);
+    report.valid = report.blockers.is_empty();
+    report
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftReadSafetyDecision {
@@ -6107,6 +6288,155 @@ where
     }
 }
 
+#[derive(Clone, Default)]
+pub struct InMemoryRaftTransport {
+    peers: Arc<Mutex<BTreeMap<RustRaftNodeId, Arc<dyn RustRaftTransport + Send + Sync>>>>,
+    validate_messages: bool,
+}
+
+impl std::fmt::Debug for InMemoryRaftTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InMemoryRaftTransport")
+            .field("validate_messages", &self.validate_messages)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InMemoryRaftTransport {
+    pub fn new() -> Self {
+        Self::with_validation(true)
+    }
+
+    pub fn with_validation(validate_messages: bool) -> Self {
+        Self {
+            peers: Arc::new(Mutex::new(BTreeMap::new())),
+            validate_messages,
+        }
+    }
+
+    pub fn register<T>(&self, node_id: RustRaftNodeId, handler: T) -> Result<(), RaftError>
+    where
+        T: RustRaftTransport + Send + Sync + 'static,
+    {
+        self.register_handler(node_id, Arc::new(handler))
+    }
+
+    pub fn register_handler(
+        &self,
+        node_id: RustRaftNodeId,
+        handler: Arc<dyn RustRaftTransport + Send + Sync>,
+    ) -> Result<(), RaftError> {
+        if node_id == 0 {
+            return Err(RaftError::InvalidRequest(
+                "in-memory raft transport node_id must be greater than zero".to_string(),
+            ));
+        }
+        self.peers
+            .lock()
+            .map_err(|_| {
+                RaftError::Transport("in-memory raft transport lock poisoned".to_string())
+            })?
+            .insert(node_id, handler);
+        Ok(())
+    }
+
+    pub fn unregister(&self, node_id: RustRaftNodeId) -> Result<(), RaftError> {
+        self.peers
+            .lock()
+            .map_err(|_| {
+                RaftError::Transport("in-memory raft transport lock poisoned".to_string())
+            })?
+            .remove(&node_id);
+        Ok(())
+    }
+
+    fn handler(
+        &self,
+        target: RustRaftNodeId,
+    ) -> Result<Arc<dyn RustRaftTransport + Send + Sync>, RaftError> {
+        if target == 0 {
+            return Err(RaftError::InvalidRequest(
+                "in-memory raft transport target must be greater than zero".to_string(),
+            ));
+        }
+        self.peers
+            .lock()
+            .map_err(|_| {
+                RaftError::Transport("in-memory raft transport lock poisoned".to_string())
+            })?
+            .get(&target)
+            .cloned()
+            .ok_or_else(|| {
+                RaftError::Transport(format!(
+                    "in-memory raft transport target {target} is not registered"
+                ))
+            })
+    }
+}
+
+impl RustRaftTransport for InMemoryRaftTransport {
+    fn append_entries(
+        &self,
+        target: u64,
+        request: RustRaftAppendEntriesRequest,
+    ) -> Result<RustRaftAppendEntriesResponse, RustRaftError> {
+        if self.validate_messages {
+            require_transport_validation(rustraft_validate_append_entries_request(&request))?;
+        }
+        let response = self.handler(target)?.append_entries(target, request)?;
+        if self.validate_messages {
+            require_transport_validation(rustraft_validate_append_entries_response(&response))?;
+        }
+        Ok(response)
+    }
+
+    fn vote(
+        &self,
+        target: u64,
+        request: RustRaftVoteRequest,
+    ) -> Result<RustRaftVoteResponse, RustRaftError> {
+        if self.validate_messages {
+            require_transport_validation(rustraft_validate_vote_request(&request))?;
+        }
+        let response = self.handler(target)?.vote(target, request)?;
+        if self.validate_messages {
+            require_transport_validation(rustraft_validate_vote_response(&response))?;
+        }
+        Ok(response)
+    }
+
+    fn install_snapshot(
+        &self,
+        target: u64,
+        request: RustRaftInstallSnapshotRequest,
+    ) -> Result<RustRaftInstallSnapshotResponse, RustRaftError> {
+        if self.validate_messages {
+            require_transport_validation(rustraft_validate_install_snapshot_request(&request))?;
+        }
+        let response = self.handler(target)?.install_snapshot(target, request)?;
+        if self.validate_messages {
+            require_transport_validation(rustraft_validate_install_snapshot_response(&response))?;
+        }
+        Ok(response)
+    }
+
+    fn read_index(
+        &self,
+        target: u64,
+        request: RustRaftReadIndexRequest,
+    ) -> Result<RustRaftReadIndexResponse, RustRaftError> {
+        if self.validate_messages {
+            require_transport_validation(rustraft_validate_read_index_request(&request))?;
+        }
+        let response = self.handler(target)?.read_index(target, request)?;
+        if self.validate_messages {
+            require_transport_validation(rustraft_validate_read_index_response(&response))?;
+        }
+        Ok(response)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "rpc", content = "payload", rename_all = "snake_case")]
 pub enum TcpRaftTransportRequest {
@@ -6209,11 +6539,16 @@ impl RustRaftTransport for TcpRaftTransport {
         target: u64,
         request: RustRaftAppendEntriesRequest,
     ) -> Result<RustRaftAppendEntriesResponse, RustRaftError> {
+        require_transport_validation(rustraft_validate_append_entries_request(&request))?;
         match self.send_rpc(
             target,
             TcpRaftTransportRequest::AppendEntries { target, request },
         )? {
-            TcpRaftTransportResponse::AppendEntries(response) => response.into_result(),
+            TcpRaftTransportResponse::AppendEntries(response) => {
+                let response = response.into_result()?;
+                require_transport_validation(rustraft_validate_append_entries_response(&response))?;
+                Ok(response)
+            }
             _ => Err(RaftError::Transport(
                 "unexpected append-entries RPC response".to_string(),
             )),
@@ -6225,8 +6560,13 @@ impl RustRaftTransport for TcpRaftTransport {
         target: u64,
         request: RustRaftVoteRequest,
     ) -> Result<RustRaftVoteResponse, RustRaftError> {
+        require_transport_validation(rustraft_validate_vote_request(&request))?;
         match self.send_rpc(target, TcpRaftTransportRequest::Vote { target, request })? {
-            TcpRaftTransportResponse::Vote(response) => response.into_result(),
+            TcpRaftTransportResponse::Vote(response) => {
+                let response = response.into_result()?;
+                require_transport_validation(rustraft_validate_vote_response(&response))?;
+                Ok(response)
+            }
             _ => Err(RaftError::Transport(
                 "unexpected vote RPC response".to_string(),
             )),
@@ -6238,11 +6578,18 @@ impl RustRaftTransport for TcpRaftTransport {
         target: u64,
         request: RustRaftInstallSnapshotRequest,
     ) -> Result<RustRaftInstallSnapshotResponse, RustRaftError> {
+        require_transport_validation(rustraft_validate_install_snapshot_request(&request))?;
         match self.send_rpc(
             target,
             TcpRaftTransportRequest::InstallSnapshot { target, request },
         )? {
-            TcpRaftTransportResponse::InstallSnapshot(response) => response.into_result(),
+            TcpRaftTransportResponse::InstallSnapshot(response) => {
+                let response = response.into_result()?;
+                require_transport_validation(rustraft_validate_install_snapshot_response(
+                    &response,
+                ))?;
+                Ok(response)
+            }
             _ => Err(RaftError::Transport(
                 "unexpected install-snapshot RPC response".to_string(),
             )),
@@ -6254,11 +6601,16 @@ impl RustRaftTransport for TcpRaftTransport {
         target: u64,
         request: RustRaftReadIndexRequest,
     ) -> Result<RustRaftReadIndexResponse, RustRaftError> {
+        require_transport_validation(rustraft_validate_read_index_request(&request))?;
         match self.send_rpc(
             target,
             TcpRaftTransportRequest::ReadIndex { target, request },
         )? {
-            TcpRaftTransportResponse::ReadIndex(response) => response.into_result(),
+            TcpRaftTransportResponse::ReadIndex(response) => {
+                let response = response.into_result()?;
+                require_transport_validation(rustraft_validate_read_index_response(&response))?;
+                Ok(response)
+            }
             _ => Err(RaftError::Transport(
                 "unexpected read-index RPC response".to_string(),
             )),
@@ -6350,6 +6702,7 @@ where
     }
     let request: TcpRaftTransportRequest = serde_json::from_str(&line)
         .map_err(|err| RaftError::Transport(format!("failed to decode raft TCP request: {err}")))?;
+    require_transport_validation(rustraft_validate_tcp_transport_request(&request))?;
     let response = match request {
         TcpRaftTransportRequest::AppendEntries { target, request } => {
             TcpRaftTransportResponse::AppendEntries(TcpRaftRpcResult::from_result(
@@ -6779,6 +7132,9 @@ pub fn rustraft_public_api_contract() -> RustRaftPublicApiContract {
             "ReadIndexRequest".to_string(),
             "ReadIndexResponse".to_string(),
             "AuthenticatedRaftRpc".to_string(),
+            "RustRaftTransportValidationReport".to_string(),
+            "InMemoryRaftTransport".to_string(),
+            "TcpRaftTransport".to_string(),
         ],
         safety_helpers: vec![
             "rustraft_read_safety_decision".to_string(),

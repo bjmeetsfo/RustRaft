@@ -18,6 +18,8 @@ License: Apache-2.0.
 - `RustRaftProductionStatus`
 - `RustRaftStorage`
 - `RustRaftTransport`
+- `InMemoryRaftTransport`
+- `RustRaftTransportValidationReport`
 - `RustRaftStatusSnapshot`
 - `RustRaftMetricNames`
 - `RustRaftFaultScenario`
@@ -88,6 +90,11 @@ Read safety now includes structured report types for quorum, applied-index
 fences, leader lease-read eligibility, and bounded-stale follower reads. These
 reports are intended to be filled with observed process-path evidence before a
 TemporalStore deployment claims ByteRaft-style read-index or lease-read parity.
+
+Transport contracts include fail-fast request/response validators and a generic
+in-memory transport router. The router is meant for library tests and harness
+adapters; production TemporalStore still owns real process transports and
+durable FSM adapters.
 
 The `rustraft_temporalstore_extraction_plan()` API is the typed migration
 ledger. It records which Raft responsibilities are already owned by this
