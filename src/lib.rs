@@ -19,6 +19,9 @@
 //! The public API is OpenRaft-free by design. Compatibility with existing
 //! TemporalStore deployment semantics is expressed through RustRaft-owned types
 //! and tests instead of upstream-specific type aliases.
+//! ByteRaft remains the feature and performance reference; RustRaft may expose
+//! more idiomatic Rust traits and error types as long as TemporalStore consumes
+//! it through a stable adapter boundary.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -61,6 +64,7 @@ pub enum RustRaftProductionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftParityReport {
     pub contract: RustRaftParityContract,
+    pub byteraft_reference_policy: RustRaftByteRaftReferencePolicy,
     pub ready: bool,
     pub production_status: RustRaftProductionStatus,
     pub satisfied: Vec<String>,
@@ -69,6 +73,14 @@ pub struct RustRaftParityReport {
     pub byteraft_parity_matrix: Vec<RustRaftByteRaftParityItem>,
     pub byteraft_gaps: Vec<String>,
     pub byteraft_intentional_differences: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftByteRaftReferencePolicy {
+    pub feature_reference: String,
+    pub performance_reference: String,
+    pub rust_api_policy: String,
+    pub temporalstore_consumption_boundary: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1296,6 +1308,7 @@ pub fn rustraft_parity_report(snapshot: &RustRaftReadinessSnapshot) -> RustRaftP
     let ready = missing.is_empty() && production_blockers.is_empty();
     RustRaftParityReport {
         contract,
+        byteraft_reference_policy: rustraft_byteraft_reference_policy(),
         ready,
         production_status: if ready {
             RustRaftProductionStatus::ProductionReady
@@ -1308,6 +1321,21 @@ pub fn rustraft_parity_report(snapshot: &RustRaftReadinessSnapshot) -> RustRaftP
         byteraft_parity_matrix,
         byteraft_gaps,
         byteraft_intentional_differences,
+    }
+}
+
+pub fn rustraft_byteraft_reference_policy() -> RustRaftByteRaftReferencePolicy {
+    RustRaftByteRaftReferencePolicy {
+        feature_reference: "ByteRaft is the feature reference for Raft behavior parity.".to_string(),
+        performance_reference:
+            "ByteRaft is the performance reference; RustRaft parity requires p50/p99 latency and throughput within the configured threshold."
+                .to_string(),
+        rust_api_policy:
+            "RustRaft may expose idiomatic Rust traits, request/response types, and error types instead of ByteRaft-shaped APIs."
+                .to_string(),
+        temporalstore_consumption_boundary:
+            "TemporalStore consumption must remain stable through temporalstore_rust::raft::DataRaftConsensusBackend and adapter-owned codecs/apply/storage wiring."
+                .to_string(),
     }
 }
 

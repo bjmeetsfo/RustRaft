@@ -1,6 +1,6 @@
 use rustraft::{
-    rustraft_byteraft_parity_matrix, rustraft_parity_report, RustRaftByteRaftParityStatus,
-    RustRaftReadinessSnapshot,
+    rustraft_byteraft_parity_matrix, rustraft_byteraft_reference_policy, rustraft_parity_report,
+    RustRaftByteRaftParityStatus, RustRaftReadinessSnapshot,
 };
 
 fn ready_snapshot() -> RustRaftReadinessSnapshot {
@@ -100,4 +100,19 @@ fn ready_byteraft_matrix_has_only_declared_runtime_split_difference() {
             .count()
             >= 12
     );
+}
+
+#[test]
+fn byteraft_is_feature_and_performance_reference_but_rust_api_can_be_idiomatic() {
+    let policy = rustraft_byteraft_reference_policy();
+    assert!(policy.feature_reference.contains("ByteRaft"));
+    assert!(policy.performance_reference.contains("ByteRaft"));
+    assert!(policy.performance_reference.contains("p50/p99"));
+    assert!(policy.rust_api_policy.contains("idiomatic Rust"));
+    assert!(policy
+        .temporalstore_consumption_boundary
+        .contains("DataRaftConsensusBackend"));
+
+    let report = rustraft_parity_report(&ready_snapshot());
+    assert_eq!(report.byteraft_reference_policy, policy);
 }
