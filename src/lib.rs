@@ -24,7 +24,7 @@
 //! it through a stable adapter boundary.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -133,6 +133,8 @@ pub struct RustRaftProductionReadinessInput {
     pub snapshot_lifecycle: Option<RustRaftSnapshotLifecycleEvidence>,
     #[serde(default)]
     pub wal_lifecycle: Option<RustRaftWalLifecycleEvidence>,
+    #[serde(default)]
+    pub admin_status_surface: Option<RustRaftAdminStatusSurfaceEvidence>,
     #[serde(default)]
     pub data_node_rollout: Option<RustRaftDataNodeProcessRolloutReport>,
     #[serde(default)]
@@ -370,6 +372,33 @@ pub struct RustRaftPeerPipelineStatus {
     pub witness_quorum_acked: u64,
     #[serde(default)]
     pub witness_quorum_reached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftAdminStatusSurfaceInput {
+    pub commit_index: RustRaftLogIndex,
+    pub max_observed_node_commit_index: RustRaftLogIndex,
+    pub quorum_size: u64,
+    pub quorum_peer_ids: Vec<RustRaftNodeId>,
+    pub peer_pipeline: Vec<RustRaftPeerPipelineStatus>,
+    pub wal_last_log_index: RustRaftLogIndex,
+    pub wal_segment_lifecycle_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftAdminStatusSurfaceEvidence {
+    pub complete: bool,
+    pub peer_rows: u64,
+    pub quorum_size: u64,
+    pub quorum_peer_progress_observed: bool,
+    pub peer_pipeline_runtime_activity_observed: bool,
+    pub peer_pipeline_limits_observed: bool,
+    pub wal_segment_lifecycle_present: bool,
+    pub wal_log_range_covers_commit: bool,
+    pub peer_next_index_present: bool,
+    pub majority_configured: bool,
+    pub cluster_commit_index_consistent: bool,
+    pub blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -7726,6 +7755,104 @@ pub fn rustraft_runtime_local_status_report(
     }
 }
 
+pub fn rustraft_admin_status_surface_evidence(
+    input: &RustRaftAdminStatusSurfaceInput,
+) -> RustRaftAdminStatusSurfaceEvidence {
+    let quorum_peer_ids = input
+        .quorum_peer_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let peer_pipeline_runtime_activity_observed = input.peer_pipeline.iter().any(|peer| {
+        peer.append_requests > 0
+            || peer.append_accepted > 0
+            || peer.append_rejected > 0
+            || peer.match_index > 0
+            || peer.next_index > 1
+            || peer.append_queue_max_depth > 0
+            || peer.apply_queue_max_depth > 0
+            || peer.inflight_entries > 0
+            || peer.inflight_bytes > 0
+            || peer.snapshot_installed_index > 0
+            || peer.snapshot_send_attempts > 0
+            || peer.snapshot_install_progress_per_mille > 0
+            || peer.transfer_leader_target
+            || peer.transfer_leader_timeouts > 0
+            || peer.pre_vote_rejections > 0
+            || peer.election_rejections > 0
+    });
+    let peer_pipeline_limits_observed = !input.peer_pipeline.is_empty()
+        && input.peer_pipeline.iter().all(|peer| {
+            peer.next_index > 0
+                && peer.append_queue_limit > 0
+                && peer.inflight_bytes_limit > 0
+                && peer.apply_inflight_limit > 0
+                && peer.apply_batch_bytes_limit > 0
+                && peer.snapshot_install_progress_per_mille <= 1_000
+        });
+    let quorum_peer_progress_observed = input.commit_index > 0
+        && input
+            .peer_pipeline
+            .iter()
+            .filter(|peer| {
+                quorum_peer_ids.contains(&peer.peer_id)
+                    && peer.match_index >= input.commit_index
+                    && peer.next_index >= peer.match_index.saturating_add(1)
+            })
+            .count() as u64
+            >= input.quorum_size;
+    let wal_log_range_covers_commit = input.wal_last_log_index >= input.commit_index;
+    let peer_next_index_present = input.peer_pipeline.iter().all(|peer| peer.next_index > 0);
+    let majority_configured = input.quorum_size > 0;
+    let cluster_commit_index_consistent =
+        input.commit_index >= input.max_observed_node_commit_index;
+    let mut blockers = Vec::new();
+    for (present, blocker) in [
+        (!input.peer_pipeline.is_empty(), "peer_pipeline_missing"),
+        (
+            peer_pipeline_limits_observed,
+            "peer_pipeline_limits_missing",
+        ),
+        (
+            quorum_peer_progress_observed,
+            "quorum_peer_progress_missing",
+        ),
+        (
+            peer_pipeline_runtime_activity_observed,
+            "peer_pipeline_runtime_activity_missing",
+        ),
+        (
+            input.wal_segment_lifecycle_present,
+            "wal_segment_lifecycle_missing",
+        ),
+        (wal_log_range_covers_commit, "wal_commit_range_missing"),
+        (peer_next_index_present, "peer_next_index_missing"),
+        (majority_configured, "quorum_size_missing"),
+        (
+            cluster_commit_index_consistent,
+            "cluster_commit_index_inconsistent",
+        ),
+    ] {
+        if !present {
+            blockers.push(blocker.to_string());
+        }
+    }
+    RustRaftAdminStatusSurfaceEvidence {
+        complete: blockers.is_empty(),
+        peer_rows: input.peer_pipeline.len() as u64,
+        quorum_size: input.quorum_size,
+        quorum_peer_progress_observed,
+        peer_pipeline_runtime_activity_observed,
+        peer_pipeline_limits_observed,
+        wal_segment_lifecycle_present: input.wal_segment_lifecycle_present,
+        wal_log_range_covers_commit,
+        peer_next_index_present,
+        majority_configured,
+        cluster_commit_index_consistent,
+        blockers,
+    }
+}
+
 pub fn rustraft_cluster_status_report(
     group_id: RustRaftGroupId,
     leader_id: Option<RustRaftNodeId>,
@@ -8291,6 +8418,13 @@ pub fn rustraft_production_readiness_report(
         &mut production_blockers,
         &mut recommended_next_actions,
     );
+    require_admin_status_surface(
+        input.admin_status_surface.as_ref(),
+        &mut satisfied,
+        &mut missing,
+        &mut production_blockers,
+        &mut recommended_next_actions,
+    );
     require_byteraft_benchmark(
         input.byteraft_benchmark.as_ref(),
         &mut satisfied,
@@ -8372,6 +8506,100 @@ fn require_byteraft_benchmark(
             blockers,
             actions,
             "clear ByteRaft benchmark blocker",
+        );
+    }
+}
+
+fn require_admin_status_surface(
+    status: Option<&RustRaftAdminStatusSurfaceEvidence>,
+    satisfied: &mut Vec<String>,
+    missing: &mut Vec<String>,
+    blockers: &mut Vec<String>,
+    actions: &mut Vec<String>,
+) {
+    require_option(
+        "status:admin_surface_present",
+        status,
+        satisfied,
+        missing,
+        blockers,
+        actions,
+        "attach RustRaft admin/status surface evidence from the serving runtime",
+    );
+    let Some(status) = status else {
+        blockers.push("status:admin_surface_missing".to_string());
+        return;
+    };
+
+    for (present, id, action) in [
+        (
+            status.complete,
+            "status:admin_surface_complete",
+            "fix incomplete RustRaft admin/status surface evidence",
+        ),
+        (
+            status.peer_rows > 0,
+            "status:peer_rows",
+            "export per-peer pipeline rows",
+        ),
+        (
+            status.quorum_size > 0,
+            "status:quorum_size",
+            "export configured quorum size",
+        ),
+        (
+            status.quorum_peer_progress_observed,
+            "status:quorum_peer_progress",
+            "prove quorum peer progress reaches the commit index",
+        ),
+        (
+            status.peer_pipeline_runtime_activity_observed,
+            "status:peer_pipeline_runtime_activity",
+            "prove peer pipeline counters are populated by runtime activity",
+        ),
+        (
+            status.peer_pipeline_limits_observed,
+            "status:peer_pipeline_limits",
+            "export per-peer replication/apply limits",
+        ),
+        (
+            status.wal_segment_lifecycle_present,
+            "status:wal_segment_lifecycle",
+            "export WAL segment lifecycle in admin status",
+        ),
+        (
+            status.wal_log_range_covers_commit,
+            "status:wal_log_range_covers_commit",
+            "prove WAL retained log range covers the committed index",
+        ),
+        (
+            status.peer_next_index_present,
+            "status:peer_next_index",
+            "export next-index per peer",
+        ),
+        (
+            status.majority_configured,
+            "status:majority_configured",
+            "export nonzero majority/quorum configuration",
+        ),
+        (
+            status.cluster_commit_index_consistent,
+            "status:cluster_commit_index_consistent",
+            "prove cluster/admin commit index is consistent with node reports",
+        ),
+    ] {
+        require_bool(present, id, satisfied, missing, blockers, actions, action);
+    }
+
+    for blocker in &status.blockers {
+        require_bool(
+            false,
+            blocker,
+            satisfied,
+            missing,
+            blockers,
+            actions,
+            "clear RustRaft admin/status blocker",
         );
     }
 }
@@ -10281,6 +10509,33 @@ mod tests {
         .collect()
     }
 
+    fn ready_admin_status_surface() -> RustRaftAdminStatusSurfaceEvidence {
+        let limits = RustRaftPipelineLimits::production_default();
+        let mut peer_2 = RustRaftPeerPipelineStatus::new(2, 105, limits);
+        peer_2.match_index = 104;
+        peer_2.append_requests = 8;
+        peer_2.append_accepted = 8;
+        peer_2.append_queue_max_depth = 4;
+        peer_2.apply_queue_max_depth = 3;
+
+        let mut peer_3 = RustRaftPeerPipelineStatus::new(3, 105, limits);
+        peer_3.match_index = 104;
+        peer_3.append_requests = 7;
+        peer_3.append_accepted = 7;
+        peer_3.inflight_entries = 1;
+        peer_3.inflight_bytes = 128;
+
+        rustraft_admin_status_surface_evidence(&RustRaftAdminStatusSurfaceInput {
+            commit_index: 104,
+            max_observed_node_commit_index: 104,
+            quorum_size: 2,
+            quorum_peer_ids: vec![2, 3],
+            peer_pipeline: vec![peer_2, peer_3],
+            wal_last_log_index: 110,
+            wal_segment_lifecycle_present: true,
+        })
+    }
+
     fn ready_production_input() -> RustRaftProductionReadinessInput {
         RustRaftProductionReadinessInput {
             readiness: ready_snapshot(),
@@ -10315,6 +10570,7 @@ mod tests {
                 compaction_observed: true,
                 slow_fsync_backpressure_observed: true,
             }),
+            admin_status_surface: Some(ready_admin_status_surface()),
             data_node_rollout: Some(ready_data_node_rollout()),
             metaserver_rollout: Some(ready_meta_rollout()),
             membership_transitions: ready_membership_transitions(),
@@ -10379,6 +10635,7 @@ mod tests {
             peer_pipeline: None,
             snapshot_lifecycle: None,
             wal_lifecycle: None,
+            admin_status_surface: None,
             data_node_rollout: None,
             metaserver_rollout: None,
             membership_transitions: Vec::new(),
@@ -10409,6 +10666,9 @@ mod tests {
         assert!(report
             .production_blockers
             .contains(&"benchmark:real_byteraft_missing".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"status:admin_surface_missing".to_string()));
     }
 
     #[test]
@@ -10436,6 +10696,39 @@ mod tests {
         assert!(report
             .production_blockers
             .contains(&"benchmark:model_byteraft:single_key_writes".to_string()));
+    }
+
+    #[test]
+    fn production_readiness_gate_rejects_incomplete_admin_status_surface() {
+        let mut input = ready_production_input();
+        input.admin_status_surface = Some(rustraft_admin_status_surface_evidence(
+            &RustRaftAdminStatusSurfaceInput {
+                commit_index: 104,
+                max_observed_node_commit_index: 106,
+                quorum_size: 2,
+                quorum_peer_ids: vec![2, 3],
+                peer_pipeline: Vec::new(),
+                wal_last_log_index: 80,
+                wal_segment_lifecycle_present: false,
+            },
+        ));
+
+        let report = rustraft_production_readiness_report(&input);
+
+        assert!(!report.ready);
+        assert_eq!(report.production_status, RustRaftProductionStatus::Blocked);
+        assert!(report
+            .production_blockers
+            .contains(&"status:admin_surface_complete".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"status:quorum_peer_progress".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"wal_segment_lifecycle_missing".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"cluster_commit_index_inconsistent".to_string()));
     }
 
     #[test]

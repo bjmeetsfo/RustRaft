@@ -1,8 +1,10 @@
 use rustraft::{
-    rustraft_byteraft_runtime_capability_prometheus, rustraft_byteraft_runtime_capability_report,
-    RustRaftDataNodeProcessRolloutReport, RustRaftMembershipScope,
+    rustraft_admin_status_surface_evidence, rustraft_byteraft_runtime_capability_prometheus,
+    rustraft_byteraft_runtime_capability_report, RustRaftAdminStatusSurfaceEvidence,
+    RustRaftAdminStatusSurfaceInput, RustRaftDataNodeProcessRolloutReport, RustRaftMembershipScope,
     RustRaftMembershipTransitionEvidence, RustRaftMembershipTransitionKind,
-    RustRaftMetaProcessRolloutReport, RustRaftPipelineEvidence, RustRaftProcessNodeEvidence,
+    RustRaftMetaProcessRolloutReport, RustRaftPeerPipelineStatus, RustRaftPipelineEvidence,
+    RustRaftPipelineLimits, RustRaftProcessNodeEvidence,
     RustRaftProcessOperationalSemanticsEvidence, RustRaftProductionReadinessInput,
     RustRaftReadinessSnapshot, RustRaftSnapshotLifecycleEvidence, RustRaftWalLifecycleEvidence,
 };
@@ -245,6 +247,32 @@ fn transitions() -> Vec<RustRaftMembershipTransitionEvidence> {
     .collect()
 }
 
+fn ready_admin_status_surface() -> RustRaftAdminStatusSurfaceEvidence {
+    let limits = RustRaftPipelineLimits::production_default();
+    let mut peer_2 = RustRaftPeerPipelineStatus::new(2, 105, limits);
+    peer_2.match_index = 104;
+    peer_2.append_requests = 8;
+    peer_2.append_accepted = 8;
+    peer_2.append_queue_max_depth = 4;
+
+    let mut peer_3 = RustRaftPeerPipelineStatus::new(3, 105, limits);
+    peer_3.match_index = 104;
+    peer_3.append_requests = 7;
+    peer_3.append_accepted = 7;
+    peer_3.inflight_entries = 1;
+    peer_3.inflight_bytes = 128;
+
+    rustraft_admin_status_surface_evidence(&RustRaftAdminStatusSurfaceInput {
+        commit_index: 104,
+        max_observed_node_commit_index: 104,
+        quorum_size: 2,
+        quorum_peer_ids: vec![2, 3],
+        peer_pipeline: vec![peer_2, peer_3],
+        wal_last_log_index: 110,
+        wal_segment_lifecycle_present: true,
+    })
+}
+
 fn ready_input() -> RustRaftProductionReadinessInput {
     RustRaftProductionReadinessInput {
         readiness: ready_snapshot(),
@@ -279,6 +307,7 @@ fn ready_input() -> RustRaftProductionReadinessInput {
             compaction_observed: true,
             slow_fsync_backpressure_observed: true,
         }),
+        admin_status_surface: Some(ready_admin_status_surface()),
         data_node_rollout: Some(ready_data_rollout()),
         metaserver_rollout: Some(ready_meta_rollout()),
         membership_transitions: transitions(),
