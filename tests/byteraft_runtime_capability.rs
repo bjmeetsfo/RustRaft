@@ -1,10 +1,10 @@
 use rustraft::{
-    rustraft_byteraft_runtime_capability_report, RustRaftDataNodeProcessRolloutReport,
-    RustRaftMembershipScope, RustRaftMembershipTransitionEvidence,
-    RustRaftMembershipTransitionKind, RustRaftMetaProcessRolloutReport, RustRaftPipelineEvidence,
-    RustRaftProcessNodeEvidence, RustRaftProcessOperationalSemanticsEvidence,
-    RustRaftProductionReadinessInput, RustRaftReadinessSnapshot, RustRaftSnapshotLifecycleEvidence,
-    RustRaftWalLifecycleEvidence,
+    rustraft_byteraft_runtime_capability_prometheus, rustraft_byteraft_runtime_capability_report,
+    RustRaftDataNodeProcessRolloutReport, RustRaftMembershipScope,
+    RustRaftMembershipTransitionEvidence, RustRaftMembershipTransitionKind,
+    RustRaftMetaProcessRolloutReport, RustRaftPipelineEvidence, RustRaftProcessNodeEvidence,
+    RustRaftProcessOperationalSemanticsEvidence, RustRaftProductionReadinessInput,
+    RustRaftReadinessSnapshot, RustRaftSnapshotLifecycleEvidence, RustRaftWalLifecycleEvidence,
 };
 
 fn ready_snapshot() -> RustRaftReadinessSnapshot {
@@ -367,4 +367,35 @@ fn byteraft_runtime_capability_report_requires_read_safety_on_both_planes() {
         blocker
             == "read_index_and_lease_safety:missing:semantics.minority_partition_read_rejection_observed"
     }));
+}
+
+#[test]
+fn byteraft_runtime_capability_prometheus_exports_generic_metrics() {
+    let mut input = ready_input();
+    input.wal_lifecycle.as_mut().unwrap().compaction_observed = false;
+
+    let report = rustraft_byteraft_runtime_capability_report(&input);
+    let metrics = rustraft_byteraft_runtime_capability_prometheus(
+        &report,
+        &[("plane", "data_node"), ("cluster", "a\"b\\c\n")],
+    );
+
+    assert_eq!(metrics.format, "prometheus_text_v0.0.4");
+    assert!(metrics.metric_count > report.capability_evidence.len() as u64);
+    assert!(metrics.text.contains("# HELP rustraft_byteraft_ready"));
+    assert!(metrics
+        .text
+        .contains("rustraft_byteraft_ready{plane=\"data_node\",cluster=\"a\\\"b\\\\c\\n\"} 0"));
+    assert!(metrics.text.contains(
+        "rustraft_byteraft_capability_ready{plane=\"data_node\",cluster=\"a\\\"b\\\\c\\n\",capability=\"wal_segment_lifecycle\""
+    ));
+    assert!(metrics.text.contains(
+        "rustraft_byteraft_capability_field_present{plane=\"data_node\",cluster=\"a\\\"b\\\\c\\n\",capability=\"wal_segment_lifecycle\",field=\"wal.compaction_observed\"} 0"
+    ));
+    assert!(metrics.text.contains(
+        "rustraft_byteraft_blocker_present{plane=\"data_node\",cluster=\"a\\\"b\\\\c\\n\",blocker=\"wal_segment_lifecycle:missing:wal.compaction_observed\"} 1"
+    ));
+    assert!(metrics
+        .text
+        .contains("rustraft_byteraft_missing_capability_count"));
 }

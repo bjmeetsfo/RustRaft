@@ -38,6 +38,9 @@ startup, object/page storage, and admin endpoints.
   semantics, snapshot sender/downloader lifecycle, WAL segment lifecycle,
   read-index/lease safety, membership role semantics, FSM apply atomicity, and
   admin/metrics observability.
+- Generic Prometheus text output for the same capability families is available
+  through `rustraft_byteraft_runtime_capability_prometheus()`, reducing the
+  product-local metric logic TemporalStore needs to carry.
 - `rustraft_temporalstore_adapter_shape()` records the desired consumer shape:
   `TemporalRaftConsensusBackend` owns a
   `rustraft::node::RaftNodeRuntime<TemporalStoreStateMachine, TemporalTransport>`
@@ -113,6 +116,9 @@ recovery, log-store inspection, and operational semantics.
 The public ByteRaft runtime capability report is the matching family-level
 contract for operational parity claims; it names exact missing evidence fields
 instead of accepting coarse API-presence booleans.
+Its Prometheus exporter is intentionally generic and uses `rustraft_byteraft_*`
+metric names so downstream services can add their own labels or prefixes without
+reimplementing the capability matrix.
 TemporalStore adapter docs should live with TemporalStore and show how
 `TemporalRaftConsensusBackend` wires command encoding, apply semantics, the
 storage engine, and process/admin integration around the RustRaft-owned runtime.

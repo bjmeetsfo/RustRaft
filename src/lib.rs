@@ -966,6 +966,13 @@ pub struct RustRaftByteRaftRuntimeCapabilityReport {
     pub blockers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftPrometheusMetricSet {
+    pub format: String,
+    pub metric_count: u64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RustRaftBlockerSeverity {
@@ -7273,6 +7280,7 @@ pub fn rustraft_compatibility_report_names() -> Vec<String> {
         "rustraft_runtime_local_status_report",
         "rustraft_runtime_admin_report",
         "rustraft_fatal_blocker_report",
+        "rustraft_byteraft_runtime_capability_prometheus",
         "rustraft_temporalstore_extraction_plan",
     ]
     .into_iter()
@@ -8545,6 +8553,100 @@ pub fn rustraft_byteraft_runtime_capability_report(
     }
 }
 
+pub fn rustraft_byteraft_runtime_capability_prometheus(
+    report: &RustRaftByteRaftRuntimeCapabilityReport,
+    labels: &[(&str, &str)],
+) -> RustRaftPrometheusMetricSet {
+    let mut out = String::new();
+    let mut metric_count = 0;
+    out.push_str("# HELP rustraft_byteraft_ready Whether ByteRaft-derived runtime capability evidence is complete.\n");
+    out.push_str("# TYPE rustraft_byteraft_ready gauge\n");
+    push_prometheus_metric(
+        &mut out,
+        "rustraft_byteraft_ready",
+        labels,
+        u64::from(report.ready),
+    );
+    metric_count += 1;
+
+    out.push_str("# HELP rustraft_byteraft_capability_ready ByteRaft-derived runtime capability readiness by family.\n");
+    out.push_str("# TYPE rustraft_byteraft_capability_ready gauge\n");
+    for capability in &report.capability_evidence {
+        let capability_label = capability.capability.as_str();
+        let mut metric_labels = labels.to_vec();
+        metric_labels.push(("capability", capability_label));
+        metric_labels.push(("source", capability.source_reference.as_str()));
+        push_prometheus_metric(
+            &mut out,
+            "rustraft_byteraft_capability_ready",
+            &metric_labels,
+            u64::from(capability.present),
+        );
+        metric_count += 1;
+
+        for evidence in &capability.evidence {
+            let field = evidence
+                .strip_prefix("present:")
+                .or_else(|| evidence.strip_prefix("missing:"))
+                .unwrap_or(evidence.as_str());
+            let mut evidence_labels = labels.to_vec();
+            evidence_labels.push(("capability", capability_label));
+            evidence_labels.push(("field", field));
+            push_prometheus_metric(
+                &mut out,
+                "rustraft_byteraft_capability_field_present",
+                &evidence_labels,
+                u64::from(evidence.starts_with("present:")),
+            );
+            metric_count += 1;
+        }
+    }
+
+    out.push_str(
+        "# HELP rustraft_byteraft_blocker_present ByteRaft-derived runtime capability blockers.\n",
+    );
+    out.push_str("# TYPE rustraft_byteraft_blocker_present gauge\n");
+    for blocker in &report.blockers {
+        let mut blocker_labels = labels.to_vec();
+        blocker_labels.push(("blocker", blocker.as_str()));
+        push_prometheus_metric(
+            &mut out,
+            "rustraft_byteraft_blocker_present",
+            &blocker_labels,
+            1,
+        );
+        metric_count += 1;
+    }
+
+    push_prometheus_metric(
+        &mut out,
+        "rustraft_byteraft_satisfied_capability_count",
+        labels,
+        report.satisfied.len() as u64,
+    );
+    metric_count += 1;
+    push_prometheus_metric(
+        &mut out,
+        "rustraft_byteraft_missing_capability_count",
+        labels,
+        report.missing.len() as u64,
+    );
+    metric_count += 1;
+    push_prometheus_metric(
+        &mut out,
+        "rustraft_byteraft_blocker_count",
+        labels,
+        report.blockers.len() as u64,
+    );
+    metric_count += 1;
+
+    RustRaftPrometheusMetricSet {
+        format: "prometheus_text_v0.0.4".to_string(),
+        metric_count,
+        text: out,
+    }
+}
+
 pub fn rustraft_data_node_process_rollout_readiness_report(
     rollout: &RustRaftDataNodeProcessRolloutReport,
 ) -> RustRaftProcessRolloutReadinessReport {
@@ -9315,6 +9417,38 @@ fn all_semantics(
         (Some(data_node), Some(metaserver)) => predicate(data_node) && predicate(metaserver),
         _ => false,
     }
+}
+
+fn push_prometheus_metric(out: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+    out.push_str(name);
+    if !labels.is_empty() {
+        out.push('{');
+        for (idx, (key, label_value)) in labels.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            out.push_str(key);
+            out.push_str("=\"");
+            out.push_str(&escape_prometheus_label_value(label_value));
+            out.push('"');
+        }
+        out.push('}');
+    }
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
+fn escape_prometheus_label_value(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            _ => vec![ch],
+        })
+        .collect()
 }
 
 fn require_data_node_rollout(

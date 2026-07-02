@@ -39,6 +39,7 @@ License: Apache-2.0.
 - `rustraft_data_node_process_rollout_readiness_report`
 - `rustraft_meta_process_rollout_readiness_report`
 - `rustraft_byteraft_runtime_capability_report`
+- `rustraft_byteraft_runtime_capability_prometheus`
 - `rustraft_public_api_contract`
 - `rustraft_open_source_surface`
 - `rustraft_temporalstore_adapter_shape`
@@ -77,6 +78,10 @@ ByteRaft-derived runtime capability families: process-path rollout proof,
 per-peer replication pipeline state, reorder queues, snapshot sender/downloader
 lifecycle, WAL segment lifecycle, read-index/lease safety, membership role
 semantics, FSM apply atomicity, and admin/metrics observability.
+`rustraft_byteraft_runtime_capability_prometheus` renders that report as generic
+`rustraft_byteraft_*` Prometheus text metrics. Product runtimes such as
+TemporalStore can attach their own service labels without duplicating the
+capability-matrix logic.
 
 ## Why It Lives Separately
 
