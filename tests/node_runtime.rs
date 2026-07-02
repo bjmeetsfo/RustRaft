@@ -4,7 +4,7 @@ use rustraft::{
 };
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn peer(node_id: u64) -> RustRaftPeer {
     RustRaftPeer {
@@ -43,6 +43,14 @@ fn node_options_in(base_dir: PathBuf) -> RustRaftNodeOptions {
         config: RustRaftConfig::default(),
         peers: vec![peer(1), peer(2), peer(3)],
     }
+}
+
+fn timer_node_options() -> RustRaftNodeOptions {
+    let mut options = node_options_in(temp_runtime_dir("timer"));
+    options.config.heartbeat_interval_ms = 10;
+    options.config.election_timeout_ms = 50;
+    options.config.leader_lease_ms = 20;
+    options
 }
 
 #[test]
@@ -128,6 +136,53 @@ fn node_runtime_supports_transfer_and_campaign_lifecycle_commands() {
         status.cluster_status.expect("cluster status").leader_id,
         Some(1)
     );
+}
+
+#[test]
+fn node_runtime_runs_heartbeat_election_timer_loop_and_peer_state_machine() {
+    let mut runtime = RaftNodeRuntime::create(timer_node_options()).expect("create runtime");
+    runtime.start().expect("start runtime");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let status = runtime.status().expect("status");
+    assert!(status.timer_status.heartbeat_ticks > 0);
+    assert!(status.timer_status.election_ticks > 0);
+    assert_eq!(status.timer_status.heartbeat_interval_ms, 10);
+    assert_eq!(status.timer_status.election_timeout_ms, 50);
+    assert_eq!(status.peer_runtime.len(), 3);
+    assert!(status
+        .peer_runtime
+        .iter()
+        .any(|peer| peer.node_id == 1 && peer.transfer_leader_target));
+    assert!(status.fatal_blocker_report.ready);
+}
+
+#[test]
+fn node_runtime_executes_prevote_and_reports_blockers_from_runtime_tasks() {
+    let mut runtime = RaftNodeRuntime::create(node_options()).expect("create runtime");
+    runtime.start().expect("start runtime");
+
+    let vote = runtime.pre_vote().expect("pre-vote");
+    assert!(vote.vote_granted);
+    assert_eq!(vote.reason, "pre_vote_granted");
+
+    runtime
+        .set_node_healthy(2, false)
+        .expect("mark node 2 down");
+    runtime
+        .set_node_healthy(3, false)
+        .expect("mark node 3 down");
+    assert!(runtime.transfer_leader(2).is_err());
+
+    let status = runtime.status().expect("status");
+    assert!(status.timer_status.pre_vote_executions >= 1);
+    assert!(status.timer_status.leader_transfer_executions >= 1);
+    assert!(!status.fatal_blocker_report.ready);
+    assert!(status
+        .fatal_blocker_report
+        .blockers
+        .iter()
+        .any(|blocker| blocker.id.contains("transfer_leader")));
 }
 
 #[test]

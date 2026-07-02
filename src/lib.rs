@@ -787,6 +787,33 @@ pub struct RustRaftFatalBlockerReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftRuntimeTimerStatus {
+    pub heartbeat_interval_ms: u64,
+    pub election_timeout_ms: u64,
+    pub heartbeat_ticks: u64,
+    pub election_ticks: u64,
+    pub pre_vote_executions: u64,
+    pub campaign_executions: u64,
+    pub leader_transfer_executions: u64,
+    pub last_tick_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftPeerRuntimeState {
+    pub node_id: RustRaftNodeId,
+    pub role: RustRaftRole,
+    pub replica_role: RustRaftReplicaRole,
+    pub healthy: bool,
+    pub matched: RustRaftLogIndex,
+    pub lag: RustRaftLogIndex,
+    pub heartbeat_due: bool,
+    pub election_elapsed_ms: u64,
+    pub pre_vote_sent: bool,
+    pub transfer_leader_target: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftSnapshotLifecycleEvidence {
     pub sender_lifecycle_present: bool,
     pub downloader_lifecycle_present: bool,
@@ -3496,6 +3523,46 @@ impl RaftCluster {
         Ok(())
     }
 
+    pub fn pre_vote(&self, candidate_id: RustRaftNodeId) -> Result<VoteResponse, RaftError> {
+        let candidate = self
+            .nodes
+            .get(&candidate_id)
+            .ok_or(RaftError::NodeNotFound(candidate_id))?;
+        if !self.config.enable_pre_vote {
+            return Ok(VoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+                reason: "pre_vote_disabled".to_string(),
+            });
+        }
+        if !candidate.replica_role.can_be_leader() {
+            return Ok(VoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+                reason: "candidate_cannot_be_leader".to_string(),
+            });
+        }
+        if !candidate.healthy {
+            return Ok(VoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+                reason: "candidate_unhealthy".to_string(),
+            });
+        }
+        if !self.has_live_quorum() {
+            return Ok(VoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+                reason: "no_live_quorum".to_string(),
+            });
+        }
+        Ok(VoteResponse {
+            term: self.current_term + 1,
+            vote_granted: true,
+            reason: "pre_vote_granted".to_string(),
+        })
+    }
+
     pub fn propose(&mut self, payload: RustRaftPayload) -> Result<RustRaftLogId, RaftError> {
         let leader_id = self.leader_id.ok_or(RaftError::NoLeader)?;
         if !self.running {
@@ -4500,6 +4567,9 @@ pub struct RaftNodeRuntimeStatus {
     pub restart_count: u64,
     pub worker_running: bool,
     pub cluster_status: Option<RaftClusterStatusReport>,
+    pub timer_status: RaftRuntimeTimerStatus,
+    pub peer_runtime: Vec<RaftPeerRuntimeState>,
+    pub fatal_blocker_report: RustRaftFatalBlockerReport,
 }
 
 enum RaftNodeRuntimeOp {
@@ -4517,6 +4587,7 @@ enum RaftNodeRuntimeOp {
     SetNodeHealthy(RustRaftNodeId, bool, mpsc::Sender<Result<(), RaftError>>),
     SetLeaderLeaseValid(bool, mpsc::Sender<Result<(), RaftError>>),
     TransferLeader(RustRaftNodeId, mpsc::Sender<Result<(), RaftError>>),
+    PreVote(mpsc::Sender<Result<VoteResponse, RaftError>>),
     Campaign(bool, mpsc::Sender<Result<(), RaftError>>),
     Shutdown(mpsc::Sender<Result<(), RaftError>>),
 }
@@ -4657,6 +4728,16 @@ impl RaftNodeRuntime {
         recv_runtime_reply(reply_rx)?
     }
 
+    pub fn pre_vote(&self) -> Result<VoteResponse, RaftError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender()?
+            .send(RaftNodeRuntimeOp::PreVote(reply_tx))
+            .map_err(|err| {
+                RaftError::Transport(format!("failed to send pre-vote to raft node: {err}"))
+            })?;
+        recv_runtime_reply(reply_rx)?
+    }
+
     pub fn campaign(&self, forced: bool) -> Result<(), RaftError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.sender()?
@@ -4774,21 +4855,83 @@ fn raft_node_runtime_loop(
         }
     };
     let mut state = RaftNodeRuntimeState::Created;
-    while let Ok(command) = command_rx.recv() {
+    let heartbeat_interval_ms = options.config.heartbeat_interval_ms.max(1);
+    let election_timeout_ms = options
+        .config
+        .election_timeout_ms
+        .max(heartbeat_interval_ms);
+    let heartbeat_interval = Duration::from_millis(heartbeat_interval_ms);
+    let mut heartbeat_ticks = 0;
+    let mut election_ticks = 0;
+    let mut election_elapsed_ms: u64 = 0;
+    let mut pre_vote_executions = 0;
+    let mut campaign_executions = 0;
+    let mut leader_transfer_executions = 0;
+    let mut last_tick_reason = "runtime_created".to_string();
+    let mut blockers = Vec::<String>::new();
+    let mut fatal_blockers = Vec::<String>::new();
+    loop {
+        let command = match command_rx.recv_timeout(heartbeat_interval) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if state == RaftNodeRuntimeState::Running {
+                    heartbeat_ticks += 1;
+                    election_elapsed_ms = election_elapsed_ms.saturating_add(heartbeat_interval_ms);
+                    last_tick_reason = "heartbeat_tick".to_string();
+                    if election_elapsed_ms >= election_timeout_ms {
+                        election_ticks += 1;
+                        election_elapsed_ms = 0;
+                        last_tick_reason = "election_tick".to_string();
+                        if cluster.leader_id().is_none() {
+                            pre_vote_executions += 1;
+                            match cluster.pre_vote(node_id) {
+                                Ok(vote) if vote.vote_granted => {
+                                    campaign_executions += 1;
+                                    let _ = record_runtime_result(
+                                        "election_tick_campaign",
+                                        cluster.campaign(node_id, false),
+                                        &mut blockers,
+                                        &mut fatal_blockers,
+                                        false,
+                                    );
+                                }
+                                Ok(vote) => blockers.push(format!("pre_vote:{}", vote.reason)),
+                                Err(error) => blockers.push(format!("pre_vote:{error}")),
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match command {
             RaftNodeRuntimeOp::Start(reply) => {
                 let result = cluster.start();
                 if result.is_ok() {
                     state = RaftNodeRuntimeState::Running;
+                    election_elapsed_ms = 0;
                 }
-                let _ = reply.send(result);
+                let _ = reply.send(record_runtime_result(
+                    "start",
+                    result,
+                    &mut blockers,
+                    &mut fatal_blockers,
+                    false,
+                ));
             }
             RaftNodeRuntimeOp::Stop(reply) => {
                 let result = cluster.stop();
                 if result.is_ok() {
                     state = RaftNodeRuntimeState::Stopped;
                 }
-                let _ = reply.send(result);
+                let _ = reply.send(record_runtime_result(
+                    "stop",
+                    result,
+                    &mut blockers,
+                    &mut fatal_blockers,
+                    false,
+                ));
             }
             RaftNodeRuntimeOp::Status(reply) => {
                 let status = RaftNodeRuntimeStatus {
@@ -4798,6 +4941,27 @@ fn raft_node_runtime_loop(
                     restart_count: 0,
                     worker_running: state != RaftNodeRuntimeState::Shutdown,
                     cluster_status: cluster.cluster_status_report().ok(),
+                    timer_status: RaftRuntimeTimerStatus {
+                        heartbeat_interval_ms,
+                        election_timeout_ms,
+                        heartbeat_ticks,
+                        election_ticks,
+                        pre_vote_executions,
+                        campaign_executions,
+                        leader_transfer_executions,
+                        last_tick_reason: last_tick_reason.clone(),
+                    },
+                    peer_runtime: raft_peer_runtime_states(
+                        &cluster,
+                        election_elapsed_ms,
+                        heartbeat_ticks > 0,
+                        pre_vote_executions > 0,
+                    ),
+                    fatal_blocker_report: rustraft_fatal_blocker_report(
+                        "raft_node_runtime",
+                        blockers.clone(),
+                        fatal_blockers.clone(),
+                    ),
                 };
                 let _ = reply.send(Ok(status));
             }
@@ -4808,7 +4972,13 @@ fn raft_node_runtime_loop(
                     }
                     Ok(log_id)
                 });
-                let _ = reply.send(result);
+                let _ = reply.send(record_runtime_result(
+                    "propose",
+                    result,
+                    &mut blockers,
+                    &mut fatal_blockers,
+                    true,
+                ));
             }
             RaftNodeRuntimeOp::ReadIndex(min_commit_index, reply) => {
                 let request = ReadIndexRequest {
@@ -4817,28 +4987,122 @@ fn raft_node_runtime_loop(
                     min_commit_index,
                     allow_lease_read: true,
                 };
-                let _ = reply.send(cluster.read_index(request));
+                let _ = reply.send(record_runtime_result(
+                    "read_index",
+                    cluster.read_index(request),
+                    &mut blockers,
+                    &mut fatal_blockers,
+                    false,
+                ));
             }
             RaftNodeRuntimeOp::SetNodeHealthy(target, healthy, reply) => {
-                let _ = reply.send(cluster.set_node_healthy(target, healthy));
+                let _ = reply.send(record_runtime_result(
+                    "set_node_healthy",
+                    cluster.set_node_healthy(target, healthy),
+                    &mut blockers,
+                    &mut fatal_blockers,
+                    false,
+                ));
             }
             RaftNodeRuntimeOp::SetLeaderLeaseValid(valid, reply) => {
                 cluster.set_leader_lease_valid(valid);
                 let _ = reply.send(Ok(()));
             }
             RaftNodeRuntimeOp::TransferLeader(target, reply) => {
-                let _ = reply.send(cluster.transfer_leader(target));
+                leader_transfer_executions += 1;
+                let _ = reply.send(record_runtime_result(
+                    "transfer_leader",
+                    cluster.transfer_leader(target),
+                    &mut blockers,
+                    &mut fatal_blockers,
+                    false,
+                ));
+            }
+            RaftNodeRuntimeOp::PreVote(reply) => {
+                pre_vote_executions += 1;
+                let _ = reply.send(record_runtime_result(
+                    "pre_vote",
+                    cluster.pre_vote(node_id),
+                    &mut blockers,
+                    &mut fatal_blockers,
+                    false,
+                ));
             }
             RaftNodeRuntimeOp::Campaign(forced, reply) => {
-                let _ = reply.send(cluster.campaign(node_id, forced));
+                campaign_executions += 1;
+                let _ = reply.send(record_runtime_result(
+                    "campaign",
+                    cluster.campaign(node_id, forced),
+                    &mut blockers,
+                    &mut fatal_blockers,
+                    false,
+                ));
             }
             RaftNodeRuntimeOp::Shutdown(reply) => {
                 let result = cluster.stop();
-                let _ = reply.send(result);
+                let _ = reply.send(record_runtime_result(
+                    "shutdown",
+                    result,
+                    &mut blockers,
+                    &mut fatal_blockers,
+                    false,
+                ));
                 break;
             }
         }
     }
+}
+
+fn record_runtime_result<T>(
+    operation: &str,
+    result: Result<T, RaftError>,
+    blockers: &mut Vec<String>,
+    fatal_blockers: &mut Vec<String>,
+    fatal_on_error: bool,
+) -> Result<T, RaftError> {
+    if let Err(error) = &result {
+        let blocker = format!("{operation}:{error}");
+        blockers.push(blocker.clone());
+        if fatal_on_error {
+            fatal_blockers.push(blocker);
+        }
+    }
+    result
+}
+
+fn raft_peer_runtime_states(
+    cluster: &RaftCluster,
+    election_elapsed_ms: u64,
+    heartbeat_due: bool,
+    pre_vote_sent: bool,
+) -> Vec<RaftPeerRuntimeState> {
+    let leader_commit_index = cluster.commit_index;
+    cluster
+        .nodes
+        .values()
+        .map(|node| {
+            let mut blockers = Vec::new();
+            if !node.healthy {
+                blockers.push("peer_unhealthy".to_string());
+            }
+            if node.match_index() < leader_commit_index {
+                blockers.push("peer_lagging".to_string());
+            }
+            RaftPeerRuntimeState {
+                node_id: node.id,
+                role: node.raft_role,
+                replica_role: node.replica_role,
+                healthy: node.healthy,
+                matched: node.match_index(),
+                lag: leader_commit_index.saturating_sub(node.match_index()),
+                heartbeat_due,
+                election_elapsed_ms,
+                pre_vote_sent,
+                transfer_leader_target: cluster.leader_id == Some(node.id),
+                blockers,
+            }
+        })
+        .collect()
 }
 
 fn respond_runtime_error(command: RaftNodeRuntimeOp, error: RaftError) -> bool {
@@ -4849,6 +5113,10 @@ fn respond_runtime_error(command: RaftNodeRuntimeOp, error: RaftError) -> bool {
         | RaftNodeRuntimeOp::SetLeaderLeaseValid(_, reply)
         | RaftNodeRuntimeOp::TransferLeader(_, reply)
         | RaftNodeRuntimeOp::Campaign(_, reply) => {
+            let _ = reply.send(Err(error));
+            false
+        }
+        RaftNodeRuntimeOp::PreVote(reply) => {
             let _ = reply.send(Err(error));
             false
         }
