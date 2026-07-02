@@ -2231,6 +2231,180 @@ where
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftFsmApplyOutcome<R> {
+    pub response: RaftApplyResponse<R>,
+    pub applied: bool,
+    pub replayed: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftFsmReplayReport {
+    pub attempted: u64,
+    pub applied: u64,
+    pub skipped_replay: u64,
+    pub last_applied: RustRaftLogIndex,
+    pub idempotent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftFsmCheckpoint<G, S> {
+    pub group_id: G,
+    pub last_applied: RustRaftLogIndex,
+    pub applied_log_ids: Vec<RustRaftLogId>,
+    pub snapshot: S,
+}
+
+#[derive(Debug, Clone)]
+pub struct RaftFsmAdapter<S, G = RustRaftGroupId, P = EntryPayload>
+where
+    S: RaftStateMachine<G, P>,
+{
+    group_id: G,
+    state_machine: S,
+    applied: BTreeMap<RustRaftLogIndex, RustRaftTerm>,
+    responses: BTreeMap<RustRaftLogIndex, RaftApplyResponse<S::Response>>,
+    last_applied: RustRaftLogIndex,
+    _payload: PhantomData<P>,
+}
+
+impl<S, G, P> RaftFsmAdapter<S, G, P>
+where
+    S: RaftStateMachine<G, P>,
+    G: Clone,
+    P: Clone,
+    S::Response: Clone,
+{
+    pub fn new(group_id: G, state_machine: S) -> Self {
+        Self {
+            group_id,
+            state_machine,
+            applied: BTreeMap::new(),
+            responses: BTreeMap::new(),
+            last_applied: 0,
+            _payload: PhantomData,
+        }
+    }
+
+    pub fn apply_entry(
+        &mut self,
+        entry: RaftLogEntry<P>,
+    ) -> Result<RaftFsmApplyOutcome<S::Response>, RaftError> {
+        if let Some(term) = self.applied.get(&entry.log_id.index) {
+            if *term != entry.log_id.term {
+                return Err(RaftError::InvalidRequest(format!(
+                    "FSM replay conflict at index {}: existing term {}, replay term {}",
+                    entry.log_id.index, term, entry.log_id.term
+                )));
+            }
+            let response = self
+                .responses
+                .get(&entry.log_id.index)
+                .cloned()
+                .ok_or_else(|| {
+                    RaftError::Storage(format!(
+                        "FSM replay response missing for applied index {}",
+                        entry.log_id.index
+                    ))
+                })?;
+            return Ok(RaftFsmApplyOutcome {
+                response,
+                applied: false,
+                replayed: true,
+                reason: "duplicate_log_id_replayed_idempotently".to_string(),
+            });
+        }
+
+        let response = self.state_machine.apply(RaftApplyRequest {
+            group_id: self.group_id.clone(),
+            log_id: entry.log_id.clone(),
+            payload: entry.payload,
+        })?;
+        self.last_applied = self.last_applied.max(response.applied_index);
+        self.applied.insert(entry.log_id.index, entry.log_id.term);
+        self.responses.insert(entry.log_id.index, response.clone());
+        Ok(RaftFsmApplyOutcome {
+            response,
+            applied: true,
+            replayed: false,
+            reason: "applied_new_log_id".to_string(),
+        })
+    }
+
+    pub fn replay_entries<I>(&mut self, entries: I) -> Result<RaftFsmReplayReport, RaftError>
+    where
+        I: IntoIterator<Item = RaftLogEntry<P>>,
+    {
+        let mut report = RaftFsmReplayReport {
+            attempted: 0,
+            applied: 0,
+            skipped_replay: 0,
+            last_applied: self.last_applied,
+            idempotent: true,
+        };
+        for entry in entries {
+            report.attempted += 1;
+            let outcome = self.apply_entry(entry)?;
+            if outcome.applied {
+                report.applied += 1;
+            }
+            if outcome.replayed {
+                report.skipped_replay += 1;
+            }
+        }
+        report.last_applied = self.last_applied;
+        Ok(report)
+    }
+
+    pub fn checkpoint(&self) -> Result<RaftFsmCheckpoint<G, S::Snapshot>, RaftError> {
+        Ok(RaftFsmCheckpoint {
+            group_id: self.group_id.clone(),
+            last_applied: self.last_applied,
+            applied_log_ids: self
+                .applied
+                .iter()
+                .map(|(index, term)| RustRaftLogId {
+                    term: *term,
+                    index: *index,
+                })
+                .collect(),
+            snapshot: self.state_machine.snapshot(self.group_id.clone())?,
+        })
+    }
+
+    pub fn install_checkpoint(
+        &mut self,
+        checkpoint: RaftFsmCheckpoint<G, S::Snapshot>,
+    ) -> Result<(), RaftError> {
+        self.state_machine.install_snapshot(checkpoint.snapshot)?;
+        self.last_applied = checkpoint.last_applied;
+        self.applied = checkpoint
+            .applied_log_ids
+            .into_iter()
+            .map(|log_id| (log_id.index, log_id.term))
+            .collect();
+        self.responses.clear();
+        Ok(())
+    }
+
+    pub fn last_applied(&self) -> RustRaftLogIndex {
+        self.last_applied
+    }
+
+    pub fn applied_log_count(&self) -> usize {
+        self.applied.len()
+    }
+
+    pub fn inner(&self) -> &S {
+        &self.state_machine
+    }
+
+    pub fn inner_mut(&mut self) -> &mut S {
+        &mut self.state_machine
+    }
+}
+
 pub trait RustRaftStateMachine {
     fn apply(
         &mut self,
