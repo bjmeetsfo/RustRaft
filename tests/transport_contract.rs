@@ -1,11 +1,13 @@
 use rustraft::{
-    AppendEntriesRequest, AppendEntriesResponse, AuthenticatedRaftTransport,
+    AppendEntriesRequest, AppendEntriesResponse, AuthenticatedRaftTransport, ClusterRaftTransport,
     InstallSnapshotRequest, InstallSnapshotResponse, RaftCluster, RaftError, RaftTransport,
     ReadIndexRequest, ReadIndexResponse, RustRaftAppendEntriesRequest,
-    RustRaftInstallSnapshotRequest, RustRaftLogId, RustRaftPeer, RustRaftReplicaRole,
-    RustRaftSnapshotChunk, RustRaftSnapshotMeta, RustRaftTransport, StaticRaftAuthToken,
-    VoteRequest, VoteResponse,
+    RustRaftInstallSnapshotRequest, RustRaftLogEntry, RustRaftLogId, RustRaftPeer,
+    RustRaftReplicaRole, RustRaftSnapshotChunk, RustRaftSnapshotMeta, RustRaftTransport,
+    StaticRaftAuthToken, TcpRaftTransport, TcpRaftTransportServer, VoteRequest, VoteResponse,
 };
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 fn peer(node_id: u64, role: RustRaftReplicaRole) -> RustRaftPeer {
     RustRaftPeer {
@@ -188,4 +190,106 @@ fn cluster_installs_snapshot_from_chunked_snapshot_rpc() {
     assert!(response.accepted);
     assert_eq!(response.reason, "snapshot_installed");
     assert_eq!(cluster.status(2).expect("status").last_snapshot_index, 9);
+}
+
+#[test]
+fn tcp_transport_round_trips_append_snapshot_vote_and_read_index() {
+    let cluster = Arc::new(Mutex::new(
+        RaftCluster::new(
+            3,
+            Default::default(),
+            vec![
+                peer(1, RustRaftReplicaRole::Voter),
+                peer(2, RustRaftReplicaRole::Voter),
+                peer(3, RustRaftReplicaRole::Voter),
+            ],
+        )
+        .expect("cluster"),
+    ));
+    cluster.lock().expect("lock").start().expect("start");
+    let handler = Arc::new(ClusterRaftTransport::new(Arc::clone(&cluster)));
+    let mut server =
+        TcpRaftTransportServer::start("127.0.0.1:0", handler).expect("start tcp server");
+
+    let mut peers = BTreeMap::new();
+    peers.insert(2, server.addr().to_string());
+    let transport = TcpRaftTransport::new(peers);
+    let append = transport
+        .append_entries(
+            2,
+            AppendEntriesRequest {
+                group_id: 3,
+                term: 1,
+                leader_id: 1,
+                prev_log_id: None,
+                entries: vec![RustRaftLogEntry {
+                    log_id: RustRaftLogId { term: 1, index: 1 },
+                    payload: b"x".to_vec(),
+                }],
+                leader_commit: 1,
+            },
+        )
+        .expect("append over tcp");
+    assert!(append.success);
+    assert_eq!(append.match_index, 1);
+
+    let vote = transport
+        .vote(
+            2,
+            VoteRequest {
+                group_id: 3,
+                term: 2,
+                candidate_id: 2,
+                last_log_id: Some(RustRaftLogId { term: 1, index: 1 }),
+                pre_vote: true,
+            },
+        )
+        .expect("vote over tcp");
+    assert!(vote.vote_granted);
+
+    let read = transport
+        .read_index(
+            2,
+            ReadIndexRequest {
+                group_id: 3,
+                requester_id: 2,
+                min_commit_index: 1,
+                allow_lease_read: true,
+            },
+        )
+        .expect("read over tcp");
+    assert!(read.safe);
+
+    let snapshot = transport
+        .install_snapshot(
+            2,
+            InstallSnapshotRequest {
+                group_id: 3,
+                term: 1,
+                leader_id: 1,
+                chunk: RustRaftSnapshotChunk {
+                    meta: RustRaftSnapshotMeta {
+                        snapshot_id: "tcp-snap".to_string(),
+                        last_log_id: RustRaftLogId { term: 1, index: 4 },
+                        membership: vec![1, 2, 3],
+                    },
+                    offset: 0,
+                    data: b"state".to_vec(),
+                    done: true,
+                },
+            },
+        )
+        .expect("snapshot over tcp");
+    assert!(snapshot.accepted);
+    assert_eq!(
+        cluster
+            .lock()
+            .expect("lock")
+            .status(2)
+            .expect("status")
+            .last_snapshot_index,
+        4
+    );
+
+    server.shutdown().expect("shutdown server");
 }

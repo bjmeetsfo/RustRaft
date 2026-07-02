@@ -28,8 +28,12 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -4227,6 +4231,101 @@ impl RustRaftConsensus for RaftCluster {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RaftMembershipOperation {
+    AddNode(RustRaftPeer),
+    AddLearner(RustRaftPeer),
+    AddWitness(RustRaftPeer),
+    Promote(RustRaftNodeId),
+    Remove(RustRaftNodeId),
+    TransferLeader(RustRaftNodeId),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftMembershipExecutionReport {
+    pub operation: RaftMembershipOperation,
+    pub before: RaftMembership,
+    pub after: RaftMembership,
+    pub leader_before: Option<RustRaftNodeId>,
+    pub leader_after: Option<RustRaftNodeId>,
+    pub success: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftMembershipExecutor {
+    reports: Vec<RaftMembershipExecutionReport>,
+}
+
+impl RaftMembershipExecutor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn execute(
+        &mut self,
+        cluster: &mut RaftCluster,
+        operation: RaftMembershipOperation,
+    ) -> Result<RaftMembershipExecutionReport, RaftError> {
+        let before = cluster.membership();
+        let leader_before = cluster.leader_id();
+        let result = match operation.clone() {
+            RaftMembershipOperation::AddNode(peer) => cluster.add_peer(peer),
+            RaftMembershipOperation::AddLearner(peer) => cluster.add_learner(peer),
+            RaftMembershipOperation::AddWitness(peer) => cluster.add_witness(peer),
+            RaftMembershipOperation::Promote(node_id) => {
+                let catchup = cluster.catchup_report(node_id)?;
+                if !catchup.promotable {
+                    Err(RaftError::InvalidRequest(format!(
+                        "node {} cannot be promoted: {}",
+                        node_id, catchup.reason
+                    )))
+                } else {
+                    cluster.promote_peer(node_id)
+                }
+            }
+            RaftMembershipOperation::Remove(node_id) => cluster.remove_peer(node_id),
+            RaftMembershipOperation::TransferLeader(node_id) => cluster.transfer_leader(node_id),
+        };
+        let success = result.is_ok();
+        let reason = match &result {
+            Ok(()) => "membership_operation_applied".to_string(),
+            Err(error) => error.to_string(),
+        };
+        let report = RaftMembershipExecutionReport {
+            operation,
+            before,
+            after: cluster.membership(),
+            leader_before,
+            leader_after: cluster.leader_id(),
+            success,
+            reason,
+        };
+        self.reports.push(report.clone());
+        result.map(|_| report)
+    }
+
+    pub fn execute_all<I>(
+        &mut self,
+        cluster: &mut RaftCluster,
+        operations: I,
+    ) -> Result<Vec<RaftMembershipExecutionReport>, RaftError>
+    where
+        I: IntoIterator<Item = RaftMembershipOperation>,
+    {
+        let mut reports = Vec::new();
+        for operation in operations {
+            reports.push(self.execute(cluster, operation)?);
+        }
+        Ok(reports)
+    }
+
+    pub fn reports(&self) -> &[RaftMembershipExecutionReport] {
+        &self.reports
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RaftNodeRuntimeState {
@@ -4744,6 +4843,345 @@ where
         request: RustRaftReadIndexRequest,
     ) -> Result<RustRaftReadIndexResponse, RustRaftError> {
         self.inner.read_index(target, request)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "rpc", content = "payload", rename_all = "snake_case")]
+pub enum TcpRaftTransportRequest {
+    AppendEntries {
+        target: RustRaftNodeId,
+        request: AppendEntriesRequest,
+    },
+    Vote {
+        target: RustRaftNodeId,
+        request: VoteRequest,
+    },
+    InstallSnapshot {
+        target: RustRaftNodeId,
+        request: InstallSnapshotRequest,
+    },
+    ReadIndex {
+        target: RustRaftNodeId,
+        request: ReadIndexRequest,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TcpRaftRpcResult<T> {
+    pub ok: Option<T>,
+    pub error: Option<String>,
+}
+
+impl<T> TcpRaftRpcResult<T> {
+    fn from_result(result: Result<T, RaftError>) -> Self {
+        match result {
+            Ok(ok) => Self {
+                ok: Some(ok),
+                error: None,
+            },
+            Err(error) => Self {
+                ok: None,
+                error: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn into_result(self) -> Result<T, RaftError> {
+        self.ok.ok_or_else(|| {
+            RaftError::Transport(self.error.unwrap_or_else(|| "raft RPC failed".to_string()))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "rpc", content = "payload", rename_all = "snake_case")]
+pub enum TcpRaftTransportResponse {
+    AppendEntries(TcpRaftRpcResult<AppendEntriesResponse>),
+    Vote(TcpRaftRpcResult<VoteResponse>),
+    InstallSnapshot(TcpRaftRpcResult<InstallSnapshotResponse>),
+    ReadIndex(TcpRaftRpcResult<ReadIndexResponse>),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TcpRaftTransport {
+    peers: BTreeMap<RustRaftNodeId, String>,
+}
+
+impl TcpRaftTransport {
+    pub fn new(peers: BTreeMap<RustRaftNodeId, String>) -> Self {
+        Self { peers }
+    }
+
+    pub fn set_peer_addr(&mut self, node_id: RustRaftNodeId, addr: impl Into<String>) {
+        self.peers.insert(node_id, addr.into());
+    }
+
+    fn send_rpc(
+        &self,
+        target: RustRaftNodeId,
+        request: TcpRaftTransportRequest,
+    ) -> Result<TcpRaftTransportResponse, RaftError> {
+        let addr = self.peers.get(&target).ok_or_else(|| {
+            RaftError::Transport(format!("raft transport target {target} has no address"))
+        })?;
+        let mut stream = TcpStream::connect(addr)
+            .map_err(|err| RaftError::Transport(format!("failed to connect to {addr}: {err}")))?;
+        let encoded = serde_json::to_vec(&request)
+            .map_err(|err| RaftError::Transport(format!("failed to encode raft RPC: {err}")))?;
+        stream
+            .write_all(&encoded)
+            .and_then(|_| stream.write_all(b"\n"))
+            .map_err(|err| RaftError::Transport(format!("failed to write raft RPC: {err}")))?;
+        let mut response = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response)
+            .map_err(|err| RaftError::Transport(format!("failed to read raft RPC: {err}")))?;
+        serde_json::from_str(&response)
+            .map_err(|err| RaftError::Transport(format!("failed to decode raft RPC: {err}")))
+    }
+}
+
+impl RustRaftTransport for TcpRaftTransport {
+    fn append_entries(
+        &self,
+        target: u64,
+        request: RustRaftAppendEntriesRequest,
+    ) -> Result<RustRaftAppendEntriesResponse, RustRaftError> {
+        match self.send_rpc(
+            target,
+            TcpRaftTransportRequest::AppendEntries { target, request },
+        )? {
+            TcpRaftTransportResponse::AppendEntries(response) => response.into_result(),
+            _ => Err(RaftError::Transport(
+                "unexpected append-entries RPC response".to_string(),
+            )),
+        }
+    }
+
+    fn vote(
+        &self,
+        target: u64,
+        request: RustRaftVoteRequest,
+    ) -> Result<RustRaftVoteResponse, RustRaftError> {
+        match self.send_rpc(target, TcpRaftTransportRequest::Vote { target, request })? {
+            TcpRaftTransportResponse::Vote(response) => response.into_result(),
+            _ => Err(RaftError::Transport(
+                "unexpected vote RPC response".to_string(),
+            )),
+        }
+    }
+
+    fn install_snapshot(
+        &self,
+        target: u64,
+        request: RustRaftInstallSnapshotRequest,
+    ) -> Result<RustRaftInstallSnapshotResponse, RustRaftError> {
+        match self.send_rpc(
+            target,
+            TcpRaftTransportRequest::InstallSnapshot { target, request },
+        )? {
+            TcpRaftTransportResponse::InstallSnapshot(response) => response.into_result(),
+            _ => Err(RaftError::Transport(
+                "unexpected install-snapshot RPC response".to_string(),
+            )),
+        }
+    }
+
+    fn read_index(
+        &self,
+        target: u64,
+        request: RustRaftReadIndexRequest,
+    ) -> Result<RustRaftReadIndexResponse, RustRaftError> {
+        match self.send_rpc(
+            target,
+            TcpRaftTransportRequest::ReadIndex { target, request },
+        )? {
+            TcpRaftTransportResponse::ReadIndex(response) => response.into_result(),
+            _ => Err(RaftError::Transport(
+                "unexpected read-index RPC response".to_string(),
+            )),
+        }
+    }
+}
+
+pub struct TcpRaftTransportServer {
+    addr: String,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl TcpRaftTransportServer {
+    pub fn start<T>(addr: impl Into<String>, handler: Arc<T>) -> Result<Self, RaftError>
+    where
+        T: RustRaftTransport + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind(addr.into()).map_err(|err| {
+            RaftError::Transport(format!("failed to bind raft TCP server: {err}"))
+        })?;
+        listener.set_nonblocking(true).map_err(|err| {
+            RaftError::Transport(format!("failed to configure raft TCP server: {err}"))
+        })?;
+        let addr = listener
+            .local_addr()
+            .map_err(|err| RaftError::Transport(format!("failed to read raft TCP addr: {err}")))?
+            .to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker = thread::Builder::new()
+            .name("rustraft-tcp-transport".to_string())
+            .spawn(move || {
+                while !worker_shutdown.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = handle_tcp_raft_stream(stream, handler.as_ref());
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|err| {
+                RaftError::Transport(format!("failed to spawn raft TCP server: {err}"))
+            })?;
+        Ok(Self {
+            addr,
+            shutdown,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), RaftError> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(&self.addr);
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| RaftError::Transport("raft TCP server panicked".to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TcpRaftTransportServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn handle_tcp_raft_stream<T>(stream: TcpStream, handler: &T) -> Result<(), RaftError>
+where
+    T: RustRaftTransport + ?Sized,
+{
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|err| RaftError::Transport(format!("failed to read raft TCP request: {err}")))?;
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    let request: TcpRaftTransportRequest = serde_json::from_str(&line)
+        .map_err(|err| RaftError::Transport(format!("failed to decode raft TCP request: {err}")))?;
+    let response = match request {
+        TcpRaftTransportRequest::AppendEntries { target, request } => {
+            TcpRaftTransportResponse::AppendEntries(TcpRaftRpcResult::from_result(
+                handler.append_entries(target, request),
+            ))
+        }
+        TcpRaftTransportRequest::Vote { target, request } => TcpRaftTransportResponse::Vote(
+            TcpRaftRpcResult::from_result(handler.vote(target, request)),
+        ),
+        TcpRaftTransportRequest::InstallSnapshot { target, request } => {
+            TcpRaftTransportResponse::InstallSnapshot(TcpRaftRpcResult::from_result(
+                handler.install_snapshot(target, request),
+            ))
+        }
+        TcpRaftTransportRequest::ReadIndex { target, request } => {
+            TcpRaftTransportResponse::ReadIndex(TcpRaftRpcResult::from_result(
+                handler.read_index(target, request),
+            ))
+        }
+    };
+    let encoded = serde_json::to_vec(&response).map_err(|err| {
+        RaftError::Transport(format!("failed to encode raft TCP response: {err}"))
+    })?;
+    let stream = reader.get_mut();
+    stream
+        .write_all(&encoded)
+        .and_then(|_| stream.write_all(b"\n"))
+        .map_err(|err| RaftError::Transport(format!("failed to write raft TCP response: {err}")))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterRaftTransport {
+    cluster: Arc<Mutex<RaftCluster>>,
+}
+
+impl ClusterRaftTransport {
+    pub fn new(cluster: Arc<Mutex<RaftCluster>>) -> Self {
+        Self { cluster }
+    }
+}
+
+impl RustRaftTransport for ClusterRaftTransport {
+    fn append_entries(
+        &self,
+        target: u64,
+        request: RustRaftAppendEntriesRequest,
+    ) -> Result<RustRaftAppendEntriesResponse, RustRaftError> {
+        self.cluster
+            .lock()
+            .map_err(|_| RaftError::Transport("raft cluster transport lock poisoned".to_string()))?
+            .append_entries_to(target, request)
+    }
+
+    fn vote(
+        &self,
+        _target: u64,
+        request: RustRaftVoteRequest,
+    ) -> Result<RustRaftVoteResponse, RustRaftError> {
+        let cluster = self.cluster.lock().map_err(|_| {
+            RaftError::Transport("raft cluster transport lock poisoned".to_string())
+        })?;
+        Ok(RustRaftVoteResponse {
+            term: cluster.current_term.max(request.term),
+            vote_granted: request.group_id == cluster.group_id,
+            reason: if request.group_id == cluster.group_id {
+                "vote_granted".to_string()
+            } else {
+                "group_id_mismatch".to_string()
+            },
+        })
+    }
+
+    fn install_snapshot(
+        &self,
+        target: u64,
+        request: RustRaftInstallSnapshotRequest,
+    ) -> Result<RustRaftInstallSnapshotResponse, RustRaftError> {
+        self.cluster
+            .lock()
+            .map_err(|_| RaftError::Transport("raft cluster transport lock poisoned".to_string()))?
+            .install_snapshot_chunk_to(target, request)
+    }
+
+    fn read_index(
+        &self,
+        _target: u64,
+        request: RustRaftReadIndexRequest,
+    ) -> Result<RustRaftReadIndexResponse, RustRaftError> {
+        self.cluster
+            .lock()
+            .map_err(|_| RaftError::Transport("raft cluster transport lock poisoned".to_string()))?
+            .read_index(request)
     }
 }
 
