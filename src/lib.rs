@@ -800,6 +800,7 @@ pub type RustRaftTerm = u64;
 pub type RustRaftLogIndex = u64;
 pub type RustRaftSnapshotId = String;
 pub type RustRaftPayload = Vec<u8>;
+pub type EntryPayload = RustRaftPayload;
 pub type RustRaftSnapshotPayload = Vec<u8>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -815,6 +816,7 @@ pub struct RustRaftGenericLogEntry<P = RustRaftPayload> {
 }
 
 pub type RustRaftLogEntry = RustRaftGenericLogEntry<RustRaftPayload>;
+pub type RaftLogEntry<P = EntryPayload> = RustRaftGenericLogEntry<P>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftHardState {
@@ -1337,10 +1339,46 @@ pub struct RustRaftGenericApplyRequest<G = RustRaftGroupId, P = RustRaftPayload>
     pub payload: P,
 }
 
+pub type RaftApplyRequest<G = RustRaftGroupId, P = EntryPayload> =
+    RustRaftGenericApplyRequest<G, P>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftGenericApplyResponse<P = RustRaftPayload> {
     pub applied_index: RustRaftLogIndex,
     pub response: P,
+}
+
+pub type RaftApplyResponse<P = EntryPayload> = RustRaftGenericApplyResponse<P>;
+
+pub trait RaftApply<G = RustRaftGroupId, P = EntryPayload> {
+    type Response;
+
+    fn apply(
+        &mut self,
+        request: RaftApplyRequest<G, P>,
+    ) -> Result<RaftApplyResponse<Self::Response>, RaftError>;
+}
+
+pub trait RaftStateMachine<G = RustRaftGroupId, P = EntryPayload>: RaftApply<G, P> {
+    type Snapshot;
+
+    fn snapshot(&self, group_id: G) -> Result<Self::Snapshot, RaftError>;
+    fn install_snapshot(&mut self, snapshot: Self::Snapshot) -> Result<(), RaftError>;
+}
+
+pub fn rustraft_apply_entry<S, G, P>(
+    state_machine: &mut S,
+    group_id: G,
+    entry: RaftLogEntry<P>,
+) -> Result<RaftApplyResponse<S::Response>, RaftError>
+where
+    S: RaftApply<G, P>,
+{
+    state_machine.apply(RaftApplyRequest {
+        group_id,
+        log_id: entry.log_id,
+        payload: entry.payload,
+    })
 }
 
 pub trait RustRaftStateMachine {
@@ -1350,6 +1388,31 @@ pub trait RustRaftStateMachine {
     ) -> Result<RustRaftApplyResponse, RustRaftError>;
     fn snapshot(&self) -> Result<RustRaftSnapshotChunk, RustRaftError>;
     fn install_snapshot(&mut self, chunk: RustRaftSnapshotChunk) -> Result<(), RustRaftError>;
+}
+
+impl<T> RaftApply<RustRaftGroupId, EntryPayload> for T
+where
+    T: RustRaftStateMachine,
+{
+    type Response = EntryPayload;
+
+    fn apply(
+        &mut self,
+        request: RaftApplyRequest<RustRaftGroupId, EntryPayload>,
+    ) -> Result<RaftApplyResponse<Self::Response>, RaftError> {
+        let response = RustRaftStateMachine::apply(
+            self,
+            RustRaftApplyRequest {
+                group_id: request.group_id,
+                log_id: request.log_id,
+                payload: request.payload,
+            },
+        )?;
+        Ok(RaftApplyResponse {
+            applied_index: response.applied_index,
+            response: response.response,
+        })
+    }
 }
 
 pub trait RustRaftConsensus {
