@@ -3561,6 +3561,14 @@ impl RaftCluster {
                 reason: "node_unhealthy".to_string(),
             });
         }
+        if !self.has_live_quorum() {
+            return Ok(RustRaftReadIndexResponse {
+                safe: false,
+                read_index: node.commit_index,
+                lease_read: false,
+                reason: "no_live_quorum".to_string(),
+            });
+        }
         if request.min_commit_index > node.applied_index {
             return Ok(RustRaftReadIndexResponse {
                 safe: false,
@@ -4114,6 +4122,15 @@ impl RaftCluster {
         voters / 2 + 1
     }
 
+    fn has_live_quorum(&self) -> bool {
+        let live_voters = self
+            .nodes
+            .values()
+            .filter(|node| node.healthy && node.replica_role.participates_in_quorum())
+            .count();
+        live_voters >= self.quorum_size()
+    }
+
     fn refresh_replication_pipelines(&mut self) {
         for (node_id, node) in &self.nodes {
             self.peer_pipelines.entry(*node_id).or_insert_with(|| {
@@ -4357,6 +4374,8 @@ enum RaftNodeRuntimeOp {
         RustRaftLogIndex,
         mpsc::Sender<Result<ReadIndexResponse, RaftError>>,
     ),
+    SetNodeHealthy(RustRaftNodeId, bool, mpsc::Sender<Result<(), RaftError>>),
+    SetLeaderLeaseValid(bool, mpsc::Sender<Result<(), RaftError>>),
     TransferLeader(RustRaftNodeId, mpsc::Sender<Result<(), RaftError>>),
     Campaign(bool, mpsc::Sender<Result<(), RaftError>>),
     Shutdown(mpsc::Sender<Result<(), RaftError>>),
@@ -4456,6 +4475,32 @@ impl RaftNodeRuntime {
             .send(RaftNodeRuntimeOp::ReadIndex(min_commit_index, reply_tx))
             .map_err(|err| {
                 RaftError::Transport(format!("failed to send read-index to raft node: {err}"))
+            })?;
+        recv_runtime_reply(reply_rx)?
+    }
+
+    pub fn set_node_healthy(
+        &self,
+        node_id: RustRaftNodeId,
+        healthy: bool,
+    ) -> Result<(), RaftError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender()?
+            .send(RaftNodeRuntimeOp::SetNodeHealthy(
+                node_id, healthy, reply_tx,
+            ))
+            .map_err(|err| {
+                RaftError::Transport(format!("failed to send health update to raft node: {err}"))
+            })?;
+        recv_runtime_reply(reply_rx)?
+    }
+
+    pub fn set_leader_lease_valid(&self, valid: bool) -> Result<(), RaftError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender()?
+            .send(RaftNodeRuntimeOp::SetLeaderLeaseValid(valid, reply_tx))
+            .map_err(|err| {
+                RaftError::Transport(format!("failed to send lease update to raft node: {err}"))
             })?;
         recv_runtime_reply(reply_rx)?
     }
@@ -4604,6 +4649,13 @@ fn raft_node_runtime_loop(
                 };
                 let _ = reply.send(cluster.read_index(request));
             }
+            RaftNodeRuntimeOp::SetNodeHealthy(target, healthy, reply) => {
+                let _ = reply.send(cluster.set_node_healthy(target, healthy));
+            }
+            RaftNodeRuntimeOp::SetLeaderLeaseValid(valid, reply) => {
+                cluster.set_leader_lease_valid(valid);
+                let _ = reply.send(Ok(()));
+            }
             RaftNodeRuntimeOp::TransferLeader(target, reply) => {
                 let _ = reply.send(cluster.transfer_leader(target));
             }
@@ -4623,6 +4675,8 @@ fn respond_runtime_error(command: RaftNodeRuntimeOp, error: RaftError) -> bool {
     match command {
         RaftNodeRuntimeOp::Start(reply)
         | RaftNodeRuntimeOp::Stop(reply)
+        | RaftNodeRuntimeOp::SetNodeHealthy(_, _, reply)
+        | RaftNodeRuntimeOp::SetLeaderLeaseValid(_, reply)
         | RaftNodeRuntimeOp::TransferLeader(_, reply)
         | RaftNodeRuntimeOp::Campaign(_, reply) => {
             let _ = reply.send(Err(error));

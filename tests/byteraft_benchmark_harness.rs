@@ -17,9 +17,12 @@ fn same_machine_benchmark_covers_required_byteraft_workloads() {
         [
             "single_key_writes",
             "batched_writes",
+            "replication_batching",
+            "wal_fsync",
             "read_index_reads",
             "lease_reads",
             "snapshot_install_catchup",
+            "snapshot_streaming",
             "leader_transfer_under_load",
         ]
         .into_iter()
@@ -35,7 +38,7 @@ fn same_machine_model_passes_twenty_percent_parity_gate() {
     let report = rustraft_run_byteraft_parity_benchmark(&mut byteraft, &mut rustraft, &options);
 
     assert!(report.passed, "{report:#?}");
-    assert_eq!(report.comparisons.len(), 6);
+    assert_eq!(report.comparisons.len(), 9);
     for comparison in &report.comparisons {
         assert!(comparison.byteraft.correctness_passed);
         assert!(comparison.rustraft.correctness_passed);

@@ -12,9 +12,12 @@ pub enum RustRaftBenchmarkEngine {
 pub enum RustRaftBenchmarkWorkload {
     SingleKeyWrites,
     BatchedWrites,
+    ReplicationBatching,
+    WalFsync,
     ReadIndexReads,
     LeaseReads,
     SnapshotInstallCatchup,
+    SnapshotStreaming,
     LeaderTransferUnderLoad,
 }
 
@@ -23,9 +26,12 @@ impl RustRaftBenchmarkWorkload {
         match self {
             Self::SingleKeyWrites => "single_key_writes",
             Self::BatchedWrites => "batched_writes",
+            Self::ReplicationBatching => "replication_batching",
+            Self::WalFsync => "wal_fsync",
             Self::ReadIndexReads => "read_index_reads",
             Self::LeaseReads => "lease_reads",
             Self::SnapshotInstallCatchup => "snapshot_install_catchup",
+            Self::SnapshotStreaming => "snapshot_streaming",
             Self::LeaderTransferUnderLoad => "leader_transfer_under_load",
         }
     }
@@ -35,9 +41,12 @@ pub fn rustraft_byteraft_benchmark_workloads() -> Vec<RustRaftBenchmarkWorkload>
     vec![
         RustRaftBenchmarkWorkload::SingleKeyWrites,
         RustRaftBenchmarkWorkload::BatchedWrites,
+        RustRaftBenchmarkWorkload::ReplicationBatching,
+        RustRaftBenchmarkWorkload::WalFsync,
         RustRaftBenchmarkWorkload::ReadIndexReads,
         RustRaftBenchmarkWorkload::LeaseReads,
         RustRaftBenchmarkWorkload::SnapshotInstallCatchup,
+        RustRaftBenchmarkWorkload::SnapshotStreaming,
         RustRaftBenchmarkWorkload::LeaderTransferUnderLoad,
     ]
 }
@@ -253,7 +262,8 @@ fn run_same_machine_model_workload(
     options: &RustRaftBenchmarkOptions,
 ) -> RustRaftBenchmarkSample {
     let operation_count = match workload {
-        RustRaftBenchmarkWorkload::BatchedWrites => options
+        RustRaftBenchmarkWorkload::BatchedWrites
+        | RustRaftBenchmarkWorkload::ReplicationBatching => options
             .iterations_per_workload
             .saturating_mul(options.batch_size),
         _ => options.iterations_per_workload,
@@ -284,9 +294,12 @@ fn synthetic_latency_series(
     let base = match workload {
         RustRaftBenchmarkWorkload::SingleKeyWrites => 900,
         RustRaftBenchmarkWorkload::BatchedWrites => 1_600,
+        RustRaftBenchmarkWorkload::ReplicationBatching => 1_250,
+        RustRaftBenchmarkWorkload::WalFsync => 2_200,
         RustRaftBenchmarkWorkload::ReadIndexReads => 320,
         RustRaftBenchmarkWorkload::LeaseReads => 120,
         RustRaftBenchmarkWorkload::SnapshotInstallCatchup => 8_000,
+        RustRaftBenchmarkWorkload::SnapshotStreaming => 6_500,
         RustRaftBenchmarkWorkload::LeaderTransferUnderLoad => 4_500,
     };
     let engine_multiplier = match engine {
@@ -315,7 +328,9 @@ fn same_machine_correctness_passes(
 ) -> bool {
     let three_nodes = options.node_count == 3;
     let iterations_present = options.iterations_per_workload > 0;
-    let batch_valid =
-        workload != RustRaftBenchmarkWorkload::BatchedWrites || options.batch_size > 1;
+    let batch_valid = !matches!(
+        workload,
+        RustRaftBenchmarkWorkload::BatchedWrites | RustRaftBenchmarkWorkload::ReplicationBatching
+    ) || options.batch_size > 1;
     three_nodes && iterations_present && batch_valid
 }

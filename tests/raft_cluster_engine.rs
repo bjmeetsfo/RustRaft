@@ -145,6 +145,7 @@ fn read_index_and_lease_read_follow_leader_lease_and_apply_floor() {
         .expect("read index");
     assert!(read_index.safe);
     assert!(!read_index.lease_read);
+    assert_eq!(read_index.reason, "read_index");
 
     let unsafe_read = cluster
         .read_index(RustRaftReadIndexRequest {
@@ -155,6 +156,27 @@ fn read_index_and_lease_read_follow_leader_lease_and_apply_floor() {
         })
         .expect("read index");
     assert!(!unsafe_read.safe);
+}
+
+#[test]
+fn read_index_rejects_when_live_quorum_is_lost() {
+    let mut cluster = three_node_cluster();
+    cluster.start().expect("cluster starts");
+    cluster.propose(b"set a=1".to_vec()).expect("propose");
+    cluster.set_node_healthy(2, false).expect("mark peer down");
+    cluster.set_node_healthy(3, false).expect("mark peer down");
+
+    let read = cluster
+        .read_index(RustRaftReadIndexRequest {
+            group_id: 7,
+            requester_id: 1,
+            min_commit_index: 1,
+            allow_lease_read: true,
+        })
+        .expect("read index");
+    assert!(!read.safe);
+    assert!(!read.lease_read);
+    assert_eq!(read.reason, "no_live_quorum");
 }
 
 #[test]

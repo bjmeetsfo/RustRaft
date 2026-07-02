@@ -50,6 +50,15 @@ fn node_runtime_lifecycle_drives_background_cluster() {
     let read = runtime.read_index(1).expect("read index");
     assert!(read.safe);
     assert_eq!(read.read_index, 1);
+    assert!(read.lease_read);
+
+    runtime
+        .set_leader_lease_valid(false)
+        .expect("stale leader lease");
+    let read = runtime.read_index(1).expect("read index without lease");
+    assert!(read.safe);
+    assert!(!read.lease_read);
+    assert_eq!(read.reason, "read_index");
 
     runtime.stop().expect("stop runtime");
     assert_eq!(runtime.state(), RaftNodeRuntimeState::Stopped);
@@ -63,6 +72,24 @@ fn node_runtime_lifecycle_drives_background_cluster() {
     runtime.shutdown().expect("shutdown runtime");
     assert_eq!(runtime.state(), RaftNodeRuntimeState::Shutdown);
     assert!(runtime.read_index(1).is_err());
+}
+
+#[test]
+fn node_runtime_read_index_rejects_without_live_quorum() {
+    let mut runtime = RaftNodeRuntime::create(node_options()).expect("create runtime");
+    runtime.start().expect("start runtime");
+    runtime.propose(b"write".to_vec()).expect("propose");
+    runtime
+        .set_node_healthy(2, false)
+        .expect("mark node 2 down");
+    runtime
+        .set_node_healthy(3, false)
+        .expect("mark node 3 down");
+
+    let read = runtime.read_index(1).expect("read index");
+    assert!(!read.safe);
+    assert!(!read.lease_read);
+    assert_eq!(read.reason, "no_live_quorum");
 }
 
 #[test]
