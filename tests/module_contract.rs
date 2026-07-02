@@ -7,7 +7,10 @@ use rustraft::{
     },
     metrics::rustraft_metric_names,
     node::{RaftNodeRuntime, RustRaftNodeOptions},
-    readiness::{rustraft_parity_report, RustRaftReadinessSnapshot},
+    readiness::{
+        rustraft_open_source_surface, rustraft_parity_report, rustraft_public_api_contract,
+        rustraft_temporalstore_adapter_shape, RustRaftReadinessSnapshot,
+    },
     snapshot::{
         PersistentRaftSnapshotStoreOptions, RaftSnapshot, RustRaftApplySnapshotFence,
         RustRaftSnapshotMeta,
@@ -159,4 +162,55 @@ fn public_modules_export_runtime_storage_wal_snapshot_and_transport_types() {
     let _vote = std::mem::size_of::<VoteRequest>();
     let _read_index_alias = std::mem::size_of::<ReadIndexRequest>();
     let _transport = std::mem::size_of::<&dyn RustRaftTransport>();
+}
+
+#[test]
+fn open_source_surface_names_modules_examples_reports_and_adapter_boundary() {
+    let api = rustraft_public_api_contract();
+    for module in [
+        "node",
+        "cluster",
+        "membership",
+        "wal",
+        "snapshot",
+        "transport",
+        "status",
+        "metrics",
+        "readiness",
+    ] {
+        assert!(api.public_modules.contains(&module.to_string()));
+    }
+    assert!(api
+        .embedding_examples
+        .contains(&"examples/open_source_surface.rs".to_string()));
+    assert!(api
+        .benchmark_interfaces
+        .contains(&"RustRaftBenchmarkRunner".to_string()));
+    assert!(api
+        .compatibility_reports
+        .contains(&"rustraft_production_readiness_report".to_string()));
+
+    let surface = rustraft_open_source_surface();
+    assert_eq!(surface.crate_name, "rustraft");
+    assert!(surface.public_modules.contains(&"wal".to_string()));
+    assert!(surface.embedding_docs.contains(&"README.md".to_string()));
+    assert!(surface
+        .byteraft_parity_matrix
+        .contains(&"leader_election".to_string()));
+    assert!(surface
+        .benchmark_harness_interface
+        .contains(&"rustraft_run_byteraft_parity_benchmark".to_string()));
+    assert!(surface
+        .compatibility_reports
+        .contains(&"rustraft_public_api_contract".to_string()));
+    assert!(surface
+        .temporalstore_adapter_boundary
+        .iter()
+        .any(|item| item.contains("TemporalStore command codecs")));
+    let adapter_shape = rustraft_temporalstore_adapter_shape();
+    assert_eq!(adapter_shape.node_field, "node");
+    assert!(adapter_shape.node_runtime_type.contains("RaftNodeRuntime"));
+    assert!(adapter_shape
+        .temporalstore_owned
+        .contains(&"apply semantics".to_string()));
 }

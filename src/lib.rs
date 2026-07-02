@@ -154,6 +154,17 @@ pub struct RustRaftProductionReadinessReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftProcessRolloutReadinessReport {
+    pub scope: String,
+    pub ready: bool,
+    pub production_status: RustRaftProductionStatus,
+    pub satisfied: Vec<String>,
+    pub missing: Vec<String>,
+    pub blockers: Vec<String>,
+    pub recommended_next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftReadinessEvidence {
     pub requirement_id: String,
     pub readiness_field: String,
@@ -180,9 +191,41 @@ pub struct RustRaftReadinessSnapshot {
 pub struct RustRaftPublicApiContract {
     pub storage_trait: String,
     pub transport_trait: String,
+    pub public_modules: Vec<String>,
     pub rpc_messages: Vec<String>,
     pub safety_helpers: Vec<String>,
+    pub embedding_examples: Vec<String>,
+    pub parity_reports: Vec<String>,
+    pub benchmark_interfaces: Vec<String>,
+    pub compatibility_reports: Vec<String>,
     pub metrics: RustRaftMetricNames,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftOpenSourceSurface {
+    pub crate_name: String,
+    pub public_modules: Vec<String>,
+    pub embedding_docs: Vec<String>,
+    pub embedding_examples: Vec<String>,
+    pub byteraft_parity_matrix: Vec<String>,
+    pub benchmark_harness_interface: Vec<String>,
+    pub compatibility_reports: Vec<String>,
+    pub rustraft_owned: Vec<String>,
+    pub temporalstore_adapter_boundary: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftTemporalStoreAdapterShape {
+    pub backend_type: String,
+    pub node_field: String,
+    pub node_runtime_type: String,
+    pub state_machine_type_parameter: String,
+    pub transport_type_parameter: String,
+    pub codec_field: String,
+    pub engine_field: String,
+    pub rustraft_owned: Vec<String>,
+    pub temporalstore_owned: Vec<String>,
+    pub example: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -7119,6 +7162,7 @@ pub fn rustraft_public_api_contract() -> RustRaftPublicApiContract {
     RustRaftPublicApiContract {
         storage_trait: "RustRaftStorage".to_string(),
         transport_trait: "RaftTransport".to_string(),
+        public_modules: rustraft_public_module_names(),
         rpc_messages: vec![
             "AppendEntriesRequest".to_string(),
             "AppendEntriesResponse".to_string(),
@@ -7142,7 +7186,164 @@ pub fn rustraft_public_api_contract() -> RustRaftPublicApiContract {
             "rustraft_learner_promotion_decision".to_string(),
             "rustraft_fatal_blocker_report".to_string(),
         ],
+        embedding_examples: rustraft_embedding_examples(),
+        parity_reports: rustraft_parity_report_names(),
+        benchmark_interfaces: rustraft_benchmark_interface_names(),
+        compatibility_reports: rustraft_compatibility_report_names(),
         metrics: rustraft_metric_names(),
+    }
+}
+
+pub fn rustraft_public_module_names() -> Vec<String> {
+    [
+        "node",
+        "cluster",
+        "config",
+        "membership",
+        "wal",
+        "snapshot",
+        "transport",
+        "status",
+        "metrics",
+        "readiness",
+        "storage",
+        "benchmark",
+        "fault",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn rustraft_embedding_examples() -> Vec<String> {
+    [
+        "examples/readiness_report.rs",
+        "examples/read_safety.rs",
+        "examples/byteraft_parity_benchmark.rs",
+        "examples/open_source_surface.rs",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn rustraft_parity_report_names() -> Vec<String> {
+    [
+        "rustraft_parity_report",
+        "rustraft_byteraft_parity_matrix",
+        "rustraft_byteraft_parity_surface",
+        "rustraft_byteraft_reference_policy",
+        "rustraft_durability_parity_report",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn rustraft_benchmark_interface_names() -> Vec<String> {
+    [
+        "RustRaftBenchmarkRunner",
+        "RustRaftBenchmarkOptions",
+        "RustRaftBenchmarkReport",
+        "rustraft_byteraft_benchmark_workloads",
+        "rustraft_run_byteraft_parity_benchmark",
+        "rustraft_assert_byteraft_parity",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn rustraft_compatibility_report_names() -> Vec<String> {
+    [
+        "rustraft_public_api_contract",
+        "rustraft_production_readiness_report",
+        "rustraft_data_node_process_rollout_readiness_report",
+        "rustraft_meta_process_rollout_readiness_report",
+        "rustraft_runtime_local_status_report",
+        "rustraft_runtime_admin_report",
+        "rustraft_fatal_blocker_report",
+        "rustraft_temporalstore_extraction_plan",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn rustraft_open_source_surface() -> RustRaftOpenSourceSurface {
+    RustRaftOpenSourceSurface {
+        crate_name: "rustraft".to_string(),
+        public_modules: rustraft_public_module_names(),
+        embedding_docs: vec!["README.md".to_string(), "docs/gap_plan.md".to_string()],
+        embedding_examples: rustraft_embedding_examples(),
+        byteraft_parity_matrix: rustraft_byteraft_parity_matrix(&RustRaftReadinessSnapshot {
+            rustraft_leader_write_authority_present: true,
+            rustraft_operator_observability_present: true,
+            rustraft_rpc_transport_contract_present: true,
+            rustraft_log_retention_snapshot_trigger_present: true,
+            rustraft_apply_snapshot_fence_present: true,
+            raft_storage_apply_fence_present: true,
+            rustraft_snapshot_floor_log_matching_present: true,
+            rustraft_snapshot_tail_catchup_present: true,
+            rustraft_compacted_entry_rejection_present: true,
+            rustraft_metaserver_snapshot_floor_election_present: true,
+            learner_catchup_promotion_present: true,
+            metaserver_membership_workflow_present: true,
+        })
+        .into_iter()
+        .map(|item| item.id)
+        .collect(),
+        benchmark_harness_interface: rustraft_benchmark_interface_names(),
+        compatibility_reports: rustraft_compatibility_report_names(),
+        rustraft_owned: vec![
+            "public Raft modules and generic types".to_string(),
+            "ByteRaft parity matrix and readiness reports".to_string(),
+            "benchmark harness traits and pass/fail reports".to_string(),
+            "transport/storage/state-machine contracts".to_string(),
+            "runtime status, metrics, blocker, and compatibility reports".to_string(),
+        ],
+        temporalstore_adapter_boundary: vec![
+            "TemporalStore command codecs".to_string(),
+            "TemporalEngine apply logic".to_string(),
+            "metaserver scheduler integration".to_string(),
+            "HTTP/process endpoints".to_string(),
+            "storage-object wiring and deployment docs".to_string(),
+        ],
+    }
+}
+
+pub fn rustraft_temporalstore_adapter_shape() -> RustRaftTemporalStoreAdapterShape {
+    RustRaftTemporalStoreAdapterShape {
+        backend_type: "TemporalRaftConsensusBackend".to_string(),
+        node_field: "node".to_string(),
+        node_runtime_type:
+            "rustraft::node::RaftNodeRuntime<TemporalStoreStateMachine, TemporalTransport>"
+                .to_string(),
+        state_machine_type_parameter: "TemporalStoreStateMachine".to_string(),
+        transport_type_parameter: "TemporalTransport".to_string(),
+        codec_field: "codec: TemporalCommandCodec".to_string(),
+        engine_field: "engine: TemporalEngine".to_string(),
+        rustraft_owned: vec![
+            "consensus node runtime".to_string(),
+            "leader election and campaign/pre-vote".to_string(),
+            "replication, read-index, lease-read safety".to_string(),
+            "membership transitions and learner/witness roles".to_string(),
+            "WAL, snapshot, transport, metrics, readiness contracts".to_string(),
+        ],
+        temporalstore_owned: vec![
+            "command encoding".to_string(),
+            "apply semantics".to_string(),
+            "storage engine".to_string(),
+            "process/admin integration".to_string(),
+        ],
+        example: [
+            "struct TemporalRaftConsensusBackend {",
+            "    node: rustraft::node::RaftNodeRuntime<TemporalStoreStateMachine, TemporalTransport>,",
+            "    codec: TemporalCommandCodec,",
+            "    engine: TemporalEngine,",
+            "}",
+        ]
+        .join("\n"),
     }
 }
 
@@ -7941,6 +8142,66 @@ pub fn rustraft_production_readiness_report(
         satisfied,
         missing,
         production_blockers,
+        recommended_next_actions,
+    }
+}
+
+pub fn rustraft_data_node_process_rollout_readiness_report(
+    rollout: &RustRaftDataNodeProcessRolloutReport,
+) -> RustRaftProcessRolloutReadinessReport {
+    let mut satisfied = Vec::new();
+    let mut missing = Vec::new();
+    let mut blockers = Vec::new();
+    let mut recommended_next_actions = Vec::new();
+    require_data_node_rollout(
+        Some(rollout),
+        &mut satisfied,
+        &mut missing,
+        &mut blockers,
+        &mut recommended_next_actions,
+    );
+    let ready = missing.is_empty() && blockers.is_empty();
+    RustRaftProcessRolloutReadinessReport {
+        scope: "data_node".to_string(),
+        ready,
+        production_status: if ready {
+            RustRaftProductionStatus::ProductionReady
+        } else {
+            RustRaftProductionStatus::Blocked
+        },
+        satisfied,
+        missing,
+        blockers,
+        recommended_next_actions,
+    }
+}
+
+pub fn rustraft_meta_process_rollout_readiness_report(
+    rollout: &RustRaftMetaProcessRolloutReport,
+) -> RustRaftProcessRolloutReadinessReport {
+    let mut satisfied = Vec::new();
+    let mut missing = Vec::new();
+    let mut blockers = Vec::new();
+    let mut recommended_next_actions = Vec::new();
+    require_meta_rollout(
+        Some(rollout),
+        &mut satisfied,
+        &mut missing,
+        &mut blockers,
+        &mut recommended_next_actions,
+    );
+    let ready = missing.is_empty() && blockers.is_empty();
+    RustRaftProcessRolloutReadinessReport {
+        scope: "metaserver".to_string(),
+        ready,
+        production_status: if ready {
+            RustRaftProductionStatus::ProductionReady
+        } else {
+            RustRaftProductionStatus::Blocked
+        },
+        satisfied,
+        missing,
+        blockers,
         recommended_next_actions,
     }
 }

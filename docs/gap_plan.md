@@ -29,6 +29,13 @@ startup, object/page storage, and admin endpoints.
 - `temporalstore-rust` converts `RaftDistributedReadiness` into a
   `RustRaftReadinessSnapshot`, then asks the `rustraft` library to build the
   report.
+- Data-node and metaserver process-rollout evidence can be validated directly
+  with `rustraft_data_node_process_rollout_readiness_report()` and
+  `rustraft_meta_process_rollout_readiness_report()`.
+- `rustraft_temporalstore_adapter_shape()` records the desired consumer shape:
+  `TemporalRaftConsensusBackend` owns a
+  `rustraft::node::RaftNodeRuntime<TemporalStoreStateMachine, TemporalTransport>`
+  plus TemporalStore-owned command codec and engine fields.
 - The library now owns stable production-boundary APIs for:
   - `RustRaftConsensus`
   - `RustRaftStateMachine`
@@ -93,6 +100,13 @@ RustRaft while making TemporalStore-specific adapter boundaries explicit.
 The public `rustraft_fault_harness_readiness_report()` function is the
 fail-closed contract for ByteRaft-derived process-path fault evidence; real
 TemporalStore harnesses still need to provide the observed process reports.
+The public process-rollout readiness helpers are the matching fail-closed
+contract for spawned-process rollout evidence, including independent WAL and
+snapshot dirs, process API writes/mutations, read-index responses, restart
+recovery, log-store inspection, and operational semantics.
+TemporalStore adapter docs should live with TemporalStore and show how
+`TemporalRaftConsensusBackend` wires command encoding, apply semantics, the
+storage engine, and process/admin integration around the RustRaft-owned runtime.
 
 ## Implementation Order
 

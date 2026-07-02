@@ -15,6 +15,7 @@ License: Apache-2.0.
 - `RustRaftParityReport`
 - `RustRaftProductionReadinessInput`
 - `RustRaftProductionReadinessReport`
+- `RustRaftProcessRolloutReadinessReport`
 - `RustRaftProductionStatus`
 - `RustRaftStorage`
 - `RustRaftTransport`
@@ -35,7 +36,11 @@ License: Apache-2.0.
 - `rustraft_parity_contract`
 - `rustraft_parity_report`
 - `rustraft_production_readiness_report`
+- `rustraft_data_node_process_rollout_readiness_report`
+- `rustraft_meta_process_rollout_readiness_report`
 - `rustraft_public_api_contract`
+- `rustraft_open_source_surface`
+- `rustraft_temporalstore_adapter_shape`
 - `rustraft_temporalstore_extraction_plan`
 - `rustraft_metric_names`
 
@@ -63,6 +68,9 @@ surface in TemporalStore readiness gates and CI.
 `rustraft_production_readiness_report` is the fail-closed deployment gate. It
 wraps the semantic parity report with runtime evidence for peer pipeline,
 snapshot lifecycle, WAL lifecycle, data-node rollout, and metaserver rollout.
+The data-node and metaserver rollout report helpers expose the same fail-closed
+process-path checks independently, so TemporalStore and downstream adopters can
+validate spawned-process evidence before composing the full production report.
 
 ## Why It Lives Separately
 
@@ -101,6 +109,36 @@ ledger. It records which Raft responsibilities are already owned by this
 standalone crate, which remain pending migration, and which must stay as
 TemporalStore-specific adapters.
 
+## Open Source Surface
+
+RustRaft exposes its standalone boundary through public modules for `node`,
+`cluster`, `membership`, `wal`, `snapshot`, `transport`, `status`, `metrics`,
+`readiness`, `storage`, `benchmark`, and `fault`. The
+`rustraft_open_source_surface()` report names those modules, embedding examples,
+ByteRaft parity matrix entries, benchmark harness APIs, and compatibility
+reports so consumers can check the published surface without scraping docs.
+
+RustRaft owns generic Raft contracts, parity/readiness reports, benchmark
+interfaces, transport/storage/state-machine traits, and status/metrics surfaces.
+TemporalStore keeps adapter docs and implementation details for command codecs,
+TemporalEngine apply logic, metaserver scheduling, HTTP/process endpoints, and
+storage-object wiring.
+
+The intended TemporalStore adapter shape is:
+
+```rust
+struct TemporalRaftConsensusBackend {
+    node: rustraft::node::RaftNodeRuntime<TemporalStoreStateMachine, TemporalTransport>,
+    codec: TemporalCommandCodec,
+    engine: TemporalEngine,
+}
+```
+
+`rustraft_temporalstore_adapter_shape()` exposes this as a typed compatibility
+report. RustRaft owns consensus behavior inside the node runtime; TemporalStore
+owns command encoding, apply semantics, storage engine integration, and
+process/admin surfaces.
+
 The fault-harness API names the ByteRaft-derived process scenarios that
 TemporalStore must prove with spawned data-node and metaserver processes:
 packet loss, slow WAL fsync, snapshot during membership change, leader transfer
@@ -131,5 +169,11 @@ Run the read-safety policy example:
 cargo run --example read_safety
 ```
 
-Both examples are also covered by integration tests so the public snippets stay
+Inspect the open-source embedding surface:
+
+```bash
+cargo run --example open_source_surface
+```
+
+These examples are also covered by integration tests so the public snippets stay
 in sync with the crate API.

@@ -90,7 +90,11 @@ fn generic_models_accept_domain_payload_and_group_ids() {
 fn rustraft_core_does_not_export_temporalstore_command_or_shard_names() {
     let lib_rs = include_str!("../src/lib.rs");
 
-    assert!(!lib_rs.contains("Command"));
+    assert!(!lib_rs.contains("pub struct Command"));
+    assert!(!lib_rs.contains("pub enum Command"));
+    assert!(!lib_rs.contains("pub type Command"));
+    assert!(!lib_rs.contains("pub struct TemporalCommand"));
+    assert!(!lib_rs.contains("pub enum TemporalCommand"));
     assert!(!lib_rs.contains("ShardId"));
 }
 

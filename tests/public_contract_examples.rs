@@ -1,5 +1,6 @@
 use rustraft::{
-    rustraft_parity_report, rustraft_read_safety_decision, rustraft_temporalstore_extraction_plan,
+    readiness::rustraft_temporalstore_adapter_shape, rustraft_parity_report,
+    rustraft_read_safety_decision, rustraft_temporalstore_extraction_plan,
     RustRaftExtractionStatus, RustRaftProductionStatus, RustRaftReadIndexRequest,
     RustRaftReadinessSnapshot, RustRaftRole, RustRaftStatusSnapshot,
 };
@@ -79,4 +80,35 @@ fn extraction_plan_keeps_reusable_raft_logic_out_of_temporalstore() {
         .any(|slice| slice.id == "domain_fsm_adapters"
             && slice.status == RustRaftExtractionStatus::AdapterOnly
             && slice.temporalstore_boundary.contains("TemporalStore owns")));
+}
+
+#[test]
+fn temporalstore_adapter_shape_keeps_consensus_inside_rustraft_runtime() {
+    let shape = rustraft_temporalstore_adapter_shape();
+    assert_eq!(shape.backend_type, "TemporalRaftConsensusBackend");
+    assert_eq!(shape.node_field, "node");
+    assert_eq!(
+        shape.node_runtime_type,
+        "rustraft::node::RaftNodeRuntime<TemporalStoreStateMachine, TemporalTransport>"
+    );
+    assert_eq!(shape.codec_field, "codec: TemporalCommandCodec");
+    assert_eq!(shape.engine_field, "engine: TemporalEngine");
+    assert!(shape
+        .rustraft_owned
+        .iter()
+        .any(|item| item.contains("consensus node runtime")));
+    for temporalstore_owned in [
+        "command encoding",
+        "apply semantics",
+        "storage engine",
+        "process/admin integration",
+    ] {
+        assert!(shape
+            .temporalstore_owned
+            .contains(&temporalstore_owned.to_string()));
+    }
+    assert!(shape
+        .example
+        .contains("struct TemporalRaftConsensusBackend"));
+    assert!(shape.example.contains("RaftNodeRuntime"));
 }
