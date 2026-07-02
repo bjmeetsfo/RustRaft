@@ -282,6 +282,17 @@ fn ready_input() -> RustRaftProductionReadinessInput {
         data_node_rollout: Some(ready_data_rollout()),
         metaserver_rollout: Some(ready_meta_rollout()),
         membership_transitions: transitions(),
+        byteraft_benchmark: Some(rustraft::RustRaftByteRaftBenchmarkEvidence {
+            real_byteraft: true,
+            rustraft_runtime: true,
+            correctness_passed: true,
+            performance_within_threshold: true,
+            workloads: rustraft::benchmark::rustraft_byteraft_benchmark_workloads()
+                .into_iter()
+                .map(|workload| workload.id().to_string())
+                .collect(),
+            blockers: Vec::new(),
+        }),
     }
 }
 

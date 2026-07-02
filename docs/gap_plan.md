@@ -38,6 +38,9 @@ startup, object/page storage, and admin endpoints.
   semantics, snapshot sender/downloader lifecycle, WAL segment lifecycle,
   read-index/lease safety, membership role semantics, FSM apply atomicity, and
   admin/metrics observability.
+- Real ByteRaft benchmark evidence is now a production readiness input. The
+  benchmark gate fails closed when the ByteRaft side or RustRaft side reports a
+  model source instead of a real ByteRaft harness plus RustRaft runtime runner.
 - Generic Prometheus text output for the same capability families is available
   through `rustraft_byteraft_runtime_capability_prometheus()`, reducing the
   product-local metric logic TemporalStore needs to carry.
@@ -102,6 +105,7 @@ if production_status != production_ready:
 | Metrics model | RustRaft metric names and status snapshots exist; runtime exporters still need to emit them everywhere. | Wire `RustRaftMetricNames` and `RustRaftStatusSnapshot` into TemporalStore metrics/admin endpoints. | Grafana/Prometheus parity checks. |
 | Fault harness API | Fault cases are currently driven by TemporalStore harnesses. | Add a library-level deterministic harness for partitions, packet loss, slow WAL, restart, compaction, and snapshot install. | `raft_rustraft_*_fault_harness` cases. |
 | Storage adapter boundary | Stable RustRaft storage trait exists; durable storage implementation remains TemporalStore-specific. | Implement `RustRaftStorage` for TemporalStore log/snapshot storage adapters. | Storage recovery and compaction gates. |
+| Real ByteRaft binary availability | The benchmark runner is wired, but the private ByteRaft checkout/harness may be absent from a machine. | Provide or build `byteraft_parity_benchmark` under `BYTERAFT_ROOT`, or point `BYTERAFT_BENCHMARK_BIN` at it. | `scripts/byteraft_vs_rustraft_benchmark.sh` fails closed with `benchmark:real_byteraft_missing`. |
 
 The public `rustraft_temporalstore_extraction_plan()` function is the source of
 truth for this migration ledger. It keeps reusable consensus behavior in

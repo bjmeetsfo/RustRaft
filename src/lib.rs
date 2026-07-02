@@ -139,6 +139,8 @@ pub struct RustRaftProductionReadinessInput {
     pub metaserver_rollout: Option<RustRaftMetaProcessRolloutReport>,
     #[serde(default)]
     pub membership_transitions: Vec<RustRaftMembershipTransitionEvidence>,
+    #[serde(default)]
+    pub byteraft_benchmark: Option<RustRaftByteRaftBenchmarkEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,6 +153,16 @@ pub struct RustRaftProductionReadinessReport {
     pub missing: Vec<String>,
     pub production_blockers: Vec<String>,
     pub recommended_next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftByteRaftBenchmarkEvidence {
+    pub real_byteraft: bool,
+    pub rustraft_runtime: bool,
+    pub correctness_passed: bool,
+    pub performance_within_threshold: bool,
+    pub workloads: Vec<String>,
+    pub blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -7276,11 +7288,15 @@ pub fn rustraft_parity_report_names() -> Vec<String> {
 pub fn rustraft_benchmark_interface_names() -> Vec<String> {
     [
         "RustRaftBenchmarkRunner",
+        "RustRaftExternalByteRaftRunner",
+        "RustRaftRuntimeBenchmarkRunner",
         "RustRaftBenchmarkOptions",
         "RustRaftBenchmarkReport",
         "rustraft_byteraft_benchmark_workloads",
         "rustraft_run_byteraft_parity_benchmark",
         "rustraft_assert_byteraft_parity",
+        "rustraft_assert_production_byteraft_parity",
+        "rustraft_byteraft_benchmark_evidence",
     ]
     .into_iter()
     .map(str::to_string)
@@ -8275,6 +8291,13 @@ pub fn rustraft_production_readiness_report(
         &mut production_blockers,
         &mut recommended_next_actions,
     );
+    require_byteraft_benchmark(
+        input.byteraft_benchmark.as_ref(),
+        &mut satisfied,
+        &mut missing,
+        &mut production_blockers,
+        &mut recommended_next_actions,
+    );
 
     let ready = missing.is_empty() && production_blockers.is_empty();
     RustRaftProductionReadinessReport {
@@ -8290,6 +8313,66 @@ pub fn rustraft_production_readiness_report(
         missing,
         production_blockers,
         recommended_next_actions,
+    }
+}
+
+fn require_byteraft_benchmark(
+    benchmark: Option<&RustRaftByteRaftBenchmarkEvidence>,
+    satisfied: &mut Vec<String>,
+    missing: &mut Vec<String>,
+    blockers: &mut Vec<String>,
+    actions: &mut Vec<String>,
+) {
+    require_option(
+        "benchmark:evidence_present",
+        benchmark,
+        satisfied,
+        missing,
+        blockers,
+        actions,
+        "attach real ByteRaft-vs-RustRaft benchmark evidence",
+    );
+    let Some(benchmark) = benchmark else {
+        blockers.push("benchmark:real_byteraft_missing".to_string());
+        return;
+    };
+    for (present, id, action) in [
+        (
+            benchmark.real_byteraft,
+            "benchmark:real_byteraft",
+            "run the benchmark against a real ByteRaft binary",
+        ),
+        (
+            benchmark.rustraft_runtime,
+            "benchmark:rustraft_runtime",
+            "run the benchmark against the RustRaft runtime runner",
+        ),
+        (
+            benchmark.correctness_passed,
+            "benchmark:correctness",
+            "fix correctness failures before measuring performance",
+        ),
+        (
+            benchmark.performance_within_threshold,
+            "benchmark:performance_threshold",
+            "bring RustRaft p50/p99 latency and throughput within the configured ByteRaft threshold",
+        ),
+    ] {
+        require_bool(present, id, satisfied, missing, blockers, actions, action);
+    }
+    for workload in &benchmark.workloads {
+        satisfied.push(format!("benchmark:workload:{workload}"));
+    }
+    for blocker in &benchmark.blockers {
+        require_bool(
+            false,
+            blocker,
+            satisfied,
+            missing,
+            blockers,
+            actions,
+            "clear ByteRaft benchmark blocker",
+        );
     }
 }
 
@@ -10235,6 +10318,17 @@ mod tests {
             data_node_rollout: Some(ready_data_node_rollout()),
             metaserver_rollout: Some(ready_meta_rollout()),
             membership_transitions: ready_membership_transitions(),
+            byteraft_benchmark: Some(RustRaftByteRaftBenchmarkEvidence {
+                real_byteraft: true,
+                rustraft_runtime: true,
+                correctness_passed: true,
+                performance_within_threshold: true,
+                workloads: crate::benchmark::rustraft_byteraft_benchmark_workloads()
+                    .into_iter()
+                    .map(|workload| workload.id().to_string())
+                    .collect(),
+                blockers: Vec::new(),
+            }),
         }
     }
 
@@ -10288,6 +10382,7 @@ mod tests {
             data_node_rollout: None,
             metaserver_rollout: None,
             membership_transitions: Vec::new(),
+            byteraft_benchmark: None,
         });
         assert!(!report.ready);
         assert_eq!(report.production_status, RustRaftProductionStatus::Blocked);
@@ -10308,6 +10403,39 @@ mod tests {
             .missing
             .iter()
             .any(|item| item == "membership:datanode:scaledown:evidence_present"));
+        assert!(report
+            .missing
+            .contains(&"benchmark:evidence_present".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"benchmark:real_byteraft_missing".to_string()));
+    }
+
+    #[test]
+    fn production_readiness_gate_rejects_model_only_benchmark_evidence() {
+        let mut input = ready_production_input();
+        input.byteraft_benchmark = Some(RustRaftByteRaftBenchmarkEvidence {
+            real_byteraft: false,
+            rustraft_runtime: false,
+            correctness_passed: true,
+            performance_within_threshold: true,
+            workloads: vec!["single_key_writes".to_string()],
+            blockers: vec![
+                "benchmark:model_byteraft:single_key_writes".to_string(),
+                "benchmark:model_rustraft:single_key_writes".to_string(),
+            ],
+        });
+        let report = rustraft_production_readiness_report(&input);
+        assert!(!report.ready);
+        assert!(report
+            .production_blockers
+            .contains(&"benchmark:real_byteraft".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"benchmark:rustraft_runtime".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"benchmark:model_byteraft:single_key_writes".to_string()));
     }
 
     #[test]

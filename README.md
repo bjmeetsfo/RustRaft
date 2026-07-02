@@ -83,6 +83,13 @@ semantics, FSM apply atomicity, and admin/metrics observability.
 TemporalStore can attach their own service labels without duplicating the
 capability-matrix logic.
 
+Production readiness also requires real ByteRaft benchmark evidence. Model
+benchmark runners remain available for unit tests, but
+`rustraft_production_readiness_report()` blocks production claims unless
+benchmark evidence proves a real ByteRaft harness and the RustRaft runtime ran
+the same 3-node workloads and passed correctness plus the configured latency and
+throughput threshold.
+
 ## Why It Lives Separately
 
 Keeping RustRaft in a separate repository gives TemporalStore a stable
@@ -207,12 +214,15 @@ cargo run --example open_source_surface
 Run the standalone ByteRaft-vs-RustRaft benchmark script from the RustRaft repo:
 
 ```bash
-bash scripts/byteraft_vs_rustraft_benchmark.sh --out target/byteraft-vs-rustraft-benchmark/report.json
+BYTERAFT_ROOT=/path/to/byteraft \
+  bash scripts/byteraft_vs_rustraft_benchmark.sh \
+  --out target/byteraft-vs-rustraft-benchmark/report.json
 ```
 
-The script does not enter or depend on the TemporalStore checkout. It records an
-optional `--byteraft-root` path for real ByteRaft binary wiring while the current
-same-machine harness uses the built-in ByteRaft reference model.
+The script does not enter or depend on the TemporalStore checkout. It fails
+closed with `benchmark:real_byteraft_missing` unless `BYTERAFT_ROOT` contains a
+`byteraft_parity_benchmark` harness or `BYTERAFT_BENCHMARK_BIN` points to one.
+The model runner is intentionally not used for production parity.
 
 These examples are also covered by integration tests so the public snippets stay
 in sync with the crate API.

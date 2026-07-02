@@ -1,8 +1,9 @@
 use rustraft::benchmark::{
-    rustraft_assert_byteraft_parity, rustraft_byteraft_benchmark_workloads,
-    rustraft_run_byteraft_parity_benchmark, RustRaftBenchmarkEngine, RustRaftBenchmarkOptions,
-    RustRaftBenchmarkRunner, RustRaftBenchmarkSample, RustRaftBenchmarkWorkload,
-    RustRaftSameMachineModelRunner,
+    rustraft_assert_byteraft_parity, rustraft_assert_production_byteraft_parity,
+    rustraft_byteraft_benchmark_evidence, rustraft_byteraft_benchmark_workloads,
+    rustraft_run_byteraft_parity_benchmark, RustRaftBenchmarkEngine, RustRaftBenchmarkEngineSource,
+    RustRaftBenchmarkOptions, RustRaftBenchmarkRunner, RustRaftBenchmarkSample,
+    RustRaftBenchmarkWorkload, RustRaftRuntimeBenchmarkRunner, RustRaftSameMachineModelRunner,
 };
 
 #[test]
@@ -36,6 +37,8 @@ fn external_benchmark_script_runs_outside_temporalstore() {
 
     assert!(script.contains("--manifest-path \"$rustraft_root/Cargo.toml\""));
     assert!(script.contains("--example byteraft_parity_benchmark"));
+    assert!(script.contains("BYTERAFT_BENCHMARK_BIN"));
+    assert!(script.contains("benchmark:real_byteraft_missing"));
     assert!(script.contains("BYTERAFT_ROOT"));
     assert!(script.contains("BENCHMARK_OUT"));
     assert!(!script.contains("TemporalStore.git"));
@@ -59,6 +62,9 @@ fn same_machine_model_passes_twenty_percent_parity_gate() {
         assert!(comparison.throughput_ratio >= 0.8, "{comparison:#?}");
     }
     rustraft_assert_byteraft_parity(&report).unwrap();
+    let error = rustraft_assert_production_byteraft_parity(&report).unwrap_err();
+    assert!(error.contains("benchmark:real_byteraft_missing"));
+    assert!(error.contains("benchmark:model_rustraft"));
 }
 
 #[test]
@@ -66,6 +72,7 @@ fn parity_gate_fails_when_correctness_or_perf_regresses() {
     let options = RustRaftBenchmarkOptions::default();
     let mut byteraft = FixedRunner::new(
         RustRaftBenchmarkEngine::ByteRaft,
+        RustRaftBenchmarkEngineSource::RealByteRaft,
         true,
         1_000,
         2_000,
@@ -73,6 +80,7 @@ fn parity_gate_fails_when_correctness_or_perf_regresses() {
     );
     let mut rustraft = FixedRunner::new(
         RustRaftBenchmarkEngine::RustRaft,
+        RustRaftBenchmarkEngineSource::RustRaftRuntime,
         false,
         1_300,
         2_500,
@@ -89,8 +97,60 @@ fn parity_gate_fails_when_correctness_or_perf_regresses() {
     assert!(error.contains("throughput_ratio"));
 }
 
+#[test]
+fn production_parity_accepts_real_byteraft_and_rustraft_runtime_sources() {
+    let options = RustRaftBenchmarkOptions {
+        iterations_per_workload: 4,
+        batch_size: 2,
+        ..Default::default()
+    };
+    let mut byteraft = FixedRunner::new(
+        RustRaftBenchmarkEngine::ByteRaft,
+        RustRaftBenchmarkEngineSource::RealByteRaft,
+        true,
+        1_000,
+        2_000,
+        1_000.0,
+    );
+    let mut rustraft = FixedRunner::new(
+        RustRaftBenchmarkEngine::RustRaft,
+        RustRaftBenchmarkEngineSource::RustRaftRuntime,
+        true,
+        1_100,
+        2_100,
+        900.0,
+    );
+    let report = rustraft_run_byteraft_parity_benchmark(&mut byteraft, &mut rustraft, &options);
+    rustraft_assert_production_byteraft_parity(&report).unwrap();
+    let evidence = rustraft_byteraft_benchmark_evidence(&report);
+    assert!(evidence.real_byteraft);
+    assert!(evidence.rustraft_runtime);
+    assert!(evidence.correctness_passed);
+    assert!(evidence.performance_within_threshold);
+    assert_eq!(evidence.workloads.len(), 9);
+}
+
+#[test]
+fn rustraft_runtime_runner_uses_runtime_source_not_model_source() {
+    let options = RustRaftBenchmarkOptions {
+        iterations_per_workload: 2,
+        batch_size: 2,
+        ..Default::default()
+    };
+    let mut runner = RustRaftRuntimeBenchmarkRunner::new("test");
+    let sample = runner.run_workload(RustRaftBenchmarkWorkload::SingleKeyWrites, &options);
+    assert_eq!(sample.engine, RustRaftBenchmarkEngine::RustRaft);
+    assert_eq!(
+        sample.engine_source,
+        RustRaftBenchmarkEngineSource::RustRaftRuntime
+    );
+    assert!(sample.correctness_passed);
+    assert_eq!(sample.node_count, 3);
+}
+
 struct FixedRunner {
     engine: RustRaftBenchmarkEngine,
+    source: RustRaftBenchmarkEngineSource,
     correctness_passed: bool,
     p50_latency_micros: u64,
     p99_latency_micros: u64,
@@ -100,6 +160,7 @@ struct FixedRunner {
 impl FixedRunner {
     fn new(
         engine: RustRaftBenchmarkEngine,
+        source: RustRaftBenchmarkEngineSource,
         correctness_passed: bool,
         p50_latency_micros: u64,
         p99_latency_micros: u64,
@@ -107,6 +168,7 @@ impl FixedRunner {
     ) -> Self {
         Self {
             engine,
+            source,
             correctness_passed,
             p50_latency_micros,
             p99_latency_micros,
@@ -120,6 +182,10 @@ impl RustRaftBenchmarkRunner for FixedRunner {
         self.engine
     }
 
+    fn engine_source(&self) -> RustRaftBenchmarkEngineSource {
+        self.source
+    }
+
     fn run_workload(
         &mut self,
         workload: RustRaftBenchmarkWorkload,
@@ -128,6 +194,10 @@ impl RustRaftBenchmarkRunner for FixedRunner {
         RustRaftBenchmarkSample {
             workload,
             engine: self.engine,
+            engine_source: self.source,
+            binary_path: Some(format!("{:?}-benchmark", self.engine)),
+            git_revision: Some("test-revision".to_string()),
+            build_profile: "test".to_string(),
             node_count: options.node_count,
             operation_count: options.iterations_per_workload,
             p50_latency_micros: self.p50_latency_micros,
