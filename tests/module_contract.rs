@@ -1,0 +1,162 @@
+use rustraft::{
+    cluster::{RaftCluster, RustRaftConsensus, RustRaftReadIndexRequest},
+    config::{RaftConfig, RustRaftConfig},
+    membership::{
+        JointConsensusMembership, RaftMembershipExecutor, RaftMembershipOperation, RustRaftPeer,
+        RustRaftReplicaRole,
+    },
+    metrics::rustraft_metric_names,
+    node::{RaftNodeRuntime, RustRaftNodeOptions},
+    readiness::{rustraft_parity_report, RustRaftReadinessSnapshot},
+    snapshot::{
+        PersistentRaftSnapshotStoreOptions, RaftSnapshot, RustRaftApplySnapshotFence,
+        RustRaftSnapshotMeta,
+    },
+    status::{rustraft_cluster_status_report, RaftHealthStatus},
+    transport::{AppendEntriesRequest, ReadIndexRequest, RustRaftTransport, VoteRequest},
+    wal::{PersistentRaftWalOptions, RaftHardState, RaftWalRecord},
+};
+
+fn peer(node_id: u64, role: RustRaftReplicaRole) -> RustRaftPeer {
+    RustRaftPeer {
+        node_id,
+        raft_addr: format!("127.0.0.1:{}", 23_000 + node_id),
+        snapshot_addr: format!("127.0.0.1:{}", 24_000 + node_id),
+        role,
+        auto_promote: false,
+    }
+}
+
+fn module_cluster() -> RaftCluster {
+    RaftCluster::new(
+        707,
+        RaftConfig::default(),
+        vec![
+            peer(1, RustRaftReplicaRole::Voter),
+            peer(2, RustRaftReplicaRole::Voter),
+            peer(3, RustRaftReplicaRole::Voter),
+        ],
+    )
+    .expect("module cluster")
+}
+
+#[test]
+fn public_modules_expose_temporalstore_consumption_boundary() {
+    let mut cluster = module_cluster();
+    RustRaftConsensus::start(&mut cluster).expect("start through cluster module");
+    let log_id =
+        RustRaftConsensus::propose(&mut cluster, b"module-write".to_vec(), Default::default())
+            .expect("propose through cluster module");
+    assert_eq!(log_id.index, 1);
+
+    let read = cluster
+        .read_index(RustRaftReadIndexRequest {
+            group_id: 707,
+            requester_id: 1,
+            min_commit_index: 1,
+            allow_lease_read: true,
+        })
+        .expect("read index through cluster module");
+    assert!(read.safe);
+    assert!(read.lease_read);
+    assert!(cluster.lease_read_eligible(1, 1).expect("lease eligible"));
+
+    cluster
+        .campaign(2, false)
+        .expect("campaign/pre-vote surface");
+    cluster.transfer_leader(1).expect("leader transfer surface");
+
+    let mut executor = RaftMembershipExecutor::new();
+    executor
+        .execute(
+            &mut cluster,
+            RaftMembershipOperation::AddLearner(peer(4, RustRaftReplicaRole::Voter)),
+        )
+        .expect("add learner through membership module");
+    assert!(cluster.membership().learners.contains(&4));
+
+    let snapshot = RaftSnapshot {
+        group_id: 707,
+        meta: RustRaftSnapshotMeta {
+            snapshot_id: "module-contract-catchup".to_string(),
+            last_log_id: log_id,
+            membership: vec![1, 2, 3, 4],
+        },
+        payload: b"snapshot".to_vec(),
+    };
+    cluster
+        .install_snapshot_to(
+            4,
+            snapshot,
+            RustRaftApplySnapshotFence {
+                applied_index: 1,
+                commit_index: 1,
+                installed_snapshot_index: 1,
+                first_retained_log_index: 2,
+            },
+        )
+        .expect("snapshot catch-up through snapshot module");
+
+    executor
+        .execute_all(
+            &mut cluster,
+            vec![
+                RaftMembershipOperation::Promote(4),
+                RaftMembershipOperation::AddWitness(peer(5, RustRaftReplicaRole::Voter)),
+                RaftMembershipOperation::Remove(3),
+            ],
+        )
+        .expect("membership workflow through module boundary");
+    let membership = cluster.membership();
+    assert!(membership.voters.contains(&4));
+    assert!(membership.witnesses.contains(&5));
+    assert!(!membership.voters.contains(&3));
+
+    let report = rustraft_cluster_status_report(
+        cluster.group_id,
+        cluster.leader_id(),
+        vec![cluster.status(1).expect("node status")],
+    );
+    assert_eq!(report.health, RaftHealthStatus::Degraded);
+    assert_eq!(report.leader_id, Some(1));
+
+    let readiness = RustRaftReadinessSnapshot {
+        rustraft_leader_write_authority_present: true,
+        rustraft_operator_observability_present: true,
+        rustraft_rpc_transport_contract_present: true,
+        rustraft_log_retention_snapshot_trigger_present: true,
+        rustraft_apply_snapshot_fence_present: true,
+        raft_storage_apply_fence_present: true,
+        rustraft_snapshot_floor_log_matching_present: true,
+        rustraft_snapshot_tail_catchup_present: true,
+        rustraft_compacted_entry_rejection_present: true,
+        rustraft_metaserver_snapshot_floor_election_present: true,
+        learner_catchup_promotion_present: true,
+        metaserver_membership_workflow_present: true,
+    };
+    assert!(rustraft_parity_report(&readiness).ready);
+    assert!(!rustraft_metric_names().append_latency_ms.is_empty());
+}
+
+#[test]
+fn public_modules_export_runtime_storage_wal_snapshot_and_transport_types() {
+    let _node_options = std::mem::size_of::<RustRaftNodeOptions>();
+    let _node_runtime = std::mem::size_of::<RaftNodeRuntime>();
+    let _config = RustRaftConfig::default();
+    let _joint = std::mem::size_of::<JointConsensusMembership>();
+
+    let wal_options =
+        PersistentRaftWalOptions::new(std::env::temp_dir().join("rustraft-module-wal"));
+    assert!(wal_options.validate().is_ok());
+    let _hard_state = std::mem::size_of::<RaftHardState>();
+    let _wal_record = std::mem::size_of::<RaftWalRecord>();
+
+    let snapshot_options =
+        PersistentRaftSnapshotStoreOptions::new(std::env::temp_dir().join("rustraft-module-snap"));
+    assert!(snapshot_options.chunk_size > 0);
+
+    let _append = std::mem::size_of::<AppendEntriesRequest>();
+    let _vote = std::mem::size_of::<VoteRequest>();
+    let _read_index_alias = std::mem::size_of::<ReadIndexRequest>();
+    let _transport = std::mem::size_of::<&dyn RustRaftTransport>();
+}

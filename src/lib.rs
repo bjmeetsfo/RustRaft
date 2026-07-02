@@ -39,6 +39,17 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub mod benchmark;
+pub mod cluster;
+pub mod config;
+pub mod membership;
+pub mod metrics;
+pub mod node;
+pub mod readiness;
+pub mod snapshot;
+pub mod status;
+pub mod storage;
+pub mod transport;
+pub mod wal;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
