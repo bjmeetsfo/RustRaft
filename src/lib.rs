@@ -26,6 +26,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 
 pub mod benchmark;
@@ -2524,6 +2527,333 @@ impl RustRaftConsensus for RaftCluster {
             membership: self.node_ids(),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RaftNodeRuntimeState {
+    Created,
+    Running,
+    Stopped,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftNodeRuntimeStatus {
+    pub node_id: RustRaftNodeId,
+    pub group_id: RustRaftGroupId,
+    pub state: RaftNodeRuntimeState,
+    pub restart_count: u64,
+    pub worker_running: bool,
+    pub cluster_status: Option<RaftClusterStatusReport>,
+}
+
+enum RaftNodeRuntimeOp {
+    Start(mpsc::Sender<Result<(), RaftError>>),
+    Stop(mpsc::Sender<Result<(), RaftError>>),
+    Status(mpsc::Sender<Result<RaftNodeRuntimeStatus, RaftError>>),
+    Propose(
+        RustRaftPayload,
+        mpsc::Sender<Result<RustRaftLogId, RaftError>>,
+    ),
+    ReadIndex(
+        RustRaftLogIndex,
+        mpsc::Sender<Result<ReadIndexResponse, RaftError>>,
+    ),
+    TransferLeader(RustRaftNodeId, mpsc::Sender<Result<(), RaftError>>),
+    Campaign(bool, mpsc::Sender<Result<(), RaftError>>),
+    Shutdown(mpsc::Sender<Result<(), RaftError>>),
+}
+
+#[derive(Debug)]
+pub struct RaftNodeRuntime {
+    node_id: RustRaftNodeId,
+    group_id: RustRaftGroupId,
+    command_tx: Option<mpsc::Sender<RaftNodeRuntimeOp>>,
+    worker: Option<thread::JoinHandle<()>>,
+    restart_count: u64,
+    state: RaftNodeRuntimeState,
+}
+
+impl RaftNodeRuntime {
+    pub fn create(options: RustRaftNodeOptions) -> Result<Self, RaftError> {
+        let node_id = options.node_id;
+        let group_id = options.group_id;
+        let (command_tx, command_rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name(format!("rustraft-node-{group_id}-{node_id}"))
+            .spawn(move || raft_node_runtime_loop(options, command_rx))
+            .map_err(|err| RaftError::Transport(format!("failed to spawn raft node: {err}")))?;
+        Ok(Self {
+            node_id,
+            group_id,
+            command_tx: Some(command_tx),
+            worker: Some(worker),
+            restart_count: 0,
+            state: RaftNodeRuntimeState::Created,
+        })
+    }
+
+    pub fn start(&mut self) -> Result<(), RaftError> {
+        self.send_unit(RaftNodeRuntimeOp::Start)?;
+        self.state = RaftNodeRuntimeState::Running;
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(), RaftError> {
+        self.send_unit(RaftNodeRuntimeOp::Stop)?;
+        self.state = RaftNodeRuntimeState::Stopped;
+        Ok(())
+    }
+
+    pub fn restart(&mut self) -> Result<(), RaftError> {
+        if self.state == RaftNodeRuntimeState::Shutdown {
+            return Err(RaftError::InvalidRequest(
+                "cannot restart a shutdown raft node runtime".to_string(),
+            ));
+        }
+        if self.state == RaftNodeRuntimeState::Running {
+            self.stop()?;
+        }
+        self.restart_count += 1;
+        self.start()
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), RaftError> {
+        if self.state == RaftNodeRuntimeState::Shutdown {
+            return Ok(());
+        }
+        let sender = self.command_tx.take().ok_or_else(|| {
+            RaftError::InvalidRequest("raft node runtime channel is closed".to_string())
+        })?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        sender
+            .send(RaftNodeRuntimeOp::Shutdown(reply_tx))
+            .map_err(|err| RaftError::Transport(format!("failed to shutdown raft node: {err}")))?;
+        let result = recv_runtime_reply(reply_rx)?;
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| {
+                RaftError::Transport("raft node worker panicked during shutdown".to_string())
+            })?;
+        }
+        self.state = RaftNodeRuntimeState::Shutdown;
+        result
+    }
+
+    pub fn propose(&self, payload: RustRaftPayload) -> Result<RustRaftLogId, RaftError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender()?
+            .send(RaftNodeRuntimeOp::Propose(payload, reply_tx))
+            .map_err(|err| {
+                RaftError::Transport(format!("failed to send propose to raft node: {err}"))
+            })?;
+        recv_runtime_reply(reply_rx)?
+    }
+
+    pub fn read_index(
+        &self,
+        min_commit_index: RustRaftLogIndex,
+    ) -> Result<ReadIndexResponse, RaftError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender()?
+            .send(RaftNodeRuntimeOp::ReadIndex(min_commit_index, reply_tx))
+            .map_err(|err| {
+                RaftError::Transport(format!("failed to send read-index to raft node: {err}"))
+            })?;
+        recv_runtime_reply(reply_rx)?
+    }
+
+    pub fn transfer_leader(&self, target: RustRaftNodeId) -> Result<(), RaftError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender()?
+            .send(RaftNodeRuntimeOp::TransferLeader(target, reply_tx))
+            .map_err(|err| {
+                RaftError::Transport(format!(
+                    "failed to send leader transfer to raft node: {err}"
+                ))
+            })?;
+        recv_runtime_reply(reply_rx)?
+    }
+
+    pub fn campaign(&self, forced: bool) -> Result<(), RaftError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender()?
+            .send(RaftNodeRuntimeOp::Campaign(forced, reply_tx))
+            .map_err(|err| {
+                RaftError::Transport(format!("failed to send campaign to raft node: {err}"))
+            })?;
+        recv_runtime_reply(reply_rx)?
+    }
+
+    pub fn status(&self) -> Result<RaftNodeRuntimeStatus, RaftError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender()?
+            .send(RaftNodeRuntimeOp::Status(reply_tx))
+            .map_err(|err| {
+                RaftError::Transport(format!("failed to send status to raft node: {err}"))
+            })?;
+        let mut status = recv_runtime_reply(reply_rx)??;
+        status.restart_count = self.restart_count;
+        status.state = self.state;
+        Ok(status)
+    }
+
+    pub fn state(&self) -> RaftNodeRuntimeState {
+        self.state
+    }
+
+    pub fn node_id(&self) -> RustRaftNodeId {
+        self.node_id
+    }
+
+    pub fn group_id(&self) -> RustRaftGroupId {
+        self.group_id
+    }
+
+    pub fn restart_count(&self) -> u64 {
+        self.restart_count
+    }
+
+    fn send_unit(
+        &self,
+        command: fn(mpsc::Sender<Result<(), RaftError>>) -> RaftNodeRuntimeOp,
+    ) -> Result<(), RaftError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender()?.send(command(reply_tx)).map_err(|err| {
+            RaftError::Transport(format!(
+                "failed to send lifecycle command to raft node: {err}"
+            ))
+        })?;
+        recv_runtime_reply(reply_rx)?
+    }
+
+    fn sender(&self) -> Result<&mpsc::Sender<RaftNodeRuntimeOp>, RaftError> {
+        self.command_tx
+            .as_ref()
+            .ok_or_else(|| RaftError::InvalidRequest("raft node runtime is shut down".to_string()))
+    }
+}
+
+impl Drop for RaftNodeRuntime {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn raft_node_runtime_loop(
+    options: RustRaftNodeOptions,
+    command_rx: mpsc::Receiver<RaftNodeRuntimeOp>,
+) {
+    let node_id = options.node_id;
+    let group_id = options.group_id;
+    let mut peers = options.peers.clone();
+    if !peers.iter().any(|peer| peer.node_id == node_id) {
+        peers.push(RustRaftPeer {
+            node_id,
+            raft_addr: options.raft_addr,
+            snapshot_addr: options.snapshot_addr,
+            role: options.role,
+            auto_promote: false,
+        });
+    }
+    let mut cluster = match RaftCluster::new(group_id, options.config, peers) {
+        Ok(cluster) => cluster,
+        Err(error) => {
+            while let Ok(command) = command_rx.recv() {
+                if respond_runtime_error(command, error.clone()) {
+                    break;
+                }
+            }
+            return;
+        }
+    };
+    let mut state = RaftNodeRuntimeState::Created;
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            RaftNodeRuntimeOp::Start(reply) => {
+                let result = cluster.start();
+                if result.is_ok() {
+                    state = RaftNodeRuntimeState::Running;
+                }
+                let _ = reply.send(result);
+            }
+            RaftNodeRuntimeOp::Stop(reply) => {
+                let result = cluster.stop();
+                if result.is_ok() {
+                    state = RaftNodeRuntimeState::Stopped;
+                }
+                let _ = reply.send(result);
+            }
+            RaftNodeRuntimeOp::Status(reply) => {
+                let status = RaftNodeRuntimeStatus {
+                    node_id,
+                    group_id,
+                    state,
+                    restart_count: 0,
+                    worker_running: state != RaftNodeRuntimeState::Shutdown,
+                    cluster_status: cluster.cluster_status_report().ok(),
+                };
+                let _ = reply.send(Ok(status));
+            }
+            RaftNodeRuntimeOp::Propose(payload, reply) => {
+                let _ = reply.send(cluster.propose(payload));
+            }
+            RaftNodeRuntimeOp::ReadIndex(min_commit_index, reply) => {
+                let request = ReadIndexRequest {
+                    group_id,
+                    requester_id: node_id,
+                    min_commit_index,
+                    allow_lease_read: true,
+                };
+                let _ = reply.send(cluster.read_index(request));
+            }
+            RaftNodeRuntimeOp::TransferLeader(target, reply) => {
+                let _ = reply.send(cluster.transfer_leader(target));
+            }
+            RaftNodeRuntimeOp::Campaign(forced, reply) => {
+                let _ = reply.send(cluster.campaign(node_id, forced));
+            }
+            RaftNodeRuntimeOp::Shutdown(reply) => {
+                let result = cluster.stop();
+                let _ = reply.send(result);
+                break;
+            }
+        }
+    }
+}
+
+fn respond_runtime_error(command: RaftNodeRuntimeOp, error: RaftError) -> bool {
+    match command {
+        RaftNodeRuntimeOp::Start(reply)
+        | RaftNodeRuntimeOp::Stop(reply)
+        | RaftNodeRuntimeOp::TransferLeader(_, reply)
+        | RaftNodeRuntimeOp::Campaign(_, reply) => {
+            let _ = reply.send(Err(error));
+            false
+        }
+        RaftNodeRuntimeOp::Shutdown(reply) => {
+            let _ = reply.send(Err(error));
+            true
+        }
+        RaftNodeRuntimeOp::Status(reply) => {
+            let _ = reply.send(Err(error));
+            false
+        }
+        RaftNodeRuntimeOp::Propose(_, reply) => {
+            let _ = reply.send(Err(error));
+            false
+        }
+        RaftNodeRuntimeOp::ReadIndex(_, reply) => {
+            let _ = reply.send(Err(error));
+            false
+        }
+    }
+}
+
+fn recv_runtime_reply<T>(reply_rx: mpsc::Receiver<T>) -> Result<T, RaftError> {
+    reply_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|err| RaftError::Transport(format!("raft node runtime did not reply: {err}")))
 }
 
 pub trait RustRaftStorage {
