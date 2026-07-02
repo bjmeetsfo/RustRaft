@@ -2,8 +2,8 @@ use rustraft::{
     rustraft_append_safety_decision, rustraft_learner_promotion_decision,
     rustraft_membership_readiness_report, rustraft_read_safety_decision,
     rustraft_recover_latest_wal_record, rustraft_validate_apply_snapshot_fence,
-    RustRaftAppendEntriesRequest, RustRaftApplySnapshotFence, RustRaftHardState,
-    RustRaftLogEntry, RustRaftLogId, RustRaftMembership, RustRaftMembershipScope,
+    RustRaftAppendEntriesRequest, RustRaftApplySnapshotFence, RustRaftHardState, RustRaftLogEntry,
+    RustRaftLogId, RustRaftMembership, RustRaftMembershipScope,
     RustRaftMembershipTransitionEvidence, RustRaftMembershipTransitionKind, RustRaftPeerStatus,
     RustRaftReadIndexRequest, RustRaftReplicaRole, RustRaftRole, RustRaftSnapshotMeta,
     RustRaftStatusSnapshot, RustRaftWalRecord,
@@ -151,18 +151,21 @@ fn raft_safety_helpers_reject_non_leader_and_apply_lag() {
 
 #[test]
 fn membership_transitions_require_safe_failover_scale_up_and_scale_down() {
-    let transitions = [RustRaftMembershipScope::Metaserver, RustRaftMembershipScope::DataNode]
+    let transitions = [
+        RustRaftMembershipScope::Metaserver,
+        RustRaftMembershipScope::DataNode,
+    ]
+    .into_iter()
+    .flat_map(|scope| {
+        [
+            RustRaftMembershipTransitionKind::Failover,
+            RustRaftMembershipTransitionKind::ScaleUp,
+            RustRaftMembershipTransitionKind::ScaleDown,
+        ]
         .into_iter()
-        .flat_map(|scope| {
-            [
-                RustRaftMembershipTransitionKind::Failover,
-                RustRaftMembershipTransitionKind::ScaleUp,
-                RustRaftMembershipTransitionKind::ScaleDown,
-            ]
-            .into_iter()
-            .map(move |kind| transition(scope, kind))
-        })
-        .collect::<Vec<_>>();
+        .map(move |kind| transition(scope, kind))
+    })
+    .collect::<Vec<_>>();
 
     let report = rustraft_membership_readiness_report(&transitions);
     assert!(report.ready, "{report:#?}");

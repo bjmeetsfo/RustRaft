@@ -2,8 +2,8 @@ use rustraft::{
     rustraft_learner_promotion_decision, rustraft_read_safety_runtime_decision,
     rustraft_recover_latest_wal_record, RustRaftApplySnapshotFence, RustRaftHardState,
     RustRaftLogEntry, RustRaftLogId, RustRaftMembership, RustRaftPeerStatus,
-    RustRaftReadSafetyOperation, RustRaftReadSafetyRuntimeInput, RustRaftReplicaRole,
-    RustRaftRole, RustRaftSnapshotMeta, RustRaftStatusSnapshot, RustRaftWalRecord,
+    RustRaftReadSafetyOperation, RustRaftReadSafetyRuntimeInput, RustRaftReplicaRole, RustRaftRole,
+    RustRaftSnapshotMeta, RustRaftStatusSnapshot, RustRaftWalRecord,
 };
 
 #[derive(Clone)]

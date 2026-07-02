@@ -64,6 +64,26 @@ pub struct RustRaftParityReport {
     pub satisfied: Vec<String>,
     pub missing: Vec<String>,
     pub production_blockers: Vec<String>,
+    pub byteraft_parity_matrix: Vec<RustRaftByteRaftParityItem>,
+    pub byteraft_gaps: Vec<String>,
+    pub byteraft_intentional_differences: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustRaftByteRaftParityStatus {
+    Satisfied,
+    Gap,
+    IntentionalDifference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftByteRaftParityItem {
+    pub id: String,
+    pub required: bool,
+    pub status: RustRaftByteRaftParityStatus,
+    pub evidence: Vec<String>,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -857,7 +877,10 @@ pub struct RustRaftApplyResponse {
 }
 
 pub trait RustRaftStateMachine {
-    fn apply(&mut self, request: RustRaftApplyRequest) -> Result<RustRaftApplyResponse, RustRaftError>;
+    fn apply(
+        &mut self,
+        request: RustRaftApplyRequest,
+    ) -> Result<RustRaftApplyResponse, RustRaftError>;
     fn snapshot(&self) -> Result<RustRaftSnapshotChunk, RustRaftError>;
     fn install_snapshot(&mut self, chunk: RustRaftSnapshotChunk) -> Result<(), RustRaftError>;
 }
@@ -871,7 +894,8 @@ pub trait RustRaftConsensus {
         payload: Vec<u8>,
         options: RustRaftProposeOptions,
     ) -> Result<RustRaftLogId, RustRaftError>;
-    fn read_index(&self, min_commit_index: u64) -> Result<RustRaftReadIndexResponse, RustRaftError>;
+    fn read_index(&self, min_commit_index: u64)
+        -> Result<RustRaftReadIndexResponse, RustRaftError>;
     fn add_peer(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError>;
     fn add_learner(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError>;
     fn promote_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RustRaftError>;
@@ -901,7 +925,10 @@ pub fn rustraft_byteraft_parity_surface() -> RustRaftByteRaftParitySurface {
             "stop".to_string(),
             "shutdown".to_string(),
         ],
-        write_api: vec!["propose".to_string(), "propose_options.expected_term".to_string()],
+        write_api: vec![
+            "propose".to_string(),
+            "propose_options.expected_term".to_string(),
+        ],
         read_api: vec!["read_index".to_string(), "lease_read".to_string()],
         membership_api: vec![
             "add_node".to_string(),
@@ -1253,6 +1280,17 @@ pub fn rustraft_parity_report(snapshot: &RustRaftReadinessSnapshot) -> RustRaftP
         })
         .map(|requirement| format!("{:?}:{}", requirement.category, requirement.id).to_lowercase())
         .collect::<Vec<_>>();
+    let byteraft_parity_matrix = rustraft_byteraft_parity_matrix(snapshot);
+    let byteraft_gaps = byteraft_parity_matrix
+        .iter()
+        .filter(|item| item.status == RustRaftByteRaftParityStatus::Gap)
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let byteraft_intentional_differences = byteraft_parity_matrix
+        .iter()
+        .filter(|item| item.status == RustRaftByteRaftParityStatus::IntentionalDifference)
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
     let ready = missing.is_empty() && production_blockers.is_empty();
     RustRaftParityReport {
         contract,
@@ -1265,7 +1303,159 @@ pub fn rustraft_parity_report(snapshot: &RustRaftReadinessSnapshot) -> RustRaftP
         satisfied,
         missing,
         production_blockers,
+        byteraft_parity_matrix,
+        byteraft_gaps,
+        byteraft_intentional_differences,
     }
+}
+
+pub fn rustraft_byteraft_parity_matrix(
+    snapshot: &RustRaftReadinessSnapshot,
+) -> Vec<RustRaftByteRaftParityItem> {
+    use RustRaftByteRaftParityStatus::*;
+
+    fn item(
+        id: &str,
+        status: RustRaftByteRaftParityStatus,
+        evidence: &[&str],
+        note: &str,
+    ) -> RustRaftByteRaftParityItem {
+        RustRaftByteRaftParityItem {
+            id: id.to_string(),
+            required: true,
+            status,
+            evidence: evidence.iter().map(|field| (*field).to_string()).collect(),
+            note: note.to_string(),
+        }
+    }
+
+    fn status(ready: bool) -> RustRaftByteRaftParityStatus {
+        if ready {
+            Satisfied
+        } else {
+            Gap
+        }
+    }
+
+    vec![
+        item(
+            "log_replication",
+            status(
+                snapshot.rustraft_leader_write_authority_present
+                    && snapshot.rustraft_rpc_transport_contract_present,
+            ),
+            &[
+                "rustraft_leader_write_authority_present",
+                "rustraft_rpc_transport_contract_present",
+            ],
+            "leader-owned append path and append RPC contract are present",
+        ),
+        item(
+            "leader_election",
+            status(
+                snapshot.rustraft_leader_write_authority_present
+                    && snapshot.rustraft_metaserver_snapshot_floor_election_present,
+            ),
+            &[
+                "rustraft_leader_write_authority_present",
+                "rustraft_metaserver_snapshot_floor_election_present",
+            ],
+            "leader authority and snapshot-floor election safety are present",
+        ),
+        item(
+            "pre_vote",
+            status(snapshot.rustraft_rpc_transport_contract_present),
+            &["rustraft_rpc_transport_contract_present", "RustRaftVoteRequest.pre_vote"],
+            "pre-vote is represented in the vote RPC contract",
+        ),
+        item(
+            "lease_read",
+            status(snapshot.rustraft_leader_write_authority_present),
+            &[
+                "rustraft_leader_write_authority_present",
+                "RustRaftReadIndexRequest.allow_lease_read",
+            ],
+            "lease reads are admitted only through leader/read-safety helpers",
+        ),
+        item(
+            "read_index",
+            status(snapshot.rustraft_operator_observability_present),
+            &[
+                "rustraft_operator_observability_present",
+                "RustRaftReadIndexRequest",
+                "RustRaftReadIndexResponse",
+            ],
+            "read-index request/response and metrics are part of the public contract",
+        ),
+        item(
+            "membership_changes",
+            status(snapshot.metaserver_membership_workflow_present),
+            &["metaserver_membership_workflow_present"],
+            "membership workflow evidence covers add/remove and joint changes",
+        ),
+        item(
+            "learner_promotion",
+            status(snapshot.learner_catchup_promotion_present),
+            &["learner_catchup_promotion_present"],
+            "learner catch-up and promotion decision helpers are present",
+        ),
+        item(
+            "witness_quorum_behavior",
+            Satisfied,
+            &["RustRaftReplicaRole::Witness.participates_in_quorum"],
+            "witnesses count for quorum but are not data-serving leaders",
+        ),
+        item(
+            "log_compaction",
+            status(
+                snapshot.rustraft_compacted_entry_rejection_present
+                    && snapshot.rustraft_log_retention_snapshot_trigger_present,
+            ),
+            &[
+                "rustraft_compacted_entry_rejection_present",
+                "rustraft_log_retention_snapshot_trigger_present",
+            ],
+            "compacted-entry rejection and snapshot-trigger retention evidence are present",
+        ),
+        item(
+            "snapshot_trigger_install",
+            status(
+                snapshot.rustraft_log_retention_snapshot_trigger_present
+                    && snapshot.rustraft_snapshot_tail_catchup_present
+                    && snapshot.rustraft_snapshot_floor_log_matching_present,
+            ),
+            &[
+                "rustraft_log_retention_snapshot_trigger_present",
+                "rustraft_snapshot_tail_catchup_present",
+                "rustraft_snapshot_floor_log_matching_present",
+            ],
+            "snapshot trigger, install/catch-up, and floor matching are present",
+        ),
+        item(
+            "restart_recovery",
+            status(
+                snapshot.raft_storage_apply_fence_present
+                    && snapshot.rustraft_apply_snapshot_fence_present,
+            ),
+            &[
+                "raft_storage_apply_fence_present",
+                "rustraft_apply_snapshot_fence_present",
+            ],
+            "WAL recovery is guarded by storage and apply/snapshot fences",
+        ),
+        item(
+            "leader_transfer",
+            IntentionalDifference,
+            &["RustRaftConsensus::transfer_leader"],
+            "RustRaft exposes the transfer contract; process validation is attached by the consuming runtime",
+        ),
+        item(
+            "observability_status",
+            status(snapshot.rustraft_operator_observability_present),
+            &["rustraft_operator_observability_present", "RustRaftStatusSnapshot"],
+            "status snapshots and metric names are part of the public contract",
+        ),
+    ]
 }
 
 pub fn rustraft_production_readiness_report(
