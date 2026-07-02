@@ -24,6 +24,7 @@
 //! it through a stable adapter boundary.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub mod benchmark;
@@ -855,6 +856,74 @@ impl Default for RustRaftConfig {
     }
 }
 
+impl RustRaftConfig {
+    pub fn validate(&self) -> Result<(), RaftConfigError> {
+        if self.election_timeout_ms == 0 {
+            return Err(RaftConfigError::ZeroElectionTimeout);
+        }
+        if self.heartbeat_interval_ms == 0 {
+            return Err(RaftConfigError::ZeroHeartbeatInterval);
+        }
+        if self.leader_lease_ms == 0 {
+            return Err(RaftConfigError::ZeroLeaderLease);
+        }
+        if self.heartbeat_interval_ms >= self.election_timeout_ms {
+            return Err(RaftConfigError::HeartbeatNotLessThanElection {
+                heartbeat_interval_ms: self.heartbeat_interval_ms,
+                election_timeout_ms: self.election_timeout_ms,
+            });
+        }
+        if self.leader_lease_ms >= self.election_timeout_ms {
+            return Err(RaftConfigError::LeaseNotLessThanElection {
+                leader_lease_ms: self.leader_lease_ms,
+                election_timeout_ms: self.election_timeout_ms,
+            });
+        }
+        if self.max_payload_bytes == 0 {
+            return Err(RaftConfigError::ZeroMaxPayloadBytes);
+        }
+        if self.snapshot_threshold_entries == 0 {
+            return Err(RaftConfigError::ZeroSnapshotThreshold);
+        }
+        if self.max_segment_bytes == 0 {
+            return Err(RaftConfigError::ZeroMaxSegmentBytes);
+        }
+        Ok(())
+    }
+}
+
+pub type RaftConfig = RustRaftConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Error)]
+pub enum RaftConfigError {
+    #[error("election_timeout_ms must be greater than zero")]
+    ZeroElectionTimeout,
+    #[error("heartbeat_interval_ms must be greater than zero")]
+    ZeroHeartbeatInterval,
+    #[error("leader_lease_ms must be greater than zero")]
+    ZeroLeaderLease,
+    #[error(
+        "heartbeat_interval_ms ({heartbeat_interval_ms}) must be less than election_timeout_ms ({election_timeout_ms})"
+    )]
+    HeartbeatNotLessThanElection {
+        heartbeat_interval_ms: u64,
+        election_timeout_ms: u64,
+    },
+    #[error(
+        "leader_lease_ms ({leader_lease_ms}) must be less than election_timeout_ms ({election_timeout_ms})"
+    )]
+    LeaseNotLessThanElection {
+        leader_lease_ms: u64,
+        election_timeout_ms: u64,
+    },
+    #[error("max_payload_bytes must be greater than zero")]
+    ZeroMaxPayloadBytes,
+    #[error("snapshot_threshold_entries must be greater than zero")]
+    ZeroSnapshotThreshold,
+    #[error("max_segment_bytes must be greater than zero")]
+    ZeroMaxSegmentBytes,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftNodeOptions {
     pub group_id: RustRaftGroupId,
@@ -1170,12 +1239,633 @@ pub struct RustRaftAppendSafetyDecision {
     pub reason: String,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RustRaftError {
+    #[error("configuration error: {0}")]
+    Config(String),
+    #[error("node {0} not found")]
+    NodeNotFound(RustRaftNodeId),
+    #[error("no leader is available")]
+    NoLeader,
+    #[error("node {0} is not the leader")]
+    NotLeader(RustRaftNodeId),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     #[error("transport error: {0}")]
     Transport(String),
     #[error("storage error: {0}")]
     Storage(String),
+}
+
+impl From<RaftConfigError> for RustRaftError {
+    fn from(error: RaftConfigError) -> Self {
+        Self::Config(error.to_string())
+    }
+}
+
+pub type RaftError = RustRaftError;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RaftNode {
+    id: RustRaftNodeId,
+    replica_role: RustRaftReplicaRole,
+    raft_role: RustRaftRole,
+    hard_state: RustRaftHardState,
+    log: Vec<RustRaftLogEntry>,
+    commit_index: RustRaftLogIndex,
+    applied_index: RustRaftLogIndex,
+    healthy: bool,
+}
+
+impl RaftNode {
+    fn new(id: RustRaftNodeId, replica_role: RustRaftReplicaRole) -> Self {
+        Self {
+            id,
+            replica_role,
+            raft_role: if replica_role == RustRaftReplicaRole::Learner {
+                RustRaftRole::Learner
+            } else {
+                RustRaftRole::Follower
+            },
+            hard_state: RustRaftHardState {
+                current_term: 0,
+                voted_for: None,
+                committed: None,
+            },
+            log: Vec::new(),
+            commit_index: 0,
+            applied_index: 0,
+            healthy: true,
+        }
+    }
+
+    fn match_index(&self) -> RustRaftLogIndex {
+        self.log
+            .last()
+            .map(|entry| entry.log_id.index)
+            .unwrap_or_default()
+    }
+
+    fn append_entry(&mut self, entry: RustRaftLogEntry) {
+        if let Some(position) = self
+            .log
+            .iter()
+            .position(|existing| existing.log_id.index == entry.log_id.index)
+        {
+            self.log.truncate(position);
+        }
+        self.log.push(entry);
+    }
+
+    fn advance_commit(&mut self, commit_index: RustRaftLogIndex) {
+        self.commit_index = self.commit_index.max(commit_index.min(self.match_index()));
+        if self.replica_role.can_serve_data() {
+            self.applied_index = self.applied_index.max(self.commit_index);
+        }
+        self.hard_state.committed = (self.commit_index > 0).then_some(RustRaftLogId {
+            term: self.hard_state.current_term,
+            index: self.commit_index,
+        });
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftCluster {
+    pub group_id: RustRaftGroupId,
+    pub config: RaftConfig,
+    nodes: BTreeMap<RustRaftNodeId, RaftNode>,
+    leader_id: Option<RustRaftNodeId>,
+    current_term: RustRaftTerm,
+    commit_index: RustRaftLogIndex,
+    applied_index: RustRaftLogIndex,
+    last_log_index: RustRaftLogIndex,
+    running: bool,
+    leader_lease_valid: bool,
+}
+
+impl RaftCluster {
+    pub fn new(
+        group_id: RustRaftGroupId,
+        config: RaftConfig,
+        peers: Vec<RustRaftPeer>,
+    ) -> Result<Self, RaftError> {
+        config.validate()?;
+        if peers.is_empty() {
+            return Err(RaftError::InvalidRequest(
+                "raft cluster requires at least one peer".to_string(),
+            ));
+        }
+
+        let mut nodes = BTreeMap::new();
+        for peer in peers {
+            if nodes
+                .insert(peer.node_id, RaftNode::new(peer.node_id, peer.role))
+                .is_some()
+            {
+                return Err(RaftError::InvalidRequest(format!(
+                    "duplicate raft node id {}",
+                    peer.node_id
+                )));
+            }
+        }
+        if !nodes.values().any(|node| node.replica_role.can_be_leader()) {
+            return Err(RaftError::InvalidRequest(
+                "raft cluster requires at least one voter".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            group_id,
+            config,
+            nodes,
+            leader_id: None,
+            current_term: 0,
+            commit_index: 0,
+            applied_index: 0,
+            last_log_index: 0,
+            running: false,
+            leader_lease_valid: false,
+        })
+    }
+
+    pub fn start(&mut self) -> Result<(), RaftError> {
+        self.running = true;
+        if self.leader_id.is_none() {
+            let leader = self
+                .nodes
+                .values()
+                .find(|node| node.replica_role.can_be_leader() && node.healthy)
+                .map(|node| node.id)
+                .ok_or_else(|| RaftError::InvalidRequest("no healthy voter".to_string()))?;
+            self.campaign(leader, true)?;
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(), RaftError> {
+        self.running = false;
+        self.leader_lease_valid = false;
+        Ok(())
+    }
+
+    pub fn leader_id(&self) -> Option<RustRaftNodeId> {
+        self.leader_id
+    }
+
+    pub fn set_node_healthy(
+        &mut self,
+        node_id: RustRaftNodeId,
+        healthy: bool,
+    ) -> Result<(), RaftError> {
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .ok_or(RaftError::NodeNotFound(node_id))?;
+        node.healthy = healthy;
+        if self.leader_id == Some(node_id) && !healthy {
+            self.leader_lease_valid = false;
+        }
+        Ok(())
+    }
+
+    pub fn set_leader_lease_valid(&mut self, valid: bool) {
+        self.leader_lease_valid = valid;
+    }
+
+    pub fn campaign(
+        &mut self,
+        candidate_id: RustRaftNodeId,
+        forced: bool,
+    ) -> Result<(), RaftError> {
+        if !self.running && !forced {
+            return Err(RaftError::InvalidRequest(
+                "cannot campaign before cluster start".to_string(),
+            ));
+        }
+        let candidate = self
+            .nodes
+            .get(&candidate_id)
+            .ok_or(RaftError::NodeNotFound(candidate_id))?;
+        if !candidate.replica_role.can_be_leader() {
+            return Err(RaftError::InvalidRequest(format!(
+                "node {} cannot become leader",
+                candidate_id
+            )));
+        }
+        if !candidate.healthy {
+            return Err(RaftError::InvalidRequest(format!(
+                "node {} is not healthy",
+                candidate_id
+            )));
+        }
+
+        self.current_term += 1;
+        self.leader_id = Some(candidate_id);
+        self.leader_lease_valid = true;
+        for node in self.nodes.values_mut() {
+            node.hard_state.current_term = self.current_term;
+            node.hard_state.voted_for = Some(candidate_id);
+            node.raft_role = if node.id == candidate_id {
+                RustRaftRole::Leader
+            } else if node.replica_role == RustRaftReplicaRole::Learner {
+                RustRaftRole::Learner
+            } else {
+                RustRaftRole::Follower
+            };
+        }
+        Ok(())
+    }
+
+    pub fn propose(&mut self, payload: RustRaftPayload) -> Result<RustRaftLogId, RaftError> {
+        let leader_id = self.leader_id.ok_or(RaftError::NoLeader)?;
+        if !self.running {
+            return Err(RaftError::InvalidRequest(
+                "cannot propose while cluster is stopped".to_string(),
+            ));
+        }
+        if payload.len() as u64 > self.config.max_payload_bytes {
+            return Err(RaftError::InvalidRequest(
+                "payload exceeds max_payload_bytes".to_string(),
+            ));
+        }
+        let leader = self
+            .nodes
+            .get(&leader_id)
+            .ok_or(RaftError::NodeNotFound(leader_id))?;
+        if !leader.healthy {
+            return Err(RaftError::NotLeader(leader_id));
+        }
+
+        let log_id = RustRaftLogId {
+            term: self.current_term,
+            index: self.last_log_index + 1,
+        };
+        let entry = RustRaftLogEntry {
+            log_id: log_id.clone(),
+            payload,
+        };
+        self.last_log_index = log_id.index;
+
+        for node in self.nodes.values_mut() {
+            if node.healthy && node.replica_role.can_serve_data() {
+                node.append_entry(entry.clone());
+            }
+        }
+        self.refresh_commit_index();
+        Ok(log_id)
+    }
+
+    pub fn append_entries_to(
+        &mut self,
+        target: RustRaftNodeId,
+        request: RustRaftAppendEntriesRequest,
+    ) -> Result<RustRaftAppendEntriesResponse, RaftError> {
+        let node = self
+            .nodes
+            .get_mut(&target)
+            .ok_or(RaftError::NodeNotFound(target))?;
+        if request.group_id != self.group_id {
+            return Err(RaftError::InvalidRequest(
+                "append entries group id mismatch".to_string(),
+            ));
+        }
+        if request.term < node.hard_state.current_term {
+            return Ok(RustRaftAppendEntriesResponse {
+                term: node.hard_state.current_term,
+                success: false,
+                match_index: node.match_index(),
+                rejection_hint: Some(node.match_index()),
+            });
+        }
+        if let Some(prev) = &request.prev_log_id {
+            if prev.index > 0 && node.match_index() < prev.index {
+                return Ok(RustRaftAppendEntriesResponse {
+                    term: node.hard_state.current_term,
+                    success: false,
+                    match_index: node.match_index(),
+                    rejection_hint: Some(node.match_index()),
+                });
+            }
+        }
+
+        node.hard_state.current_term = request.term;
+        node.raft_role = if node.replica_role == RustRaftReplicaRole::Learner {
+            RustRaftRole::Learner
+        } else {
+            RustRaftRole::Follower
+        };
+        for entry in request.entries {
+            if node.replica_role.can_serve_data() {
+                node.append_entry(entry);
+            }
+        }
+        node.advance_commit(request.leader_commit);
+        let term = node.hard_state.current_term;
+        let match_index = node.match_index();
+        self.refresh_cluster_indexes();
+        Ok(RustRaftAppendEntriesResponse {
+            term,
+            success: true,
+            match_index,
+            rejection_hint: None,
+        })
+    }
+
+    pub fn read_index(
+        &self,
+        request: RustRaftReadIndexRequest,
+    ) -> Result<RustRaftReadIndexResponse, RaftError> {
+        if request.group_id != self.group_id {
+            return Err(RaftError::InvalidRequest(
+                "read index group id mismatch".to_string(),
+            ));
+        }
+        let node = self
+            .nodes
+            .get(&request.requester_id)
+            .ok_or(RaftError::NodeNotFound(request.requester_id))?;
+        if !node.healthy {
+            return Ok(RustRaftReadIndexResponse {
+                safe: false,
+                read_index: node.commit_index,
+                lease_read: false,
+                reason: "node_unhealthy".to_string(),
+            });
+        }
+        if request.min_commit_index > node.applied_index {
+            return Ok(RustRaftReadIndexResponse {
+                safe: false,
+                read_index: node.commit_index,
+                lease_read: false,
+                reason: "applied_index_behind_min_commit".to_string(),
+            });
+        }
+        let lease_read = request.allow_lease_read
+            && self.config.enable_lease_read
+            && self.leader_id == Some(request.requester_id)
+            && self.leader_lease_valid;
+        Ok(RustRaftReadIndexResponse {
+            safe: true,
+            read_index: node.commit_index,
+            lease_read,
+            reason: if lease_read {
+                "lease_read".to_string()
+            } else {
+                "read_index".to_string()
+            },
+        })
+    }
+
+    pub fn lease_read_eligible(
+        &self,
+        node_id: RustRaftNodeId,
+        min_commit_index: RustRaftLogIndex,
+    ) -> Result<bool, RaftError> {
+        let response = self.read_index(RustRaftReadIndexRequest {
+            group_id: self.group_id,
+            requester_id: node_id,
+            min_commit_index,
+            allow_lease_read: true,
+        })?;
+        Ok(response.safe && response.lease_read)
+    }
+
+    pub fn transfer_leader(&mut self, target: RustRaftNodeId) -> Result<(), RaftError> {
+        let target_node = self
+            .nodes
+            .get(&target)
+            .ok_or(RaftError::NodeNotFound(target))?;
+        if !target_node.replica_role.can_be_leader() {
+            return Err(RaftError::InvalidRequest(format!(
+                "node {} cannot become leader",
+                target
+            )));
+        }
+        if !target_node.healthy {
+            return Err(RaftError::InvalidRequest(format!(
+                "node {} is not healthy",
+                target
+            )));
+        }
+        if target_node.match_index() < self.commit_index {
+            return Err(RaftError::InvalidRequest(format!(
+                "node {} is behind committed index {}",
+                target, self.commit_index
+            )));
+        }
+        self.campaign(target, true)
+    }
+
+    pub fn status(&self, node_id: RustRaftNodeId) -> Result<RustRaftStatusSnapshot, RaftError> {
+        let node = self
+            .nodes
+            .get(&node_id)
+            .ok_or(RaftError::NodeNotFound(node_id))?;
+        Ok(RustRaftStatusSnapshot {
+            group_id: self.group_id,
+            node_id,
+            role: node.raft_role,
+            term: node.hard_state.current_term,
+            leader_id: self.leader_id,
+            commit_index: node.commit_index,
+            applied_index: node.applied_index,
+            last_log_index: node.match_index(),
+            last_snapshot_index: 0,
+            peers: self
+                .nodes
+                .values()
+                .filter(|peer| peer.id != node_id)
+                .map(|peer| RustRaftPeerStatus {
+                    node_id: peer.id,
+                    matched: peer.match_index(),
+                    next_index: peer.match_index() + 1,
+                    learner: peer.replica_role == RustRaftReplicaRole::Learner,
+                    healthy: peer.healthy,
+                    lag: node.match_index().saturating_sub(peer.match_index()),
+                })
+                .collect(),
+        })
+    }
+
+    pub fn node_ids(&self) -> Vec<RustRaftNodeId> {
+        self.nodes.keys().copied().collect()
+    }
+
+    fn refresh_commit_index(&mut self) {
+        let mut candidate_indexes: Vec<_> = self
+            .nodes
+            .values()
+            .filter(|node| node.healthy && node.replica_role.participates_in_quorum())
+            .map(RaftNode::match_index)
+            .collect();
+        if candidate_indexes.is_empty() {
+            return;
+        }
+        candidate_indexes.sort_unstable();
+        let quorum_index = candidate_indexes.len().saturating_sub(self.quorum_size());
+        let commit_index = candidate_indexes[quorum_index];
+        self.commit_index = self.commit_index.max(commit_index);
+        for node in self.nodes.values_mut() {
+            if node.healthy {
+                node.advance_commit(self.commit_index);
+            }
+        }
+        self.refresh_cluster_indexes();
+    }
+
+    fn refresh_cluster_indexes(&mut self) {
+        self.commit_index = self
+            .nodes
+            .values()
+            .map(|node| node.commit_index)
+            .max()
+            .unwrap_or_default();
+        self.applied_index = self
+            .nodes
+            .values()
+            .filter(|node| node.replica_role.can_serve_data())
+            .map(|node| node.applied_index)
+            .min()
+            .unwrap_or_default();
+        self.last_log_index = self
+            .nodes
+            .values()
+            .map(RaftNode::match_index)
+            .max()
+            .unwrap_or_default();
+    }
+
+    fn quorum_size(&self) -> usize {
+        let voters = self
+            .nodes
+            .values()
+            .filter(|node| node.replica_role.participates_in_quorum())
+            .count();
+        voters / 2 + 1
+    }
+}
+
+impl RustRaftConsensus for RaftCluster {
+    fn start(&mut self) -> Result<(), RustRaftError> {
+        RaftCluster::start(self)
+    }
+
+    fn stop(&mut self) -> Result<(), RustRaftError> {
+        RaftCluster::stop(self)
+    }
+
+    fn status(&self) -> Result<RustRaftStatusSnapshot, RustRaftError> {
+        let node_id = self.leader_id.ok_or(RaftError::NoLeader)?;
+        RaftCluster::status(self, node_id)
+    }
+
+    fn propose(
+        &mut self,
+        payload: RustRaftPayload,
+        options: RustRaftProposeOptions,
+    ) -> Result<RustRaftLogId, RustRaftError> {
+        if let Some(expected_term) = options.expected_term {
+            if expected_term != self.current_term {
+                return Err(RaftError::InvalidRequest(format!(
+                    "expected term {} does not match current term {}",
+                    expected_term, self.current_term
+                )));
+            }
+        }
+        RaftCluster::propose(self, payload)
+    }
+
+    fn read_index(
+        &self,
+        min_commit_index: RustRaftLogIndex,
+    ) -> Result<RustRaftReadIndexResponse, RustRaftError> {
+        let requester_id = self.leader_id.ok_or(RaftError::NoLeader)?;
+        RaftCluster::read_index(
+            self,
+            RustRaftReadIndexRequest {
+                group_id: self.group_id,
+                requester_id,
+                min_commit_index,
+                allow_lease_read: false,
+            },
+        )
+    }
+
+    fn add_peer(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError> {
+        if self.nodes.contains_key(&peer.node_id) {
+            return Err(RaftError::InvalidRequest(format!(
+                "duplicate raft node id {}",
+                peer.node_id
+            )));
+        }
+        self.nodes
+            .insert(peer.node_id, RaftNode::new(peer.node_id, peer.role));
+        Ok(())
+    }
+
+    fn add_learner(&mut self, mut peer: RustRaftPeer) -> Result<(), RustRaftError> {
+        peer.role = RustRaftReplicaRole::Learner;
+        self.add_peer(peer)
+    }
+
+    fn promote_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RustRaftError> {
+        let commit_index = self.commit_index;
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .ok_or(RaftError::NodeNotFound(node_id))?;
+        if node.match_index() < commit_index {
+            return Err(RaftError::InvalidRequest(format!(
+                "node {} is behind committed index {}",
+                node_id, commit_index
+            )));
+        }
+        node.replica_role = RustRaftReplicaRole::Voter;
+        node.raft_role = RustRaftRole::Follower;
+        Ok(())
+    }
+
+    fn add_witness(&mut self, mut peer: RustRaftPeer) -> Result<(), RustRaftError> {
+        peer.role = RustRaftReplicaRole::Witness;
+        self.add_peer(peer)
+    }
+
+    fn remove_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RustRaftError> {
+        self.nodes
+            .remove(&node_id)
+            .ok_or(RaftError::NodeNotFound(node_id))?;
+        if self.leader_id == Some(node_id) {
+            self.leader_id = None;
+            self.leader_lease_valid = false;
+        }
+        Ok(())
+    }
+
+    fn transfer_leader(&mut self, target: RustRaftNodeId) -> Result<(), RustRaftError> {
+        RaftCluster::transfer_leader(self, target)
+    }
+
+    fn campaign(&mut self, forced: bool) -> Result<(), RustRaftError> {
+        let candidate_id = self.leader_id.unwrap_or_else(|| {
+            self.nodes
+                .values()
+                .find(|node| node.replica_role.can_be_leader())
+                .map(|node| node.id)
+                .unwrap_or_default()
+        });
+        RaftCluster::campaign(self, candidate_id, forced)
+    }
+
+    fn trigger_snapshot(&mut self) -> Result<RustRaftSnapshotMeta, RustRaftError> {
+        Ok(RustRaftSnapshotMeta {
+            snapshot_id: format!("{}-{}", self.group_id, self.commit_index),
+            last_log_id: RustRaftLogId {
+                term: self.current_term,
+                index: self.commit_index,
+            },
+            membership: self.node_ids(),
+        })
+    }
 }
 
 pub trait RustRaftStorage {
