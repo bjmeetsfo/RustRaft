@@ -1,6 +1,7 @@
 use rustraft::{
-    rustraft_parity_report, rustraft_read_safety_decision, RustRaftProductionStatus,
-    RustRaftReadIndexRequest, RustRaftReadinessSnapshot, RustRaftRole, RustRaftStatusSnapshot,
+    rustraft_parity_report, rustraft_read_safety_decision, rustraft_temporalstore_extraction_plan,
+    RustRaftExtractionStatus, RustRaftProductionStatus, RustRaftReadIndexRequest,
+    RustRaftReadinessSnapshot, RustRaftRole, RustRaftStatusSnapshot,
 };
 
 #[test]
@@ -56,4 +57,26 @@ fn read_safety_example_rejects_reads_ahead_of_applied_index() {
 
     assert!(!decision.safe);
     assert_eq!(decision.reason, "apply_lag");
+}
+
+#[test]
+fn extraction_plan_keeps_reusable_raft_logic_out_of_temporalstore() {
+    let plan = rustraft_temporalstore_extraction_plan();
+    assert!(plan.policy.contains("RustRaft owns reusable consensus"));
+    assert!(plan
+        .slices
+        .iter()
+        .any(|slice| slice.id == "read_safety"
+            && slice.status == RustRaftExtractionStatus::InLibrary));
+    assert!(plan
+        .slices
+        .iter()
+        .any(|slice| slice.id == "replication_pipeline_runtime"
+            && slice.status == RustRaftExtractionStatus::PendingMigration));
+    assert!(plan
+        .slices
+        .iter()
+        .any(|slice| slice.id == "domain_fsm_adapters"
+            && slice.status == RustRaftExtractionStatus::AdapterOnly
+            && slice.temporalstore_boundary.contains("TemporalStore owns")));
 }

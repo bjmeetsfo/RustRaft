@@ -29,6 +29,7 @@ License: Apache-2.0.
 - `rustraft_parity_report`
 - `rustraft_production_readiness_report`
 - `rustraft_public_api_contract`
+- `rustraft_temporalstore_extraction_plan`
 - `rustraft_metric_names`
 
 The crate is OpenRaft-free and independent of OpenRaft types. TemporalStore
@@ -77,6 +78,11 @@ node/options, storage, transport, status, metric, safety-policy, WAL record,
 snapshot fence, membership, and ByteRaft-parity surfaces that TemporalStore can
 consume from data-node and metaserver code. The remaining roadmap is tracked in
 [`docs/gap_plan.md`](docs/gap_plan.md).
+
+The `rustraft_temporalstore_extraction_plan()` API is the typed migration
+ledger. It records which Raft responsibilities are already owned by this
+standalone crate, which remain pending migration, and which must stay as
+TemporalStore-specific adapters.
 
 ## Test
 

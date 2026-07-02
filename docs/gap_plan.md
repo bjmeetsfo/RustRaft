@@ -83,6 +83,10 @@ if production_status != production_ready:
 | Fault harness API | Fault cases are currently driven by TemporalStore harnesses. | Add a library-level deterministic harness for partitions, packet loss, slow WAL, restart, compaction, and snapshot install. | `raft_rustraft_*_fault_harness` cases. |
 | Storage adapter boundary | Stable RustRaft storage trait exists; durable storage implementation remains TemporalStore-specific. | Implement `RustRaftStorage` for TemporalStore log/snapshot storage adapters. | Storage recovery and compaction gates. |
 
+The public `rustraft_temporalstore_extraction_plan()` function is the source of
+truth for this migration ledger. It keeps reusable consensus behavior in
+RustRaft while making TemporalStore-specific adapter boundaries explicit.
+
 ## Implementation Order
 
 1. Keep this repo as the stable public RustRaft contract crate.

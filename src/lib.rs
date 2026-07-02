@@ -184,6 +184,29 @@ pub struct RustRaftPublicApiContract {
     pub metrics: RustRaftMetricNames,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustRaftExtractionStatus {
+    InLibrary,
+    AdapterOnly,
+    PendingMigration,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftExtractionSlice {
+    pub id: String,
+    pub status: RustRaftExtractionStatus,
+    pub rustraft_owner: String,
+    pub temporalstore_boundary: String,
+    pub next_evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftTemporalStoreExtractionPlan {
+    pub policy: String,
+    pub slices: Vec<RustRaftExtractionSlice>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftMetricNames {
     pub ready: String,
@@ -983,6 +1006,54 @@ pub struct RustRaftWalLifecycleEvidence {
     pub slow_fsync_backpressure_observed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftWalChecksumFormat {
+    pub algorithm: String,
+    pub encoding: String,
+    pub covered_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftLogRetainedRange {
+    pub first_log_index: RustRaftLogIndex,
+    pub last_log_index: RustRaftLogIndex,
+    pub first_segment_id: u64,
+    pub last_segment_id: u64,
+    pub record_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftWalSegmentIndex {
+    pub segment_id: u64,
+    pub first_log_index: RustRaftLogIndex,
+    pub last_log_index: RustRaftLogIndex,
+    pub record_count: u64,
+    pub sealed: bool,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftWalWriteReport {
+    pub segment_id: u64,
+    pub log_index: RustRaftLogIndex,
+    pub checksum: String,
+    pub checksum_format: RaftWalChecksumFormat,
+    pub bytes_written: u64,
+    pub fsync_on_append: bool,
+    pub segment_rolled: bool,
+    pub hard_state_persisted: bool,
+    pub retained_range: RaftLogRetainedRange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftWalCompactionReport {
+    pub requested_log_index: RustRaftLogIndex,
+    pub released_segments: u64,
+    pub retained_range: RaftLogRetainedRange,
+    pub fence_valid: bool,
+    pub blocker: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftProcessNodeEvidence {
     pub node_id: u64,
@@ -1726,6 +1797,12 @@ pub struct RaftWalRecoveryReport {
     pub truncated_corrupt_tail: bool,
     pub surviving_records: usize,
     pub removed_records: usize,
+    #[serde(default)]
+    pub segments_scanned: u64,
+    #[serde(default)]
+    pub checksum_format: Option<RaftWalChecksumFormat>,
+    #[serde(default)]
+    pub retained_range: Option<RaftLogRetainedRange>,
 }
 
 impl LocalRaftWal {
@@ -6384,6 +6461,56 @@ pub fn rustraft_public_api_contract() -> RustRaftPublicApiContract {
             "rustraft_fatal_blocker_report".to_string(),
         ],
         metrics: rustraft_metric_names(),
+    }
+}
+
+pub fn rustraft_temporalstore_extraction_plan() -> RustRaftTemporalStoreExtractionPlan {
+    RustRaftTemporalStoreExtractionPlan {
+        policy: "RustRaft owns reusable consensus contracts, safety decisions, membership state, WAL/snapshot models, transport/storage traits, pipeline metrics, and deterministic harness logic; TemporalStore keeps only command codecs, process startup, shard FSM adapters, and storage-engine integration.".to_string(),
+        slices: vec![
+            RustRaftExtractionSlice {
+                id: "read_safety".to_string(),
+                status: RustRaftExtractionStatus::InLibrary,
+                rustraft_owner: "read-index, lease-read, bounded-stale, lagging-follower, stale-leader, and minority-partition decisions".to_string(),
+                temporalstore_boundary: "translate data-node and metaserver runtime status into RustRaft read-safety inputs".to_string(),
+                next_evidence: "multi-process TemporalStore harness must attach observed read-index and lease responses".to_string(),
+            },
+            RustRaftExtractionSlice {
+                id: "membership_workflow".to_string(),
+                status: RustRaftExtractionStatus::InLibrary,
+                rustraft_owner: "learner add/catch-up/promote, voter add/remove, witness add, leader transfer validation, rollback reports, and joint consensus summaries".to_string(),
+                temporalstore_boundary: "metaserver scheduler invokes RustRaft workflow and applies accepted operations through data-node process APIs".to_string(),
+                next_evidence: "scheduler-owned data-node membership report with stale-token rejection and restart replay".to_string(),
+            },
+            RustRaftExtractionSlice {
+                id: "wal_snapshot_models".to_string(),
+                status: RustRaftExtractionStatus::InLibrary,
+                rustraft_owner: "hard state, WAL records, segment status, snapshot metadata, apply snapshot fences, and snapshot lifecycle reports".to_string(),
+                temporalstore_boundary: "persist records in TemporalStore-owned directories and bind apply fences to storage mutations".to_string(),
+                next_evidence: "crash between WAL persistence, storage mutation, and snapshot install recovers deterministically".to_string(),
+            },
+            RustRaftExtractionSlice {
+                id: "transport_storage_traits".to_string(),
+                status: RustRaftExtractionStatus::InLibrary,
+                rustraft_owner: "generic storage and transport traits plus AppendEntries, Vote, PreVote, InstallSnapshot, snapshot chunk, and ReadIndex messages".to_string(),
+                temporalstore_boundary: "HTTP/tonic/process adapters implement the traits without leaking TemporalStore command types into RustRaft".to_string(),
+                next_evidence: "data-node and metaserver process paths consume trait adapters in scale/failover harnesses".to_string(),
+            },
+            RustRaftExtractionSlice {
+                id: "replication_pipeline_runtime".to_string(),
+                status: RustRaftExtractionStatus::PendingMigration,
+                rustraft_owner: "inflight limits, append/apply queue limits, max replicate bytes, oversized-log rejection, reorder queue, and pressure counters".to_string(),
+                temporalstore_boundary: "runtime should feed per-peer process observations into RustRaft pipeline evidence".to_string(),
+                next_evidence: "ByteRaft-derived packet-loss, out-of-order append, slow WAL, and pressure tests pass through process harnesses".to_string(),
+            },
+            RustRaftExtractionSlice {
+                id: "domain_fsm_adapters".to_string(),
+                status: RustRaftExtractionStatus::AdapterOnly,
+                rustraft_owner: "opaque bytes/state-machine trait contracts only".to_string(),
+                temporalstore_boundary: "TemporalStore owns data-shard commands, metaserver mutations, object/block storage, and admin surfaces".to_string(),
+                next_evidence: "integration tests prove adapters implement RustRaft traits without moving domain codecs into the library".to_string(),
+            },
+        ],
     }
 }
 
