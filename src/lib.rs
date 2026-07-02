@@ -3484,6 +3484,64 @@ impl RaftCluster {
         Ok(log_id)
     }
 
+    pub fn wal_record_for(&self, node_id: RustRaftNodeId) -> Result<RaftWalRecord, RaftError> {
+        let node = self
+            .nodes
+            .get(&node_id)
+            .ok_or(RaftError::NodeNotFound(node_id))?;
+        let installed_snapshot = node.installed_snapshot.clone();
+        let snapshot_index = installed_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.last_log_id.index)
+            .unwrap_or_default();
+        let mut record = RaftWalRecord {
+            group_id: self.group_id,
+            node_id,
+            hard_state: node.hard_state.clone(),
+            membership: self.membership(),
+            entries: node.log.clone(),
+            installed_snapshot,
+            apply_snapshot_fence: RustRaftApplySnapshotFence {
+                applied_index: node.applied_index,
+                commit_index: node.commit_index,
+                installed_snapshot_index: snapshot_index,
+                first_retained_log_index: if snapshot_index > 0 {
+                    snapshot_index + 1
+                } else {
+                    node.log
+                        .first()
+                        .map(|entry| entry.log_id.index)
+                        .unwrap_or_default()
+                },
+            },
+            checksum: String::new(),
+        };
+        record.checksum = rustraft_wal_checksum(&record);
+        Ok(record)
+    }
+
+    pub fn restore_wal_record(&mut self, record: RaftWalRecord) -> Result<(), RaftError> {
+        if record.group_id != self.group_id {
+            return Err(RaftError::InvalidRequest(
+                "WAL record group id mismatch".to_string(),
+            ));
+        }
+        let node = self
+            .nodes
+            .get_mut(&record.node_id)
+            .ok_or(RaftError::NodeNotFound(record.node_id))?;
+        node.hard_state = record.hard_state;
+        node.log = record.entries;
+        node.installed_snapshot = record.installed_snapshot;
+        node.commit_index = record.apply_snapshot_fence.commit_index;
+        node.applied_index = record.apply_snapshot_fence.applied_index;
+        self.current_term = self.current_term.max(node.hard_state.current_term);
+        self.last_log_index = self.last_log_index.max(node.match_index());
+        self.refresh_cluster_indexes();
+        self.refresh_replication_pipelines();
+        Ok(())
+    }
+
     pub fn append_entries_to(
         &mut self,
         target: RustRaftNodeId,
@@ -4598,8 +4656,32 @@ fn raft_node_runtime_loop(
             auto_promote: false,
         });
     }
-    let mut cluster = match RaftCluster::new(group_id, options.config, peers) {
+    let mut cluster = match RaftCluster::new(group_id, options.config.clone(), peers) {
         Ok(cluster) => cluster,
+        Err(error) => {
+            while let Ok(command) = command_rx.recv() {
+                if respond_runtime_error(command, error.clone()) {
+                    break;
+                }
+            }
+            return;
+        }
+    };
+    let mut wal = match PersistentRaftWal::open(PersistentRaftWalOptions {
+        dir: PathBuf::from(&options.wal_dir),
+        max_records_per_segment: 10_000,
+        max_segment_bytes: options.config.max_segment_bytes,
+        min_keep_segments: options.config.min_keep_segment_num as usize,
+        fsync_on_append: true,
+    }) {
+        Ok(mut wal) => {
+            if let Ok(report) = wal.recover() {
+                if let Some(record) = report.recovered {
+                    let _ = cluster.restore_wal_record(record);
+                }
+            }
+            Some(wal)
+        }
         Err(error) => {
             while let Ok(command) = command_rx.recv() {
                 if respond_runtime_error(command, error.clone()) {
@@ -4638,7 +4720,13 @@ fn raft_node_runtime_loop(
                 let _ = reply.send(Ok(status));
             }
             RaftNodeRuntimeOp::Propose(payload, reply) => {
-                let _ = reply.send(cluster.propose(payload));
+                let result = cluster.propose(payload).and_then(|log_id| {
+                    if let Some(wal) = wal.as_mut() {
+                        wal.append(cluster.wal_record_for(node_id)?)?;
+                    }
+                    Ok(log_id)
+                });
+                let _ = reply.send(result);
             }
             RaftNodeRuntimeOp::ReadIndex(min_commit_index, reply) => {
                 let request = ReadIndexRequest {

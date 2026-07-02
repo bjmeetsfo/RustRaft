@@ -2,6 +2,9 @@ use rustraft::{
     RaftNodeRuntime, RaftNodeRuntimeState, RustRaftConfig, RustRaftNodeOptions, RustRaftPeer,
     RustRaftReplicaRole,
 };
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn peer(node_id: u64) -> RustRaftPeer {
     RustRaftPeer {
@@ -13,14 +16,29 @@ fn peer(node_id: u64) -> RustRaftPeer {
     }
 }
 
+fn temp_runtime_dir(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "rustraft-node-runtime-{name}-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
 fn node_options() -> RustRaftNodeOptions {
+    node_options_in(temp_runtime_dir("default"))
+}
+
+fn node_options_in(base_dir: PathBuf) -> RustRaftNodeOptions {
     RustRaftNodeOptions {
         group_id: 77,
         node_id: 1,
         raft_addr: "127.0.0.1:12001".to_string(),
         snapshot_addr: "127.0.0.1:13001".to_string(),
-        wal_dir: "/tmp/rustraft-node-runtime-wal".to_string(),
-        snapshot_dir: "/tmp/rustraft-node-runtime-snapshot".to_string(),
+        wal_dir: base_dir.join("wal").to_string_lossy().into_owned(),
+        snapshot_dir: base_dir.join("snapshot").to_string_lossy().into_owned(),
         role: RustRaftReplicaRole::Voter,
         config: RustRaftConfig::default(),
         peers: vec![peer(1), peer(2), peer(3)],
@@ -119,4 +137,33 @@ fn node_runtime_shutdown_is_idempotent() {
     runtime.shutdown().expect("shutdown runtime");
     runtime.shutdown().expect("second shutdown is ok");
     assert_eq!(runtime.state(), RaftNodeRuntimeState::Shutdown);
+}
+
+#[test]
+fn node_runtime_recovers_committed_index_from_persistent_wal() {
+    let base_dir = temp_runtime_dir("wal-recovery");
+    let options = node_options_in(base_dir.clone());
+    {
+        let mut runtime = RaftNodeRuntime::create(options.clone()).expect("create runtime");
+        runtime.start().expect("start runtime");
+        assert_eq!(runtime.propose(b"one".to_vec()).expect("first").index, 1);
+        assert_eq!(runtime.propose(b"two".to_vec()).expect("second").index, 2);
+        runtime.shutdown().expect("shutdown");
+    }
+
+    let mut recovered = RaftNodeRuntime::create(options).expect("recreate runtime");
+    recovered.start().expect("start recovered runtime");
+    let read = recovered.read_index(2).expect("read recovered index");
+    assert!(read.safe);
+    assert_eq!(read.read_index, 2);
+    assert_eq!(
+        recovered
+            .propose(b"three".to_vec())
+            .expect("post recovery write")
+            .index,
+        3
+    );
+    recovered.shutdown().expect("shutdown recovered");
+
+    let _ = fs::remove_dir_all(base_dir);
 }
