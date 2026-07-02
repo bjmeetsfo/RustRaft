@@ -25,7 +25,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -1602,6 +1605,438 @@ impl LocalRaftWal {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistentRaftWalOptions {
+    pub dir: PathBuf,
+    pub max_records_per_segment: usize,
+    pub max_segment_bytes: u64,
+    pub min_keep_segments: usize,
+    pub fsync_on_append: bool,
+}
+
+impl PersistentRaftWalOptions {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            max_records_per_segment: 10_000,
+            max_segment_bytes: 64 * 1024 * 1024,
+            min_keep_segments: 2,
+            fsync_on_append: true,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), RaftError> {
+        if self.max_records_per_segment == 0 {
+            return Err(RaftError::InvalidRequest(
+                "max_records_per_segment must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_segment_bytes == 0 {
+            return Err(RaftError::InvalidRequest(
+                "max_segment_bytes must be greater than zero".to_string(),
+            ));
+        }
+        if self.min_keep_segments == 0 {
+            return Err(RaftError::InvalidRequest(
+                "min_keep_segments must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct PersistentRaftWal {
+    options: PersistentRaftWalOptions,
+    segments: Vec<RaftWalSegment>,
+    active_segment: File,
+    next_segment_id: u64,
+    released_segment_count: u64,
+    truncated_corrupt_tail: bool,
+}
+
+impl PersistentRaftWal {
+    pub fn open(options: PersistentRaftWalOptions) -> Result<Self, RaftError> {
+        options.validate()?;
+        fs::create_dir_all(&options.dir).map_err(|err| {
+            RaftError::Storage(format!(
+                "failed to create WAL directory {}: {err}",
+                options.dir.display()
+            ))
+        })?;
+        let (mut segments, truncated_corrupt_tail) = read_wal_segments_from_dir(&options.dir)?;
+        if segments.is_empty() {
+            segments.push(RaftWalSegment {
+                segment_id: 0,
+                first_index: 0,
+                last_index: 0,
+                records: Vec::new(),
+                sealed: false,
+            });
+            write_wal_segment_file(&options.dir, &segments[0])?;
+        }
+        let active_id = segments
+            .last()
+            .map(|segment| segment.segment_id)
+            .unwrap_or(0);
+        for segment in segments.iter_mut() {
+            segment.sealed = segment.segment_id != active_id;
+        }
+        let active_segment = open_segment_for_append(&options.dir, active_id)?;
+        let next_segment_id = active_id + 1;
+        Ok(Self {
+            options,
+            segments,
+            active_segment,
+            next_segment_id,
+            released_segment_count: 0,
+            truncated_corrupt_tail,
+        })
+    }
+
+    pub fn append(&mut self, mut record: RaftWalRecord) -> Result<String, RaftError> {
+        record.checksum = rustraft_wal_checksum(&record);
+        let encoded = serde_json::to_string(&record)
+            .map_err(|err| RaftError::Storage(format!("failed to encode WAL record: {err}")))?;
+        let record_bytes = encoded.len() as u64 + 1;
+        let active_len = self
+            .active_segment
+            .metadata()
+            .map_err(|err| {
+                RaftError::Storage(format!("failed to read WAL active segment metadata: {err}"))
+            })?
+            .len();
+        let active_records = self
+            .segments
+            .last()
+            .map(|segment| segment.records.len())
+            .unwrap_or_default();
+        if active_records >= self.options.max_records_per_segment
+            || (active_records > 0 && active_len + record_bytes > self.options.max_segment_bytes)
+        {
+            self.roll_segment()?;
+        }
+
+        self.active_segment
+            .write_all(encoded.as_bytes())
+            .and_then(|_| self.active_segment.write_all(b"\n"))
+            .map_err(|err| RaftError::Storage(format!("failed to append WAL record: {err}")))?;
+        if self.options.fsync_on_append {
+            self.active_segment
+                .sync_data()
+                .map_err(|err| RaftError::Storage(format!("failed to fsync WAL record: {err}")))?;
+        }
+        let checksum = record.checksum.clone();
+        let record_index = wal_record_index(&record);
+        let segment = self
+            .segments
+            .last_mut()
+            .ok_or_else(|| RaftError::Storage("WAL has no active segment".to_string()))?;
+        if segment.records.is_empty() {
+            segment.first_index = record_index;
+        }
+        segment.last_index = record_index;
+        segment.records.push(record);
+        Ok(checksum)
+    }
+
+    pub fn recover(&mut self) -> Result<RaftWalRecoveryReport, RaftError> {
+        let (segments, truncated_corrupt_tail) = read_wal_segments_from_dir(&self.options.dir)?;
+        let original_len = self.records().len();
+        let records: Vec<_> = segments
+            .iter()
+            .flat_map(|segment| segment.records.iter().cloned())
+            .collect();
+        self.segments = if segments.is_empty() {
+            vec![RaftWalSegment {
+                segment_id: 0,
+                first_index: 0,
+                last_index: 0,
+                records: Vec::new(),
+                sealed: false,
+            }]
+        } else {
+            segments
+        };
+        let active_id = self
+            .segments
+            .last()
+            .map(|segment| segment.segment_id)
+            .unwrap_or(0);
+        for segment in self.segments.iter_mut() {
+            segment.sealed = segment.segment_id != active_id;
+        }
+        self.active_segment = open_segment_for_append(&self.options.dir, active_id)?;
+        self.next_segment_id = active_id + 1;
+        let observed_corrupt_tail = self.truncated_corrupt_tail || truncated_corrupt_tail;
+        self.truncated_corrupt_tail = observed_corrupt_tail;
+        Ok(RaftWalRecoveryReport {
+            recovered: rustraft_recover_latest_wal_record(&records).ok(),
+            truncated_corrupt_tail: observed_corrupt_tail,
+            surviving_records: records.len(),
+            removed_records: original_len.saturating_sub(records.len()),
+        })
+    }
+
+    pub fn compact_through(&mut self, log_index: RustRaftLogIndex) -> Result<u64, RaftError> {
+        if self.segments.len() <= self.options.min_keep_segments {
+            return Ok(0);
+        }
+        let removable_count = self
+            .segments
+            .len()
+            .saturating_sub(self.options.min_keep_segments);
+        let removable_ids: Vec<_> = self
+            .segments
+            .iter()
+            .take(removable_count)
+            .filter(|segment| segment.last_index > 0 && segment.last_index <= log_index)
+            .map(|segment| segment.segment_id)
+            .collect();
+        for segment_id in &removable_ids {
+            let path = wal_segment_path(&self.options.dir, *segment_id);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(RaftError::Storage(format!(
+                        "failed to remove compacted WAL segment {}: {err}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        if !removable_ids.is_empty() {
+            self.segments
+                .retain(|segment| !removable_ids.contains(&segment.segment_id));
+            self.released_segment_count += removable_ids.len() as u64;
+        }
+        Ok(removable_ids.len() as u64)
+    }
+
+    pub fn status(&self) -> RustRaftWalLifecycleStatus {
+        let total_records = self.records().len() as u64;
+        let total_bytes = self
+            .segments
+            .iter()
+            .map(|segment| {
+                fs::metadata(wal_segment_path(&self.options.dir, segment.segment_id))
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default()
+            })
+            .sum();
+        let active_segment_bytes = self
+            .segments
+            .last()
+            .and_then(|segment| {
+                fs::metadata(wal_segment_path(&self.options.dir, segment.segment_id)).ok()
+            })
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        RustRaftWalLifecycleStatus {
+            segment_count: self.segments.len() as u64,
+            active_segment_id: self
+                .segments
+                .last()
+                .map(|segment| segment.segment_id)
+                .unwrap_or(0),
+            first_retained_segment_id: self
+                .segments
+                .first()
+                .map(|segment| segment.segment_id)
+                .unwrap_or(0),
+            last_retained_segment_id: self
+                .segments
+                .last()
+                .map(|segment| segment.segment_id)
+                .unwrap_or(0),
+            total_bytes,
+            active_segment_bytes,
+            total_records,
+            first_sequence: self
+                .segments
+                .first()
+                .map(|segment| segment.segment_id)
+                .unwrap_or(0),
+            last_sequence: self
+                .segments
+                .last()
+                .map(|segment| segment.segment_id)
+                .unwrap_or(0),
+            first_log_index: self
+                .segments
+                .first()
+                .map(|segment| segment.first_index)
+                .unwrap_or(0),
+            last_log_index: self
+                .segments
+                .last()
+                .map(|segment| segment.last_index)
+                .unwrap_or(0),
+            released_segment_count: self.released_segment_count,
+            slow_fsync_backpressure_observed: false,
+        }
+    }
+
+    pub fn segments(&self) -> &[RaftWalSegment] {
+        &self.segments
+    }
+
+    pub fn records(&self) -> Vec<RaftWalRecord> {
+        self.segments
+            .iter()
+            .flat_map(|segment| segment.records.iter().cloned())
+            .collect()
+    }
+
+    pub fn corrupt_tail_for_test(&mut self) -> Result<(), RaftError> {
+        self.active_segment
+            .seek(SeekFrom::End(0))
+            .and_then(|_| self.active_segment.write_all(b"{\"corrupt_tail\":true\n"))
+            .and_then(|_| self.active_segment.flush())
+            .map_err(|err| RaftError::Storage(format!("failed to corrupt WAL tail: {err}")))?;
+        Ok(())
+    }
+
+    fn roll_segment(&mut self) -> Result<(), RaftError> {
+        if let Some(segment) = self.segments.last_mut() {
+            segment.sealed = true;
+            write_wal_segment_file(&self.options.dir, segment)?;
+        }
+        let segment_id = self.next_segment_id;
+        self.next_segment_id += 1;
+        let segment = RaftWalSegment {
+            segment_id,
+            first_index: 0,
+            last_index: 0,
+            records: Vec::new(),
+            sealed: false,
+        };
+        write_wal_segment_file(&self.options.dir, &segment)?;
+        self.active_segment = open_segment_for_append(&self.options.dir, segment_id)?;
+        self.segments.push(segment);
+        Ok(())
+    }
+}
+
+pub type FileRaftWal = PersistentRaftWal;
+
+fn wal_segment_path(dir: &Path, segment_id: u64) -> PathBuf {
+    dir.join(format!("{segment_id:020}.wal"))
+}
+
+fn wal_record_index(record: &RaftWalRecord) -> RustRaftLogIndex {
+    record
+        .hard_state
+        .committed
+        .as_ref()
+        .map(|log_id| log_id.index)
+        .or_else(|| record.entries.last().map(|entry| entry.log_id.index))
+        .unwrap_or_default()
+}
+
+fn open_segment_for_append(dir: &Path, segment_id: u64) -> Result<File, RaftError> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(wal_segment_path(dir, segment_id))
+        .map_err(|err| RaftError::Storage(format!("failed to open WAL segment: {err}")))
+}
+
+fn write_wal_segment_file(dir: &Path, segment: &RaftWalSegment) -> Result<(), RaftError> {
+    let mut file = File::create(wal_segment_path(dir, segment.segment_id))
+        .map_err(|err| RaftError::Storage(format!("failed to create WAL segment: {err}")))?;
+    for record in &segment.records {
+        let encoded = serde_json::to_string(record)
+            .map_err(|err| RaftError::Storage(format!("failed to encode WAL segment: {err}")))?;
+        file.write_all(encoded.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .map_err(|err| RaftError::Storage(format!("failed to write WAL segment: {err}")))?;
+    }
+    file.sync_data()
+        .map_err(|err| RaftError::Storage(format!("failed to fsync WAL segment: {err}")))
+}
+
+fn read_wal_segments_from_dir(dir: &Path) -> Result<(Vec<RaftWalSegment>, bool), RaftError> {
+    let mut files = fs::read_dir(dir)
+        .map_err(|err| RaftError::Storage(format!("failed to read WAL directory: {err}")))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let segment_id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u64>().ok())?;
+            (path.extension().and_then(|ext| ext.to_str()) == Some("wal"))
+                .then_some((segment_id, path))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(segment_id, _)| *segment_id);
+
+    let mut segments = Vec::new();
+    let mut truncated_corrupt_tail = false;
+    let last_file_index = files.len().saturating_sub(1);
+    for (file_position, (segment_id, path)) in files.into_iter().enumerate() {
+        let (records, truncated) = read_wal_segment_file(&path)?;
+        truncated_corrupt_tail |= truncated;
+        let first_index = records.first().map(wal_record_index).unwrap_or_default();
+        let last_index = records.last().map(wal_record_index).unwrap_or_default();
+        segments.push(RaftWalSegment {
+            segment_id,
+            first_index,
+            last_index,
+            records,
+            sealed: file_position != last_file_index,
+        });
+    }
+    Ok((segments, truncated_corrupt_tail))
+}
+
+fn read_wal_segment_file(path: &Path) -> Result<(Vec<RaftWalRecord>, bool), RaftError> {
+    let file = File::open(path)
+        .map_err(|err| RaftError::Storage(format!("failed to open WAL segment: {err}")))?;
+    let reader = BufReader::new(file);
+    let mut records = Vec::new();
+    let mut valid_end_offset = 0u64;
+    let mut current_offset = 0u64;
+    let mut truncated = false;
+    for line in reader.split(b'\n') {
+        let line = line.map_err(|err| {
+            RaftError::Storage(format!(
+                "failed to read WAL segment {}: {err}",
+                path.display()
+            ))
+        })?;
+        current_offset += line.len() as u64 + 1;
+        if line.is_empty() {
+            valid_end_offset = current_offset;
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<RaftWalRecord>(&line) else {
+            truncated = true;
+            break;
+        };
+        if !rustraft_wal_checksum_valid(&record) {
+            truncated = true;
+            break;
+        }
+        valid_end_offset = current_offset;
+        records.push(record);
+    }
+    if truncated {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|err| RaftError::Storage(format!("failed to reopen WAL segment: {err}")))?;
+        file.set_len(valid_end_offset)
+            .map_err(|err| RaftError::Storage(format!("failed to truncate WAL segment: {err}")))?;
+        file.sync_data()
+            .map_err(|err| RaftError::Storage(format!("failed to fsync truncated WAL: {err}")))?;
+    }
+    Ok((records, truncated))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
