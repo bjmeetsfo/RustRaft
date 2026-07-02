@@ -42,6 +42,8 @@ startup, object/page storage, and admin endpoints.
   - `RustRaftStatusSnapshot`
   - `RustRaftMetricNames`
   - ByteRaft parity-surface reporting
+  - read-path reports for quorum, applied-index fences, lease-read eligibility,
+    bounded-stale follower reads, and stale leader lease rejection
 - Shared corpus and Rust tests use `raft_rustraft_*` case names.
 - OpenRaft is not part of the RustRaft contract.
 - Production readiness is fail-closed. A report is `blocked` when any required
@@ -75,7 +77,7 @@ if production_status != production_ready:
 
 | Gap | Why It Matters | Target Implementation | Shared Gate |
 |---|---|---|---|
-| Native log runtime | The contract is now separate, but most live runtime code still lives inside `temporalstore-rust`. | Move reusable log entry, hard-state, membership, snapshot-floor, and read-index primitives into this repo; keep only FSM adapters in TemporalStore. | RustRaft unit tests plus TemporalStore integration tests. |
+| Native log runtime | The contract is now separate, but most live runtime code still lives inside `temporalstore-rust`. | Move reusable log entry, hard-state, membership, snapshot-floor, and process-observed read-path primitives into this repo; keep only FSM adapters in TemporalStore. | RustRaft unit tests plus TemporalStore integration tests. |
 | Transport abstraction | Stable RustRaft transport API exists; production data-node and metaserver paths still need to implement it directly. | Wire `RustRaftTransport` into TemporalStore data-node and metaserver RPC paths. | Shared Raft transport contract cases. |
 | Snapshot lifecycle | Snapshot floor, chunk retry, stale chunk rejection, and tail catch-up are still tested mostly through TemporalStore. | Add library-level snapshot state machine and fault tests. | `raft_rustraft_snapshot_lifecycle_depth`. |
 | Membership workflow | Learner catch-up, promote, remove, transfer leader, and joint membership need a reusable library state model. | Add membership planner/state transitions to this repo; TemporalStore metaserver consumes it. | `raft_rustraft_leader_transfer_high_write_fault_harness` and membership cases. |

@@ -23,6 +23,9 @@ License: Apache-2.0.
 - `RustRaftFaultScenario`
 - `rustraft_fault_harness_readiness_report`
 - `rustraft_read_safety_decision`
+- `rustraft_applied_index_fence_report`
+- `rustraft_lease_read_eligibility_report`
+- `rustraft_bounded_stale_read_report`
 - `rustraft_learner_promotion_decision`
 - `rustraft_append_safety_decision`
 - `RustRaftReadinessEvidence`
@@ -80,6 +83,11 @@ node/options, storage, transport, status, metric, safety-policy, WAL record,
 snapshot fence, membership, and ByteRaft-parity surfaces that TemporalStore can
 consume from data-node and metaserver code. The remaining roadmap is tracked in
 [`docs/gap_plan.md`](docs/gap_plan.md).
+
+Read safety now includes structured report types for quorum, applied-index
+fences, leader lease-read eligibility, and bounded-stale follower reads. These
+reports are intended to be filled with observed process-path evidence before a
+TemporalStore deployment claims ByteRaft-style read-index or lease-read parity.
 
 The `rustraft_temporalstore_extraction_plan()` API is the typed migration
 ledger. It records which Raft responsibilities are already owned by this
