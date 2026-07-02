@@ -257,7 +257,7 @@ pub struct RustRaftWalLifecycleEvidence {
     pub slow_fsync_backpressure_observed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftProcessNodeEvidence {
     pub node_id: u64,
     pub addr: String,
@@ -470,7 +470,7 @@ impl RustRaftProcessOperationalSemanticsEvidence {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftDataNodeProcessRolloutReport {
     pub shard_id: u64,
     #[serde(default)]
@@ -539,7 +539,7 @@ pub struct RustRaftDataNodeProcessRolloutReport {
     pub blockers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftMetaProcessRolloutReport {
     #[serde(default)]
     pub voters: Vec<u64>,
@@ -702,6 +702,229 @@ pub struct RustRaftHardState {
     pub current_term: u64,
     pub voted_for: Option<u64>,
     pub committed: Option<RustRaftLogId>,
+}
+
+pub type RustRaftNodeId = u64;
+pub type RustRaftGroupId = u64;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RustRaftReplicaRole {
+    Voter,
+    Learner,
+    Witness,
+}
+
+impl RustRaftReplicaRole {
+    pub fn participates_in_quorum(self) -> bool {
+        matches!(self, Self::Voter | Self::Witness)
+    }
+
+    pub fn can_serve_data(self) -> bool {
+        matches!(self, Self::Voter | Self::Learner)
+    }
+
+    pub fn can_be_leader(self) -> bool {
+        matches!(self, Self::Voter)
+    }
+}
+
+impl Default for RustRaftReplicaRole {
+    fn default() -> Self {
+        Self::Voter
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftPeer {
+    pub node_id: RustRaftNodeId,
+    pub raft_addr: String,
+    pub snapshot_addr: String,
+    pub role: RustRaftReplicaRole,
+    #[serde(default)]
+    pub auto_promote: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftMembership {
+    pub group_id: RustRaftGroupId,
+    pub voters: Vec<RustRaftNodeId>,
+    #[serde(default)]
+    pub learners: Vec<RustRaftNodeId>,
+    #[serde(default)]
+    pub witnesses: Vec<RustRaftNodeId>,
+    #[serde(default)]
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftJointMembership {
+    pub old_voters: Vec<RustRaftNodeId>,
+    pub new_voters: Vec<RustRaftNodeId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftApplySnapshotFence {
+    pub applied_index: u64,
+    pub commit_index: u64,
+    pub installed_snapshot_index: u64,
+    pub first_retained_log_index: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftWalRecord {
+    pub group_id: RustRaftGroupId,
+    pub node_id: RustRaftNodeId,
+    pub hard_state: RustRaftHardState,
+    pub membership: RustRaftMembership,
+    #[serde(default)]
+    pub entries: Vec<RustRaftLogEntry>,
+    #[serde(default)]
+    pub installed_snapshot: Option<RustRaftSnapshotMeta>,
+    pub apply_snapshot_fence: RustRaftApplySnapshotFence,
+    pub checksum: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftConfig {
+    pub election_timeout_ms: u64,
+    pub heartbeat_interval_ms: u64,
+    pub leader_lease_ms: u64,
+    pub max_payload_bytes: u64,
+    pub snapshot_threshold_entries: u64,
+    pub max_segment_bytes: u64,
+    pub min_keep_segment_num: u64,
+    pub enable_pre_vote: bool,
+    pub enable_lease_read: bool,
+}
+
+impl Default for RustRaftConfig {
+    fn default() -> Self {
+        Self {
+            election_timeout_ms: 1_000,
+            heartbeat_interval_ms: 100,
+            leader_lease_ms: 500,
+            max_payload_bytes: 8 * 1024 * 1024,
+            snapshot_threshold_entries: 10_000,
+            max_segment_bytes: 64 * 1024 * 1024,
+            min_keep_segment_num: 2,
+            enable_pre_vote: true,
+            enable_lease_read: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftNodeOptions {
+    pub group_id: RustRaftGroupId,
+    pub node_id: RustRaftNodeId,
+    pub raft_addr: String,
+    pub snapshot_addr: String,
+    pub wal_dir: String,
+    pub snapshot_dir: String,
+    pub role: RustRaftReplicaRole,
+    pub config: RustRaftConfig,
+    #[serde(default)]
+    pub peers: Vec<RustRaftPeer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftProposeOptions {
+    pub expected_term: Option<u64>,
+    pub is_command: bool,
+}
+
+impl Default for RustRaftProposeOptions {
+    fn default() -> Self {
+        Self {
+            expected_term: None,
+            is_command: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftApplyRequest {
+    pub group_id: RustRaftGroupId,
+    pub log_id: RustRaftLogId,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftApplyResponse {
+    pub applied_index: u64,
+    pub response: Vec<u8>,
+}
+
+pub trait RustRaftStateMachine {
+    fn apply(&mut self, request: RustRaftApplyRequest) -> Result<RustRaftApplyResponse, RustRaftError>;
+    fn snapshot(&self) -> Result<RustRaftSnapshotChunk, RustRaftError>;
+    fn install_snapshot(&mut self, chunk: RustRaftSnapshotChunk) -> Result<(), RustRaftError>;
+}
+
+pub trait RustRaftConsensus {
+    fn start(&mut self) -> Result<(), RustRaftError>;
+    fn stop(&mut self) -> Result<(), RustRaftError>;
+    fn status(&self) -> Result<RustRaftStatusSnapshot, RustRaftError>;
+    fn propose(
+        &mut self,
+        payload: Vec<u8>,
+        options: RustRaftProposeOptions,
+    ) -> Result<RustRaftLogId, RustRaftError>;
+    fn read_index(&self, min_commit_index: u64) -> Result<RustRaftReadIndexResponse, RustRaftError>;
+    fn add_peer(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError>;
+    fn add_learner(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError>;
+    fn promote_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RustRaftError>;
+    fn add_witness(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError>;
+    fn remove_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RustRaftError>;
+    fn transfer_leader(&mut self, target: RustRaftNodeId) -> Result<(), RustRaftError>;
+    fn campaign(&mut self, forced: bool) -> Result<(), RustRaftError>;
+    fn trigger_snapshot(&mut self) -> Result<RustRaftSnapshotMeta, RustRaftError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftByteRaftParitySurface {
+    pub node_lifecycle: Vec<String>,
+    pub write_api: Vec<String>,
+    pub read_api: Vec<String>,
+    pub membership_api: Vec<String>,
+    pub durability_api: Vec<String>,
+    pub observability_api: Vec<String>,
+}
+
+pub fn rustraft_byteraft_parity_surface() -> RustRaftByteRaftParitySurface {
+    RustRaftByteRaftParitySurface {
+        node_lifecycle: vec![
+            "create".to_string(),
+            "start".to_string(),
+            "restart".to_string(),
+            "stop".to_string(),
+            "shutdown".to_string(),
+        ],
+        write_api: vec!["propose".to_string(), "propose_options.expected_term".to_string()],
+        read_api: vec!["read_index".to_string(), "lease_read".to_string()],
+        membership_api: vec![
+            "add_node".to_string(),
+            "add_learner".to_string(),
+            "add_witness".to_string(),
+            "promote".to_string(),
+            "remove_node".to_string(),
+            "transfer_leader".to_string(),
+            "campaign".to_string(),
+        ],
+        durability_api: vec![
+            "wal_hard_state".to_string(),
+            "snapshot_install".to_string(),
+            "snapshot_tail_catchup".to_string(),
+            "apply_snapshot_fence".to_string(),
+        ],
+        observability_api: vec![
+            "status".to_string(),
+            "local_status".to_string(),
+            "metrics".to_string(),
+            "fatal_events".to_string(),
+        ],
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -905,6 +1128,65 @@ pub trait RustRaftTransport {
         target: u64,
         request: RustRaftReadIndexRequest,
     ) -> Result<RustRaftReadIndexResponse, RustRaftError>;
+}
+
+pub fn rustraft_validate_apply_snapshot_fence(
+    record: &RustRaftWalRecord,
+) -> Result<(), RustRaftError> {
+    let fence = &record.apply_snapshot_fence;
+    let committed_index = record
+        .hard_state
+        .committed
+        .as_ref()
+        .map(|log_id| log_id.index)
+        .unwrap_or_default();
+    if fence.applied_index > committed_index {
+        return Err(RustRaftError::Storage(
+            "apply snapshot fence is ahead of committed index".to_string(),
+        ));
+    }
+    if fence.commit_index != committed_index {
+        return Err(RustRaftError::Storage(
+            "apply snapshot fence commit index does not match hard state".to_string(),
+        ));
+    }
+    if let Some(snapshot) = &record.installed_snapshot {
+        if fence.installed_snapshot_index != snapshot.last_log_id.index {
+            return Err(RustRaftError::Storage(
+                "apply snapshot fence does not match installed snapshot".to_string(),
+            ));
+        }
+        if fence.first_retained_log_index > 0
+            && fence.first_retained_log_index <= snapshot.last_log_id.index
+        {
+            return Err(RustRaftError::Storage(
+                "first retained log index overlaps installed snapshot".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn rustraft_recover_latest_wal_record(
+    records: &[RustRaftWalRecord],
+) -> Result<RustRaftWalRecord, RustRaftError> {
+    let Some(record) = records
+        .iter()
+        .filter(|record| rustraft_validate_apply_snapshot_fence(record).is_ok())
+        .max_by_key(|record| {
+            record
+                .hard_state
+                .committed
+                .as_ref()
+                .map(|log_id| log_id.index)
+                .unwrap_or_default()
+        })
+    else {
+        return Err(RustRaftError::Storage(
+            "no valid WAL record survived recovery".to_string(),
+        ));
+    };
+    Ok(record.clone())
 }
 
 pub fn rustraft_parity_contract() -> RustRaftParityContract {

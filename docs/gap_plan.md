@@ -6,6 +6,11 @@ keeping the operational semantics that production storage needs: leader-only
 writes, bounded reads, durable hard state, safe membership, snapshots, failover,
 and observable apply lag.
 
+The intended architecture mirrors C++ TemporalStore consuming ByteRaft:
+RustRaft owns generic Raft mechanics and public contracts; Rust TemporalStore
+keeps only adapters for TemporalStore commands, metaserver mutations, process
+startup, object/page storage, and admin endpoints.
+
 ## What Is Implemented Now
 
 - `RustRaft` lives in its own repository:
@@ -25,11 +30,18 @@ and observable apply lag.
   `RustRaftReadinessSnapshot`, then asks the `rustraft` library to build the
   report.
 - The library now owns stable production-boundary APIs for:
+  - `RustRaftConsensus`
+  - `RustRaftStateMachine`
+  - `RustRaftNodeOptions`
+  - `RustRaftConfig`
+  - voter, learner, and witness roles
+  - generic membership, joint membership, WAL record, and snapshot fence types
   - `RustRaftStorage`
   - `RustRaftTransport`
   - AppendEntries, Vote, InstallSnapshot, and ReadIndex request/response messages
   - `RustRaftStatusSnapshot`
   - `RustRaftMetricNames`
+  - ByteRaft parity-surface reporting
 - Shared corpus and Rust tests use `raft_rustraft_*` case names.
 - OpenRaft is not part of the RustRaft contract.
 - Production readiness is fail-closed. A report is `blocked` when any required
@@ -63,7 +75,7 @@ if production_status != production_ready:
 
 | Gap | Why It Matters | Target Implementation | Shared Gate |
 |---|---|---|---|
-| Native log runtime | The contract is now separate, but runtime code still lives inside `temporalstore-rust`. | Move reusable log entry, hard-state, membership, snapshot-floor, and read-index primitives into this repo. | RustRaft unit tests plus TemporalStore integration tests. |
+| Native log runtime | The contract is now separate, but most live runtime code still lives inside `temporalstore-rust`. | Move reusable log entry, hard-state, membership, snapshot-floor, and read-index primitives into this repo; keep only FSM adapters in TemporalStore. | RustRaft unit tests plus TemporalStore integration tests. |
 | Transport abstraction | Stable RustRaft transport API exists; production data-node and metaserver paths still need to implement it directly. | Wire `RustRaftTransport` into TemporalStore data-node and metaserver RPC paths. | Shared Raft transport contract cases. |
 | Snapshot lifecycle | Snapshot floor, chunk retry, stale chunk rejection, and tail catch-up are still tested mostly through TemporalStore. | Add library-level snapshot state machine and fault tests. | `raft_rustraft_snapshot_lifecycle_depth`. |
 | Membership workflow | Learner catch-up, promote, remove, transfer leader, and joint membership need a reusable library state model. | Add membership planner/state transitions to this repo; TemporalStore metaserver consumes it. | `raft_rustraft_leader_transfer_high_write_fault_harness` and membership cases. |
@@ -75,10 +87,10 @@ if production_status != production_ready:
 
 1. Keep this repo as the stable public RustRaft contract crate.
 2. Move pure contract/state types first; keep TemporalStore process and storage code
-   where it is until the library boundary is stable.
+   where it is until the library boundary is stable. In progress.
 3. Add RustRaft transport and storage traits without changing production behavior. Done.
 4. Add library-level deterministic state-machine tests for read-index, stale leader,
-   learner promotion, snapshot floor, and compacted-entry rejection.
+   learner promotion, snapshot floor, and compacted-entry rejection. Done.
 5. Make TemporalStore data-node and metaserver code consume the shared RustRaft
    traits and reports.
 6. Run shared corpus gates for data-node Raft, metaserver Raft, multi-node,

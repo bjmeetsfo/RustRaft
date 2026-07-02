@@ -69,10 +69,13 @@ consensus-readiness boundary:
 
 ## Current Scope
 
-This first standalone version is a contract library. It does not yet implement a
-complete Raft consensus runtime. It now also owns the stable storage, transport,
-status, metric, and safety-policy contract surface that TemporalStore can
-implement from its data-node and metaserver runtime code. The remaining roadmap is tracked in
+This standalone version is the Rust equivalent of the C++ TemporalStore +
+ByteRaft split: RustRaft owns the reusable Raft-facing contracts and model
+primitives, while TemporalStore owns only FSM/domain adapters, codecs, process
+wiring, and storage-engine integration. RustRaft now owns the stable
+node/options, storage, transport, status, metric, safety-policy, WAL record,
+snapshot fence, membership, and ByteRaft-parity surfaces that TemporalStore can
+consume from data-node and metaserver code. The remaining roadmap is tracked in
 [`docs/gap_plan.md`](docs/gap_plan.md).
 
 ## Test
