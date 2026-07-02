@@ -141,6 +141,12 @@ crate surface covers node lifecycle, replication, election/pre-vote, membership,
 WAL recovery, snapshots, read-index/lease-read, and status/metrics/readiness
 without relying on TemporalStore adapter code.
 
+`tests/standalone_embedding_contract.rs` repeats that status check as five
+executable embedding passes: node lifecycle, replication/read safety,
+membership workflow, WAL/snapshot durability, and final readiness/API coverage.
+Those tests are the guardrail for continuing to move generic Raft substrate out
+of TemporalStore and into this standalone crate.
+
 The intended TemporalStore adapter shape is:
 
 ```rust
@@ -166,6 +172,12 @@ pending joint consensus.
 
 ```bash
 cargo test
+```
+
+Run the five-pass standalone embedding contract:
+
+```bash
+cargo test --test standalone_embedding_contract
 ```
 
 ## Examples
