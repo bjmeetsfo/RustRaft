@@ -20,6 +20,8 @@ License: Apache-2.0.
 - `RustRaftTransport`
 - `RustRaftStatusSnapshot`
 - `RustRaftMetricNames`
+- `RustRaftFaultScenario`
+- `rustraft_fault_harness_readiness_report`
 - `rustraft_read_safety_decision`
 - `rustraft_learner_promotion_decision`
 - `rustraft_append_safety_decision`
@@ -83,6 +85,12 @@ The `rustraft_temporalstore_extraction_plan()` API is the typed migration
 ledger. It records which Raft responsibilities are already owned by this
 standalone crate, which remain pending migration, and which must stay as
 TemporalStore-specific adapters.
+
+The fault-harness API names the ByteRaft-derived process scenarios that
+TemporalStore must prove with spawned data-node and metaserver processes:
+packet loss, slow WAL fsync, snapshot during membership change, leader transfer
+under load, follower rejoin after compacted logs, and rolling restart with
+pending joint consensus.
 
 ## Test
 

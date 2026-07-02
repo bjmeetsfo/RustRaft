@@ -11,3 +11,9 @@ pub use crate::{
     RustRaftPipelineLimits, RustRaftProcessNodeEvidence,
     RustRaftProcessOperationalSemanticsEvidence, RustRaftStatusSnapshot,
 };
+
+pub use crate::fault::{
+    rustraft_byteraft_fault_scenarios, rustraft_fault_harness_readiness_report,
+    RustRaftFaultHarnessReadinessReport, RustRaftFaultScenario, RustRaftFaultScenarioEvidence,
+    RustRaftFaultScenarioRequirement, RustRaftFaultScenarioResult,
+};

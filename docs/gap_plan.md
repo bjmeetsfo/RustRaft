@@ -86,6 +86,9 @@ if production_status != production_ready:
 The public `rustraft_temporalstore_extraction_plan()` function is the source of
 truth for this migration ledger. It keeps reusable consensus behavior in
 RustRaft while making TemporalStore-specific adapter boundaries explicit.
+The public `rustraft_fault_harness_readiness_report()` function is the
+fail-closed contract for ByteRaft-derived process-path fault evidence; real
+TemporalStore harnesses still need to provide the observed process reports.
 
 ## Implementation Order
 

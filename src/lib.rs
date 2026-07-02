@@ -41,6 +41,7 @@ use thiserror::Error;
 pub mod benchmark;
 pub mod cluster;
 pub mod config;
+pub mod fault;
 pub mod membership;
 pub mod metrics;
 pub mod node;
@@ -6647,6 +6648,13 @@ pub fn rustraft_temporalstore_extraction_plan() -> RustRaftTemporalStoreExtracti
                 rustraft_owner: "generic storage and transport traits plus AppendEntries, Vote, PreVote, InstallSnapshot, snapshot chunk, and ReadIndex messages".to_string(),
                 temporalstore_boundary: "HTTP/tonic/process adapters implement the traits without leaking TemporalStore command types into RustRaft".to_string(),
                 next_evidence: "data-node and metaserver process paths consume trait adapters in scale/failover harnesses".to_string(),
+            },
+            RustRaftExtractionSlice {
+                id: "fault_harness_contract".to_string(),
+                status: RustRaftExtractionStatus::InLibrary,
+                rustraft_owner: "ByteRaft-derived fault scenario catalog and readiness report for process-path evidence".to_string(),
+                temporalstore_boundary: "TemporalStore process harnesses run the real data-node and metaserver binaries and feed observed evidence into RustRaft reports".to_string(),
+                next_evidence: "packet loss, slow WAL, snapshot during membership, leader transfer under load, compacted-log rejoin, and rolling restart reports all pass".to_string(),
             },
             RustRaftExtractionSlice {
                 id: "replication_pipeline_runtime".to_string(),
