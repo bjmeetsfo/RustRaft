@@ -24,7 +24,7 @@
 //! it through a stable adapter boundary.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::mpsc;
 use std::thread;
@@ -256,6 +256,414 @@ pub struct RustRaftPipelineEvidence {
 }
 
 pub type RaftPeerPipelineState = RustRaftPeerPipelineStatus;
+
+impl RustRaftPipelineLimits {
+    pub fn production_default() -> Self {
+        Self {
+            max_inflights_replicate: 256,
+            max_memory_replicate_log_bytes: 64 * 1024 * 1024,
+            max_inflights_apply_task: 1024,
+            max_apply_batch_bytes: 8 * 1024 * 1024,
+            enable_reorder_queue: true,
+            reorder_window_size: 1024,
+            reorder_timeout_us: 5_000_000,
+        }
+    }
+}
+
+impl Default for RustRaftPipelineLimits {
+    fn default() -> Self {
+        Self::production_default()
+    }
+}
+
+impl RustRaftPeerPipelineStatus {
+    pub fn new(
+        peer_id: RustRaftNodeId,
+        next_index: RustRaftLogIndex,
+        limits: RustRaftPipelineLimits,
+    ) -> Self {
+        Self {
+            peer_id,
+            match_index: next_index.saturating_sub(1),
+            next_index,
+            append_requests: 0,
+            append_accepted: 0,
+            append_rejected: 0,
+            inflight_entries: 0,
+            inflight_bytes: 0,
+            append_queue_depth: 0,
+            append_queue_limit: limits.max_inflights_replicate,
+            append_queue_max_depth: 0,
+            inflight_bytes_limit: limits.max_memory_replicate_log_bytes,
+            apply_inflight_tasks: 0,
+            apply_inflight_limit: limits.max_inflights_apply_task,
+            apply_queue_depth: 0,
+            apply_queue_max_depth: 0,
+            apply_batch_bytes_limit: limits.max_apply_batch_bytes,
+            apply_backpressure_rejections: 0,
+            memory_backpressure_rejections: 0,
+            oversized_log_rejections: 0,
+            reorder_queue_depth: 0,
+            out_of_order_append_rejections: 0,
+            reorder_entries_rejected: 0,
+            reorder_entry_timeouts: 0,
+            reorder_dropped_packages: 0,
+            stale_term_rejections: 0,
+            snapshot_sending: false,
+            snapshot_installing: false,
+            snapshot_installed_index: 0,
+            snapshot_send_attempts: 0,
+            snapshot_install_total_chunks: 0,
+            snapshot_install_progress_per_mille: 0,
+            snapshot_backpressure_rejections: 0,
+            snapshot_rate_limit_rejections: 0,
+            snapshot_install_rolled_back: 0,
+            snapshot_chunk_retry_count: 0,
+            snapshot_send_timeouts: 0,
+            snapshot_during_membership_change: false,
+            snapshot_rejoin_after_compacted_log: false,
+            transfer_leader_target: false,
+            transfer_leader_timeouts: 0,
+            pre_vote_rejections: 0,
+            election_rejections: 0,
+            offline_timeout_reached: false,
+            offline_timeout_rejections: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftInflightAppend {
+    pub first_log_id: RustRaftLogId,
+    pub last_log_id: RustRaftLogId,
+    pub entry_count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftSnapshotTransferState {
+    pub snapshot_id: RustRaftSnapshotId,
+    pub snapshot_index: RustRaftLogIndex,
+    pub total_chunks: u64,
+    pub acknowledged_chunks: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftReplicationPipeline {
+    peer_id: RustRaftNodeId,
+    limits: RustRaftPipelineLimits,
+    status: RustRaftPeerPipelineStatus,
+    append_queue: VecDeque<RustRaftLogEntry>,
+    inflight: VecDeque<RaftInflightAppend>,
+    reorder_queue: BTreeMap<RustRaftLogIndex, RustRaftLogEntry>,
+    snapshot_transfer: Option<RaftSnapshotTransferState>,
+}
+
+impl RaftReplicationPipeline {
+    pub fn new(
+        peer_id: RustRaftNodeId,
+        next_index: RustRaftLogIndex,
+        limits: RustRaftPipelineLimits,
+    ) -> Self {
+        Self {
+            peer_id,
+            limits,
+            status: RustRaftPeerPipelineStatus::new(peer_id, next_index, limits),
+            append_queue: VecDeque::new(),
+            inflight: VecDeque::new(),
+            reorder_queue: BTreeMap::new(),
+            snapshot_transfer: None,
+        }
+    }
+
+    pub fn peer_id(&self) -> RustRaftNodeId {
+        self.peer_id
+    }
+
+    pub fn status(&self) -> RustRaftPeerPipelineStatus {
+        self.status.clone()
+    }
+
+    pub fn queue_append(&mut self, entry: RustRaftLogEntry) -> Result<(), RaftError> {
+        let bytes = entry.payload.len() as u64;
+        if bytes > self.limits.max_apply_batch_bytes {
+            self.status.oversized_log_rejections += 1;
+            return Err(RaftError::InvalidRequest(
+                "append entry exceeds max apply batch bytes".to_string(),
+            ));
+        }
+        if self.append_queue.len() as u64 >= self.status.append_queue_limit {
+            self.status.apply_backpressure_rejections += 1;
+            return Err(RaftError::InvalidRequest(
+                "append queue backpressure limit reached".to_string(),
+            ));
+        }
+        if self.status.inflight_bytes + self.queued_bytes() + bytes
+            > self.limits.max_memory_replicate_log_bytes
+        {
+            self.status.memory_backpressure_rejections += 1;
+            return Err(RaftError::InvalidRequest(
+                "replication memory backpressure limit reached".to_string(),
+            ));
+        }
+        self.append_queue.push_back(entry);
+        self.status.append_queue_depth = self.append_queue.len() as u64;
+        self.status.append_queue_max_depth = self
+            .status
+            .append_queue_max_depth
+            .max(self.status.append_queue_depth);
+        Ok(())
+    }
+
+    pub fn flush_append_window(&mut self) -> Vec<RaftInflightAppend> {
+        let mut flushed = Vec::new();
+        while self.status.inflight_entries < self.limits.max_inflights_replicate {
+            let Some(entry) = self.append_queue.pop_front() else {
+                break;
+            };
+            let bytes = entry.payload.len() as u64;
+            if self.status.inflight_bytes + bytes > self.limits.max_memory_replicate_log_bytes {
+                self.append_queue.push_front(entry);
+                self.status.memory_backpressure_rejections += 1;
+                break;
+            }
+            let inflight = RaftInflightAppend {
+                first_log_id: entry.log_id.clone(),
+                last_log_id: entry.log_id,
+                entry_count: 1,
+                bytes,
+            };
+            self.status.append_requests += 1;
+            self.status.inflight_entries += inflight.entry_count;
+            self.status.inflight_bytes += inflight.bytes;
+            self.inflight.push_back(inflight.clone());
+            flushed.push(inflight);
+        }
+        self.status.append_queue_depth = self.append_queue.len() as u64;
+        flushed
+    }
+
+    pub fn handle_append_response(
+        &mut self,
+        response: &RustRaftAppendEntriesResponse,
+    ) -> Result<(), RaftError> {
+        if response.term == 0 {
+            self.status.stale_term_rejections += 1;
+        }
+        if response.success {
+            self.status.append_accepted += 1;
+            self.status.match_index = self.status.match_index.max(response.match_index);
+            self.status.next_index = self.status.match_index + 1;
+            self.release_inflight_through(response.match_index);
+            self.drain_reorder_queue();
+            Ok(())
+        } else {
+            self.status.append_rejected += 1;
+            self.status.next_index = response
+                .rejection_hint
+                .unwrap_or(self.status.match_index)
+                .saturating_add(1);
+            Err(RaftError::InvalidRequest(
+                "append rejected by peer pipeline".to_string(),
+            ))
+        }
+    }
+
+    pub fn receive_out_of_order(&mut self, entry: RustRaftLogEntry) -> Result<(), RaftError> {
+        if entry.log_id.index < self.status.next_index {
+            self.status.out_of_order_append_rejections += 1;
+            return Err(RaftError::InvalidRequest(
+                "append is below peer next index".to_string(),
+            ));
+        }
+        if entry.log_id.index == self.status.next_index {
+            self.status.match_index = entry.log_id.index;
+            self.status.next_index = entry.log_id.index + 1;
+            self.drain_reorder_queue();
+            return Ok(());
+        }
+        if !self.limits.enable_reorder_queue {
+            self.status.out_of_order_append_rejections += 1;
+            return Err(RaftError::InvalidRequest(
+                "out-of-order append received while reorder queue is disabled".to_string(),
+            ));
+        }
+        if self.reorder_queue.len() as u64 >= self.limits.reorder_window_size {
+            self.status.reorder_entries_rejected += 1;
+            return Err(RaftError::InvalidRequest(
+                "reorder queue window is full".to_string(),
+            ));
+        }
+        self.reorder_queue.insert(entry.log_id.index, entry);
+        self.status.reorder_queue_depth = self.reorder_queue.len() as u64;
+        Ok(())
+    }
+
+    pub fn expire_reorder_queue(&mut self) -> u64 {
+        let dropped = self.reorder_queue.len() as u64;
+        if dropped > 0 {
+            self.reorder_queue.clear();
+            self.status.reorder_queue_depth = 0;
+            self.status.reorder_entry_timeouts += dropped;
+            self.status.reorder_dropped_packages += dropped;
+        }
+        dropped
+    }
+
+    pub fn begin_snapshot_send(
+        &mut self,
+        snapshot_id: impl Into<String>,
+        snapshot_index: RustRaftLogIndex,
+        total_chunks: u64,
+    ) -> Result<(), RaftError> {
+        if self.status.snapshot_sending || self.status.snapshot_installing {
+            self.status.snapshot_backpressure_rejections += 1;
+            return Err(RaftError::InvalidRequest(
+                "snapshot transfer is already active".to_string(),
+            ));
+        }
+        self.status.snapshot_sending = true;
+        self.status.snapshot_send_attempts += 1;
+        self.status.snapshot_install_total_chunks = total_chunks;
+        self.status.snapshot_install_progress_per_mille = 0;
+        self.snapshot_transfer = Some(RaftSnapshotTransferState {
+            snapshot_id: snapshot_id.into(),
+            snapshot_index,
+            total_chunks,
+            acknowledged_chunks: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+        });
+        Ok(())
+    }
+
+    pub fn record_snapshot_chunk_sent(&mut self, bytes: u64) -> Result<(), RaftError> {
+        let transfer = self
+            .snapshot_transfer
+            .as_mut()
+            .ok_or_else(|| RaftError::InvalidRequest("snapshot send is not active".to_string()))?;
+        transfer.bytes_sent += bytes;
+        Ok(())
+    }
+
+    pub fn acknowledge_snapshot_chunk(&mut self) -> Result<(), RaftError> {
+        let transfer = self.snapshot_transfer.as_mut().ok_or_else(|| {
+            RaftError::InvalidRequest("snapshot transfer is not active".to_string())
+        })?;
+        transfer.acknowledged_chunks += 1;
+        self.status.snapshot_install_progress_per_mille = if transfer.total_chunks == 0 {
+            1000
+        } else {
+            (transfer.acknowledged_chunks * 1000 / transfer.total_chunks).min(1000)
+        };
+        if transfer.acknowledged_chunks >= transfer.total_chunks {
+            self.finish_snapshot_install()?;
+        }
+        Ok(())
+    }
+
+    pub fn begin_snapshot_install(
+        &mut self,
+        snapshot_id: impl Into<String>,
+        snapshot_index: RustRaftLogIndex,
+        total_chunks: u64,
+    ) -> Result<(), RaftError> {
+        if self.status.snapshot_sending || self.status.snapshot_installing {
+            self.status.snapshot_backpressure_rejections += 1;
+            return Err(RaftError::InvalidRequest(
+                "snapshot transfer is already active".to_string(),
+            ));
+        }
+        self.status.snapshot_installing = true;
+        self.status.snapshot_install_total_chunks = total_chunks;
+        self.status.snapshot_install_progress_per_mille = 0;
+        self.snapshot_transfer = Some(RaftSnapshotTransferState {
+            snapshot_id: snapshot_id.into(),
+            snapshot_index,
+            total_chunks,
+            acknowledged_chunks: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+        });
+        Ok(())
+    }
+
+    pub fn receive_snapshot_chunk(&mut self, bytes: u64, done: bool) -> Result<(), RaftError> {
+        let transfer = self.snapshot_transfer.as_mut().ok_or_else(|| {
+            RaftError::InvalidRequest("snapshot install is not active".to_string())
+        })?;
+        transfer.bytes_received += bytes;
+        transfer.acknowledged_chunks += 1;
+        self.status.snapshot_install_progress_per_mille = if transfer.total_chunks == 0 {
+            1000
+        } else {
+            (transfer.acknowledged_chunks * 1000 / transfer.total_chunks).min(1000)
+        };
+        if done {
+            self.finish_snapshot_install()?;
+        }
+        Ok(())
+    }
+
+    pub fn rollback_snapshot_install(&mut self) {
+        self.snapshot_transfer = None;
+        self.status.snapshot_sending = false;
+        self.status.snapshot_installing = false;
+        self.status.snapshot_install_rolled_back += 1;
+    }
+
+    fn queued_bytes(&self) -> u64 {
+        self.append_queue
+            .iter()
+            .map(|entry| entry.payload.len() as u64)
+            .sum()
+    }
+
+    fn release_inflight_through(&mut self, match_index: RustRaftLogIndex) {
+        while self
+            .inflight
+            .front()
+            .map(|inflight| inflight.last_log_id.index <= match_index)
+            .unwrap_or(false)
+        {
+            if let Some(inflight) = self.inflight.pop_front() {
+                self.status.inflight_entries = self
+                    .status
+                    .inflight_entries
+                    .saturating_sub(inflight.entry_count);
+                self.status.inflight_bytes =
+                    self.status.inflight_bytes.saturating_sub(inflight.bytes);
+            }
+        }
+    }
+
+    fn drain_reorder_queue(&mut self) {
+        while let Some(entry) = self.reorder_queue.remove(&self.status.next_index) {
+            self.status.match_index = entry.log_id.index;
+            self.status.next_index = entry.log_id.index + 1;
+        }
+        self.status.reorder_queue_depth = self.reorder_queue.len() as u64;
+    }
+
+    fn finish_snapshot_install(&mut self) -> Result<(), RaftError> {
+        let transfer = self.snapshot_transfer.take().ok_or_else(|| {
+            RaftError::InvalidRequest("snapshot transfer is not active".to_string())
+        })?;
+        self.status.snapshot_sending = false;
+        self.status.snapshot_installing = false;
+        self.status.snapshot_installed_index = self
+            .status
+            .snapshot_installed_index
+            .max(transfer.snapshot_index);
+        self.status.snapshot_install_progress_per_mille = 1000;
+        self.status.match_index = self.status.match_index.max(transfer.snapshot_index);
+        self.status.next_index = self.status.match_index + 1;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1857,6 +2265,7 @@ pub struct RaftCluster {
     pub group_id: RustRaftGroupId,
     pub config: RaftConfig,
     nodes: BTreeMap<RustRaftNodeId, RaftNode>,
+    peer_pipelines: BTreeMap<RustRaftNodeId, RaftReplicationPipeline>,
     leader_id: Option<RustRaftNodeId>,
     current_term: RustRaftTerm,
     commit_index: RustRaftLogIndex,
@@ -1897,10 +2306,22 @@ impl RaftCluster {
             ));
         }
 
+        let peer_pipelines = nodes
+            .keys()
+            .copied()
+            .map(|node_id| {
+                (
+                    node_id,
+                    RaftReplicationPipeline::new(node_id, 1, RustRaftPipelineLimits::default()),
+                )
+            })
+            .collect();
+
         Ok(Self {
             group_id,
             config,
             nodes,
+            peer_pipelines,
             leader_id: None,
             current_term: 0,
             commit_index: 0,
@@ -1996,6 +2417,7 @@ impl RaftCluster {
                 RustRaftRole::Follower
             };
         }
+        self.refresh_replication_pipelines();
         Ok(())
     }
 
@@ -2029,9 +2451,40 @@ impl RaftCluster {
         };
         self.last_log_index = log_id.index;
 
-        for node in self.nodes.values_mut() {
-            if node.healthy && node.replica_role.can_serve_data() {
+        let node_ids: Vec<_> = self.nodes.keys().copied().collect();
+        for node_id in node_ids {
+            let Some(node) = self.nodes.get_mut(&node_id) else {
+                continue;
+            };
+            if node_id == leader_id {
                 node.append_entry(entry.clone());
+                continue;
+            }
+            if !node.replica_role.can_serve_data() {
+                continue;
+            }
+            let response = if let Some(pipeline) = self.peer_pipelines.get_mut(&node_id) {
+                pipeline.queue_append(entry.clone())?;
+                let _ = pipeline.flush_append_window();
+                if node.healthy {
+                    node.append_entry(entry.clone());
+                    let match_index = node.match_index();
+                    Some(RustRaftAppendEntriesResponse {
+                        term: node.hard_state.current_term,
+                        success: true,
+                        match_index,
+                        rejection_hint: None,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(response) = response {
+                if let Some(pipeline) = self.peer_pipelines.get_mut(&node_id) {
+                    let _ = pipeline.handle_append_response(&response);
+                }
             }
         }
         self.refresh_commit_index();
@@ -2213,6 +2666,15 @@ impl RaftCluster {
         }
         self.nodes
             .insert(peer.node_id, RaftNode::new(peer.node_id, peer.role));
+        self.peer_pipelines.insert(
+            peer.node_id,
+            RaftReplicationPipeline::new(
+                peer.node_id,
+                self.last_log_index + 1,
+                RustRaftPipelineLimits::default(),
+            ),
+        );
+        self.refresh_replication_pipelines();
         Ok(())
     }
 
@@ -2247,10 +2709,12 @@ impl RaftCluster {
         self.nodes
             .remove(&node_id)
             .ok_or(RaftError::NodeNotFound(node_id))?;
+        self.peer_pipelines.remove(&node_id);
         if self.leader_id == Some(node_id) {
             self.leader_id = None;
             self.leader_lease_valid = false;
         }
+        self.refresh_replication_pipelines();
         Ok(())
     }
 
@@ -2378,6 +2842,102 @@ impl RaftCluster {
         ))
     }
 
+    pub fn peer_pipeline_status(
+        &self,
+        peer_id: RustRaftNodeId,
+    ) -> Result<RaftPeerPipelineState, RaftError> {
+        self.peer_pipelines
+            .get(&peer_id)
+            .map(RaftReplicationPipeline::status)
+            .ok_or(RaftError::NodeNotFound(peer_id))
+    }
+
+    pub fn peer_pipeline_statuses(&self) -> Vec<RaftPeerPipelineState> {
+        self.peer_pipelines
+            .iter()
+            .filter(|(peer_id, _)| Some(**peer_id) != self.leader_id)
+            .map(|(_, pipeline)| pipeline.status())
+            .collect()
+    }
+
+    pub fn receive_out_of_order_append_for(
+        &mut self,
+        peer_id: RustRaftNodeId,
+        entry: RustRaftLogEntry,
+    ) -> Result<(), RaftError> {
+        self.peer_pipelines
+            .get_mut(&peer_id)
+            .ok_or(RaftError::NodeNotFound(peer_id))?
+            .receive_out_of_order(entry)
+    }
+
+    pub fn expire_peer_reorder_queue(&mut self, peer_id: RustRaftNodeId) -> Result<u64, RaftError> {
+        Ok(self
+            .peer_pipelines
+            .get_mut(&peer_id)
+            .ok_or(RaftError::NodeNotFound(peer_id))?
+            .expire_reorder_queue())
+    }
+
+    pub fn begin_snapshot_send_to(
+        &mut self,
+        peer_id: RustRaftNodeId,
+        snapshot_id: impl Into<String>,
+        snapshot_index: RustRaftLogIndex,
+        total_chunks: u64,
+    ) -> Result<(), RaftError> {
+        self.peer_pipelines
+            .get_mut(&peer_id)
+            .ok_or(RaftError::NodeNotFound(peer_id))?
+            .begin_snapshot_send(snapshot_id, snapshot_index, total_chunks)
+    }
+
+    pub fn record_snapshot_chunk_sent_to(
+        &mut self,
+        peer_id: RustRaftNodeId,
+        bytes: u64,
+    ) -> Result<(), RaftError> {
+        self.peer_pipelines
+            .get_mut(&peer_id)
+            .ok_or(RaftError::NodeNotFound(peer_id))?
+            .record_snapshot_chunk_sent(bytes)
+    }
+
+    pub fn acknowledge_snapshot_chunk_to(
+        &mut self,
+        peer_id: RustRaftNodeId,
+    ) -> Result<(), RaftError> {
+        self.peer_pipelines
+            .get_mut(&peer_id)
+            .ok_or(RaftError::NodeNotFound(peer_id))?
+            .acknowledge_snapshot_chunk()
+    }
+
+    pub fn begin_snapshot_install_from(
+        &mut self,
+        peer_id: RustRaftNodeId,
+        snapshot_id: impl Into<String>,
+        snapshot_index: RustRaftLogIndex,
+        total_chunks: u64,
+    ) -> Result<(), RaftError> {
+        self.peer_pipelines
+            .get_mut(&peer_id)
+            .ok_or(RaftError::NodeNotFound(peer_id))?
+            .begin_snapshot_install(snapshot_id, snapshot_index, total_chunks)
+    }
+
+    pub fn receive_snapshot_chunk_from(
+        &mut self,
+        peer_id: RustRaftNodeId,
+        bytes: u64,
+        done: bool,
+    ) -> Result<(), RaftError> {
+        self.peer_pipelines
+            .get_mut(&peer_id)
+            .ok_or(RaftError::NodeNotFound(peer_id))?
+            .receive_snapshot_chunk(bytes, done)
+    }
+
     pub fn node_ids(&self) -> Vec<RustRaftNodeId> {
         self.nodes.keys().copied().collect()
     }
@@ -2433,6 +2993,29 @@ impl RaftCluster {
             .filter(|node| node.replica_role.participates_in_quorum())
             .count();
         voters / 2 + 1
+    }
+
+    fn refresh_replication_pipelines(&mut self) {
+        for (node_id, node) in &self.nodes {
+            self.peer_pipelines.entry(*node_id).or_insert_with(|| {
+                RaftReplicationPipeline::new(
+                    *node_id,
+                    node.match_index() + 1,
+                    RustRaftPipelineLimits::default(),
+                )
+            });
+        }
+        if let Some(leader_id) = self.leader_id {
+            if let Some(pipeline) = self.peer_pipelines.get_mut(&leader_id) {
+                let response = RustRaftAppendEntriesResponse {
+                    term: self.current_term,
+                    success: true,
+                    match_index: self.last_log_index,
+                    rejection_hint: None,
+                };
+                let _ = pipeline.handle_append_response(&response);
+            }
+        }
     }
 }
 
