@@ -719,27 +719,34 @@ pub enum RustRaftRole {
     Learner,
 }
 
+pub type RustRaftNodeId = u64;
+pub type RustRaftGroupId = u64;
+pub type RustRaftTerm = u64;
+pub type RustRaftLogIndex = u64;
+pub type RustRaftSnapshotId = String;
+pub type RustRaftPayload = Vec<u8>;
+pub type RustRaftSnapshotPayload = Vec<u8>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftLogId {
-    pub term: u64,
-    pub index: u64,
+    pub term: RustRaftTerm,
+    pub index: RustRaftLogIndex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustRaftLogEntry {
+pub struct RustRaftGenericLogEntry<P = RustRaftPayload> {
     pub log_id: RustRaftLogId,
-    pub payload: Vec<u8>,
+    pub payload: P,
 }
+
+pub type RustRaftLogEntry = RustRaftGenericLogEntry<RustRaftPayload>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftHardState {
-    pub current_term: u64,
-    pub voted_for: Option<u64>,
+    pub current_term: RustRaftTerm,
+    pub voted_for: Option<RustRaftNodeId>,
     pub committed: Option<RustRaftLogId>,
 }
-
-pub type RustRaftNodeId = u64;
-pub type RustRaftGroupId = u64;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -799,10 +806,10 @@ pub struct RustRaftJointMembership {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftApplySnapshotFence {
-    pub applied_index: u64,
-    pub commit_index: u64,
-    pub installed_snapshot_index: u64,
-    pub first_retained_log_index: u64,
+    pub applied_index: RustRaftLogIndex,
+    pub commit_index: RustRaftLogIndex,
+    pub installed_snapshot_index: RustRaftLogIndex,
+    pub first_retained_log_index: RustRaftLogIndex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -864,7 +871,7 @@ pub struct RustRaftNodeOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftProposeOptions {
-    pub expected_term: Option<u64>,
+    pub expected_term: Option<RustRaftTerm>,
     pub is_command: bool,
 }
 
@@ -881,13 +888,26 @@ impl Default for RustRaftProposeOptions {
 pub struct RustRaftApplyRequest {
     pub group_id: RustRaftGroupId,
     pub log_id: RustRaftLogId,
-    pub payload: Vec<u8>,
+    pub payload: RustRaftPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftApplyResponse {
-    pub applied_index: u64,
-    pub response: Vec<u8>,
+    pub applied_index: RustRaftLogIndex,
+    pub response: RustRaftPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftGenericApplyRequest<G = RustRaftGroupId, P = RustRaftPayload> {
+    pub group_id: G,
+    pub log_id: RustRaftLogId,
+    pub payload: P,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftGenericApplyResponse<P = RustRaftPayload> {
+    pub applied_index: RustRaftLogIndex,
+    pub response: P,
 }
 
 pub trait RustRaftStateMachine {
@@ -905,11 +925,13 @@ pub trait RustRaftConsensus {
     fn status(&self) -> Result<RustRaftStatusSnapshot, RustRaftError>;
     fn propose(
         &mut self,
-        payload: Vec<u8>,
+        payload: RustRaftPayload,
         options: RustRaftProposeOptions,
     ) -> Result<RustRaftLogId, RustRaftError>;
-    fn read_index(&self, min_commit_index: u64)
-        -> Result<RustRaftReadIndexResponse, RustRaftError>;
+    fn read_index(
+        &self,
+        min_commit_index: RustRaftLogIndex,
+    ) -> Result<RustRaftReadIndexResponse, RustRaftError>;
     fn add_peer(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError>;
     fn add_learner(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError>;
     fn promote_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RustRaftError>;
@@ -970,88 +992,103 @@ pub fn rustraft_byteraft_parity_surface() -> RustRaftByteRaftParitySurface {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftPeerStatus {
-    pub node_id: u64,
-    pub matched: u64,
-    pub next_index: u64,
+    pub node_id: RustRaftNodeId,
+    pub matched: RustRaftLogIndex,
+    pub next_index: RustRaftLogIndex,
     pub learner: bool,
     pub healthy: bool,
-    pub lag: u64,
+    pub lag: RustRaftLogIndex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftStatusSnapshot {
-    pub group_id: u64,
-    pub node_id: u64,
+    pub group_id: RustRaftGroupId,
+    pub node_id: RustRaftNodeId,
     pub role: RustRaftRole,
-    pub term: u64,
-    pub leader_id: Option<u64>,
-    pub commit_index: u64,
-    pub applied_index: u64,
-    pub last_log_index: u64,
-    pub last_snapshot_index: u64,
+    pub term: RustRaftTerm,
+    pub leader_id: Option<RustRaftNodeId>,
+    pub commit_index: RustRaftLogIndex,
+    pub applied_index: RustRaftLogIndex,
+    pub last_log_index: RustRaftLogIndex,
+    pub last_snapshot_index: RustRaftLogIndex,
     pub peers: Vec<RustRaftPeerStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftAppendEntriesRequest {
-    pub group_id: u64,
-    pub term: u64,
-    pub leader_id: u64,
+    pub group_id: RustRaftGroupId,
+    pub term: RustRaftTerm,
+    pub leader_id: RustRaftNodeId,
     pub prev_log_id: Option<RustRaftLogId>,
     pub entries: Vec<RustRaftLogEntry>,
-    pub leader_commit: u64,
+    pub leader_commit: RustRaftLogIndex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftAppendEntriesResponse {
-    pub term: u64,
+    pub term: RustRaftTerm,
     pub success: bool,
-    pub match_index: u64,
-    pub rejection_hint: Option<u64>,
+    pub match_index: RustRaftLogIndex,
+    pub rejection_hint: Option<RustRaftLogIndex>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftVoteRequest {
-    pub group_id: u64,
-    pub term: u64,
-    pub candidate_id: u64,
+    pub group_id: RustRaftGroupId,
+    pub term: RustRaftTerm,
+    pub candidate_id: RustRaftNodeId,
     pub last_log_id: Option<RustRaftLogId>,
     pub pre_vote: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftVoteResponse {
-    pub term: u64,
+    pub term: RustRaftTerm,
     pub vote_granted: bool,
     pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftSnapshotMeta {
-    pub snapshot_id: String,
+    pub snapshot_id: RustRaftSnapshotId,
     pub last_log_id: RustRaftLogId,
-    pub membership: Vec<u64>,
+    pub membership: Vec<RustRaftNodeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftSnapshotChunk {
     pub meta: RustRaftSnapshotMeta,
     pub offset: u64,
-    pub data: Vec<u8>,
+    pub data: RustRaftSnapshotPayload,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftGenericSnapshot<G = RustRaftGroupId, P = RustRaftSnapshotPayload> {
+    pub group_id: G,
+    pub meta: RustRaftSnapshotMeta,
+    pub payload: P,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftGenericSnapshotChunk<P = RustRaftSnapshotPayload> {
+    pub meta: RustRaftSnapshotMeta,
+    pub offset: u64,
+    pub data: P,
     pub done: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftInstallSnapshotRequest {
-    pub group_id: u64,
-    pub term: u64,
-    pub leader_id: u64,
+    pub group_id: RustRaftGroupId,
+    pub term: RustRaftTerm,
+    pub leader_id: RustRaftNodeId,
     pub chunk: RustRaftSnapshotChunk,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftInstallSnapshotResponse {
-    pub term: u64,
+    pub term: RustRaftTerm,
     pub accepted: bool,
     pub next_offset: u64,
     pub reason: String,
@@ -1059,16 +1096,16 @@ pub struct RustRaftInstallSnapshotResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftReadIndexRequest {
-    pub group_id: u64,
-    pub requester_id: u64,
-    pub min_commit_index: u64,
+    pub group_id: RustRaftGroupId,
+    pub requester_id: RustRaftNodeId,
+    pub min_commit_index: RustRaftLogIndex,
     pub allow_lease_read: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftReadIndexResponse {
     pub safe: bool,
-    pub read_index: u64,
+    pub read_index: RustRaftLogIndex,
     pub lease_read: bool,
     pub reason: String,
 }
@@ -1076,7 +1113,7 @@ pub struct RustRaftReadIndexResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftReadSafetyDecision {
     pub safe: bool,
-    pub read_index: u64,
+    pub read_index: RustRaftLogIndex,
     pub lease_read: bool,
     pub reason: String,
 }
