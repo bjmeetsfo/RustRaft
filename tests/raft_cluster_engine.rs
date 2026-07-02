@@ -159,6 +159,93 @@ fn read_index_and_lease_read_follow_leader_lease_and_apply_floor() {
 }
 
 #[test]
+fn read_path_report_tracks_quorum_lease_fence_and_bounded_stale() {
+    let mut cluster = three_node_cluster();
+    cluster.start().expect("cluster starts");
+    cluster.propose(b"set a=1".to_vec()).expect("propose");
+
+    cluster.set_leader_lease_valid(false);
+    let stale_lease = cluster
+        .read_path_report(
+            RustRaftReadIndexRequest {
+                group_id: 7,
+                requester_id: 1,
+                min_commit_index: 1,
+                allow_lease_read: true,
+            },
+            0,
+        )
+        .expect("read path report");
+    assert!(stale_lease.safe);
+    assert!(!stale_lease.lease_read);
+    assert!(stale_lease.stale_leader_rejected);
+    assert!(stale_lease.quorum.reached);
+    assert_eq!(stale_lease.quorum.required, 2);
+    assert!(!stale_lease.lease_read_eligibility.eligible);
+    assert_eq!(
+        stale_lease.lease_read_eligibility.reason,
+        "stale_leader_lease"
+    );
+
+    let fenced = cluster
+        .read_path_report(
+            RustRaftReadIndexRequest {
+                group_id: 7,
+                requester_id: 1,
+                min_commit_index: 2,
+                allow_lease_read: false,
+            },
+            0,
+        )
+        .expect("fenced read path");
+    assert!(!fenced.safe);
+    assert!(!fenced.applied_index_fence.passed);
+    assert_eq!(
+        fenced.applied_index_fence.reason,
+        "applied_index_behind_min_commit"
+    );
+
+    cluster
+        .set_node_healthy(3, false)
+        .expect("mark follower down");
+    cluster
+        .propose(b"set a=2".to_vec())
+        .expect("propose while follower down");
+    cluster.set_node_healthy(3, true).expect("heal follower");
+
+    let bounded = cluster
+        .read_path_report(
+            RustRaftReadIndexRequest {
+                group_id: 7,
+                requester_id: 3,
+                min_commit_index: 1,
+                allow_lease_read: false,
+            },
+            1,
+        )
+        .expect("bounded stale report");
+    assert!(bounded.safe);
+    let bounded_stale = bounded.bounded_stale.expect("bounded stale");
+    assert_eq!(bounded_stale.lag, 1);
+    assert!(bounded_stale.allowed);
+
+    let too_stale = cluster
+        .read_path_report(
+            RustRaftReadIndexRequest {
+                group_id: 7,
+                requester_id: 3,
+                min_commit_index: 1,
+                allow_lease_read: false,
+            },
+            0,
+        )
+        .expect("stale follower report");
+    assert!(!too_stale.safe);
+    assert_eq!(too_stale.reason, "replica_lagging");
+    assert!(!too_stale.bounded_stale.expect("bounded stale").allowed);
+}
+
+#[test]
 fn read_index_rejects_when_live_quorum_is_lost() {
     let mut cluster = three_node_cluster();
     cluster.start().expect("cluster starts");

@@ -3532,6 +3532,61 @@ pub struct RustRaftReadSafetyDecision {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftReadQuorumReport {
+    pub required: u64,
+    pub live_voters: Vec<RustRaftNodeId>,
+    pub live_witnesses: Vec<RustRaftNodeId>,
+    pub acknowledgements: Vec<RustRaftNodeId>,
+    pub reached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftAppliedIndexFenceReport {
+    pub min_commit_index: RustRaftLogIndex,
+    pub commit_index: RustRaftLogIndex,
+    pub applied_index: RustRaftLogIndex,
+    pub passed: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftLeaseReadEligibilityReport {
+    pub node_id: RustRaftNodeId,
+    pub leader_id: Option<RustRaftNodeId>,
+    pub config_enabled: bool,
+    pub requester_is_leader: bool,
+    pub leader_lease_valid: bool,
+    pub applied_index_fence_passed: bool,
+    pub eligible: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftBoundedStaleReadReport {
+    pub node_id: RustRaftNodeId,
+    pub leader_id: RustRaftNodeId,
+    pub node_commit_index: RustRaftLogIndex,
+    pub leader_commit_index: RustRaftLogIndex,
+    pub lag: RustRaftLogIndex,
+    pub max_stale_index_lag: RustRaftLogIndex,
+    pub allowed: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftReadPathReport {
+    pub safe: bool,
+    pub read_index: RustRaftLogIndex,
+    pub lease_read: bool,
+    pub stale_leader_rejected: bool,
+    pub reason: String,
+    pub quorum: RustRaftReadQuorumReport,
+    pub applied_index_fence: RustRaftAppliedIndexFenceReport,
+    pub lease_read_eligibility: RustRaftLeaseReadEligibilityReport,
+    pub bounded_stale: Option<RustRaftBoundedStaleReadReport>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RustRaftReadSafetyOperation {
@@ -4141,6 +4196,85 @@ impl RaftCluster {
         })
     }
 
+    pub fn read_path_report(
+        &self,
+        request: RustRaftReadIndexRequest,
+        max_stale_index_lag: RustRaftLogIndex,
+    ) -> Result<RustRaftReadPathReport, RaftError> {
+        if request.group_id != self.group_id {
+            return Err(RaftError::InvalidRequest(
+                "read path group id mismatch".to_string(),
+            ));
+        }
+        let node = self
+            .nodes
+            .get(&request.requester_id)
+            .ok_or(RaftError::NodeNotFound(request.requester_id))?;
+        let quorum = self.read_quorum_report();
+        let applied_index_fence = rustraft_applied_index_fence_report(
+            request.min_commit_index,
+            node.commit_index,
+            node.applied_index,
+        );
+        let lease_read_eligibility = rustraft_lease_read_eligibility_report(
+            request.requester_id,
+            self.leader_id,
+            self.config.enable_lease_read && request.allow_lease_read,
+            self.leader_lease_valid,
+            applied_index_fence.passed,
+        );
+        let bounded_stale = self.leader_id.map(|leader_id| {
+            rustraft_bounded_stale_read_report(
+                request.requester_id,
+                leader_id,
+                node.commit_index,
+                self.commit_index,
+                max_stale_index_lag,
+            )
+        });
+        let stale_leader_rejected = request.allow_lease_read
+            && self.leader_id == Some(request.requester_id)
+            && !self.leader_lease_valid;
+        let read_index = self.read_index(request)?;
+        let safe = read_index.safe
+            && quorum.reached
+            && applied_index_fence.passed
+            && bounded_stale
+                .as_ref()
+                .map(|report| report.allowed)
+                .unwrap_or(true);
+        let reason = if !node.healthy {
+            "node_unhealthy"
+        } else if !quorum.reached {
+            "no_live_quorum"
+        } else if !applied_index_fence.passed {
+            applied_index_fence.reason.as_str()
+        } else if bounded_stale
+            .as_ref()
+            .map(|report| !report.allowed)
+            .unwrap_or(false)
+        {
+            "replica_lagging"
+        } else if stale_leader_rejected {
+            "stale_leader_lease"
+        } else if read_index.lease_read {
+            "lease_read"
+        } else {
+            "read_index_quorum"
+        };
+        Ok(RustRaftReadPathReport {
+            safe,
+            read_index: read_index.read_index,
+            lease_read: read_index.lease_read && safe,
+            stale_leader_rejected,
+            reason: reason.to_string(),
+            quorum,
+            applied_index_fence,
+            lease_read_eligibility,
+            bounded_stale,
+        })
+    }
+
     pub fn lease_read_eligible(
         &self,
         node_id: RustRaftNodeId,
@@ -4153,6 +4287,45 @@ impl RaftCluster {
             allow_lease_read: true,
         })?;
         Ok(response.safe && response.lease_read)
+    }
+
+    pub fn read_quorum_report(&self) -> RustRaftReadQuorumReport {
+        let membership = self.membership();
+        let live_voters = membership
+            .voters
+            .iter()
+            .copied()
+            .filter(|node_id| {
+                self.nodes
+                    .get(node_id)
+                    .map(|node| node.healthy)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let live_witnesses = membership
+            .witnesses
+            .iter()
+            .copied()
+            .filter(|node_id| {
+                self.nodes
+                    .get(node_id)
+                    .map(|node| node.healthy)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let acknowledgements = live_voters
+            .iter()
+            .chain(live_witnesses.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let required = membership.quorum_size() as u64;
+        RustRaftReadQuorumReport {
+            required,
+            live_voters,
+            live_witnesses,
+            reached: acknowledgements.len() as u64 >= required,
+            acknowledgements,
+        }
     }
 
     pub fn transfer_leader(&mut self, target: RustRaftNodeId) -> Result<(), RaftError> {
@@ -7729,6 +7902,84 @@ pub fn rustraft_read_safety_decision(
     }
 }
 
+pub fn rustraft_applied_index_fence_report(
+    min_commit_index: RustRaftLogIndex,
+    commit_index: RustRaftLogIndex,
+    applied_index: RustRaftLogIndex,
+) -> RustRaftAppliedIndexFenceReport {
+    let passed = applied_index >= min_commit_index && applied_index <= commit_index;
+    RustRaftAppliedIndexFenceReport {
+        min_commit_index,
+        commit_index,
+        applied_index,
+        passed,
+        reason: if applied_index < min_commit_index {
+            "applied_index_behind_min_commit".to_string()
+        } else if applied_index > commit_index {
+            "applied_index_ahead_of_commit".to_string()
+        } else {
+            "applied_index_fence_passed".to_string()
+        },
+    }
+}
+
+pub fn rustraft_lease_read_eligibility_report(
+    node_id: RustRaftNodeId,
+    leader_id: Option<RustRaftNodeId>,
+    config_enabled: bool,
+    leader_lease_valid: bool,
+    applied_index_fence_passed: bool,
+) -> RustRaftLeaseReadEligibilityReport {
+    let requester_is_leader = leader_id == Some(node_id);
+    let eligible =
+        config_enabled && requester_is_leader && leader_lease_valid && applied_index_fence_passed;
+    RustRaftLeaseReadEligibilityReport {
+        node_id,
+        leader_id,
+        config_enabled,
+        requester_is_leader,
+        leader_lease_valid,
+        applied_index_fence_passed,
+        eligible,
+        reason: if !config_enabled {
+            "lease_read_disabled".to_string()
+        } else if !requester_is_leader {
+            "requester_not_leader".to_string()
+        } else if !leader_lease_valid {
+            "stale_leader_lease".to_string()
+        } else if !applied_index_fence_passed {
+            "applied_index_fence_failed".to_string()
+        } else {
+            "lease_read_eligible".to_string()
+        },
+    }
+}
+
+pub fn rustraft_bounded_stale_read_report(
+    node_id: RustRaftNodeId,
+    leader_id: RustRaftNodeId,
+    node_commit_index: RustRaftLogIndex,
+    leader_commit_index: RustRaftLogIndex,
+    max_stale_index_lag: RustRaftLogIndex,
+) -> RustRaftBoundedStaleReadReport {
+    let lag = leader_commit_index.saturating_sub(node_commit_index);
+    let allowed = lag <= max_stale_index_lag;
+    RustRaftBoundedStaleReadReport {
+        node_id,
+        leader_id,
+        node_commit_index,
+        leader_commit_index,
+        lag,
+        max_stale_index_lag,
+        allowed,
+        reason: if allowed {
+            "bounded_stale_read_allowed".to_string()
+        } else {
+            "replica_lagging".to_string()
+        },
+    }
+}
+
 pub fn rustraft_read_safety_runtime_decision(
     input: RustRaftReadSafetyRuntimeInput,
 ) -> RustRaftReadSafetyRuntimeDecision {
@@ -7770,23 +8021,35 @@ pub fn rustraft_read_safety_runtime_decision(
         };
     }
 
-    if matches!(
-        input.operation,
-        RustRaftReadSafetyOperation::ReadIndex | RustRaftReadSafetyOperation::LeaseRead
-    ) && (!input.leader_lease_valid || !input.has_majority)
+    if matches!(input.operation, RustRaftReadSafetyOperation::LeaseRead)
+        && !input.leader_lease_valid
     {
         return RustRaftReadSafetyRuntimeDecision {
             allowed: false,
             read_index: input.node_commit_index,
-            reason: if !input.leader_lease_valid {
-                "stale_leader_lease".to_string()
-            } else {
-                "minority_partition".to_string()
-            },
-            stale_leader_lease_rejected: !input.leader_lease_valid,
+            reason: "stale_leader_lease".to_string(),
+            stale_leader_lease_rejected: true,
             lagging_follower_read_rejected: false,
             stale_follower_write_rejected: false,
-            minority_partition_read_rejected: !input.has_majority,
+            minority_partition_read_rejected: false,
+            minority_partition_write_rejected: false,
+            healed_follower_catchup_observed: false,
+        };
+    }
+
+    if matches!(
+        input.operation,
+        RustRaftReadSafetyOperation::ReadIndex | RustRaftReadSafetyOperation::LeaseRead
+    ) && !input.has_majority
+    {
+        return RustRaftReadSafetyRuntimeDecision {
+            allowed: false,
+            read_index: input.node_commit_index,
+            reason: "minority_partition".to_string(),
+            stale_leader_lease_rejected: false,
+            lagging_follower_read_rejected: false,
+            stale_follower_write_rejected: false,
+            minority_partition_read_rejected: true,
             minority_partition_write_rejected: false,
             healed_follower_catchup_observed: false,
         };
@@ -8793,7 +9056,7 @@ mod tests {
     #[test]
     fn runtime_read_safety_rejects_stale_leader_lease() {
         let decision = rustraft_read_safety_runtime_decision(RustRaftReadSafetyRuntimeInput {
-            operation: RustRaftReadSafetyOperation::ReadIndex,
+            operation: RustRaftReadSafetyOperation::LeaseRead,
             node_id: 1,
             leader_id: 1,
             node_alive: true,
