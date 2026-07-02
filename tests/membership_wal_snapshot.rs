@@ -139,6 +139,75 @@ fn cluster_membership_methods_add_promote_remove_and_report_catchup() {
 }
 
 #[test]
+fn cluster_catches_up_late_learner_with_snapshot_before_membership_config_entry() {
+    let mut cluster = RaftCluster::new(
+        17,
+        Default::default(),
+        vec![
+            peer(1, RustRaftReplicaRole::Voter),
+            peer(2, RustRaftReplicaRole::Voter),
+        ],
+    )
+    .expect("cluster");
+    cluster.start().expect("start");
+    cluster
+        .propose(b"temporalstore-write-1".to_vec())
+        .expect("write 1");
+    cluster
+        .propose(b"temporalstore-write-2".to_vec())
+        .expect("write 2");
+    assert_eq!(cluster.status(1).expect("leader status").commit_index, 2);
+
+    cluster
+        .add_learner(peer(3, RustRaftReplicaRole::Learner))
+        .expect("late learner");
+    let lagging = cluster.catchup_report(3).expect("lagging report");
+    assert!(!lagging.promotable);
+
+    let snapshot = RaftSnapshot {
+        group_id: 17,
+        meta: RustRaftSnapshotMeta {
+            snapshot_id: "temporalstore-catchup-through-two".to_string(),
+            last_log_id: RustRaftLogId { term: 1, index: 2 },
+            membership: vec![1, 2],
+        },
+        payload: b"opaque-temporalstore-state".to_vec(),
+    };
+    cluster
+        .install_snapshot_with_tail_to(
+            3,
+            snapshot,
+            RustRaftApplySnapshotFence {
+                applied_index: 2,
+                commit_index: 2,
+                installed_snapshot_index: 2,
+                first_retained_log_index: 3,
+            },
+            Vec::new(),
+        )
+        .expect("snapshot catch-up");
+    assert!(cluster.catchup_report(3).expect("caught up").promotable);
+
+    cluster.promote_peer(3).expect("promote");
+    let membership_entry = cluster
+        .propose(b"temporalstore-membership:promote:3".to_vec())
+        .expect("membership config entry");
+    assert_eq!(membership_entry.index, 3);
+
+    let read = cluster
+        .read_index(rustraft::RustRaftReadIndexRequest {
+            group_id: 17,
+            requester_id: 1,
+            min_commit_index: 3,
+            allow_lease_read: true,
+        })
+        .expect("read-index");
+    assert!(read.safe, "{read:?}");
+    assert_eq!(read.read_index, 3);
+    assert_eq!(cluster.membership().voters, vec![1, 2, 3]);
+}
+
+#[test]
 fn local_raft_wal_segments_recovers_and_truncates_corrupt_tail() {
     let mut wal = LocalRaftWal::new(2).expect("wal");
     wal.append(wal_record(1)).expect("append");
