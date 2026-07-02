@@ -23,6 +23,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod benchmark;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RustRaftRequirementCategory {
