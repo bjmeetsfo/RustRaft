@@ -2,11 +2,12 @@ use rustraft::{
     rustraft_append_safety_decision, rustraft_learner_promotion_decision,
     rustraft_membership_readiness_report, rustraft_read_safety_decision,
     rustraft_recover_latest_wal_record, rustraft_validate_apply_snapshot_fence,
-    RustRaftAppendEntriesRequest, RustRaftApplySnapshotFence, RustRaftHardState, RustRaftLogEntry,
-    RustRaftLogId, RustRaftMembership, RustRaftMembershipScope,
-    RustRaftMembershipTransitionEvidence, RustRaftMembershipTransitionKind, RustRaftPeerStatus,
-    RustRaftReadIndexRequest, RustRaftReplicaRole, RustRaftRole, RustRaftSnapshotMeta,
-    RustRaftStatusSnapshot, RustRaftWalRecord,
+    rustraft_wal_checksum, RustRaftAppendEntriesRequest, RustRaftApplySnapshotFence,
+    RustRaftHardState, RustRaftLogEntry, RustRaftLogId, RustRaftMembership,
+    RustRaftMembershipScope, RustRaftMembershipTransitionEvidence,
+    RustRaftMembershipTransitionKind, RustRaftPeerStatus, RustRaftReadIndexRequest,
+    RustRaftReplicaRole, RustRaftRole, RustRaftSnapshotMeta, RustRaftStatusSnapshot,
+    RustRaftWalRecord,
 };
 
 fn status(role: RustRaftRole, applied_index: u64) -> RustRaftStatusSnapshot {
@@ -37,7 +38,7 @@ fn wal_record(commit_index: u64, snapshot_index: Option<u64>) -> RustRaftWalReco
         last_log_id: RustRaftLogId { term: 3, index },
         membership: vec![1, 2, 3],
     });
-    RustRaftWalRecord {
+    let mut record = RustRaftWalRecord {
         group_id: 7,
         node_id: 1,
         hard_state: RustRaftHardState {
@@ -69,8 +70,10 @@ fn wal_record(commit_index: u64, snapshot_index: Option<u64>) -> RustRaftWalReco
             installed_snapshot_index: snapshot_index.unwrap_or_default(),
             first_retained_log_index: snapshot_index.map(|index| index + 1).unwrap_or_default(),
         },
-        checksum: format!("checksum-{commit_index}"),
-    }
+        checksum: String::new(),
+    };
+    record.checksum = rustraft_wal_checksum(&record);
+    record
 }
 
 fn transition(

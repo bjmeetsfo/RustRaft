@@ -749,6 +749,8 @@ pub struct RustRaftHardState {
     pub committed: Option<RustRaftLogId>,
 }
 
+pub type RaftHardState = RustRaftHardState;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RustRaftReplicaRole {
@@ -799,10 +801,161 @@ pub struct RustRaftMembership {
     pub epoch: u64,
 }
 
+pub type RaftMembership = RustRaftMembership;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftLearnerCatchUpReport {
+    pub learner_id: RustRaftNodeId,
+    pub learner_match_index: RustRaftLogIndex,
+    pub leader_commit_index: RustRaftLogIndex,
+    pub caught_up: bool,
+    pub lag: RustRaftLogIndex,
+    pub promotable: bool,
+    pub reason: String,
+}
+
+impl RustRaftMembership {
+    pub fn quorum_size(&self) -> usize {
+        let participants = self.voters.len() + self.witnesses.len();
+        participants / 2 + 1
+    }
+
+    pub fn quorum_reached<I>(&self, acknowledgements: I) -> bool
+    where
+        I: IntoIterator<Item = RustRaftNodeId>,
+    {
+        let acknowledgements: Vec<_> = acknowledgements.into_iter().collect();
+        let votes = self
+            .voters
+            .iter()
+            .chain(self.witnesses.iter())
+            .filter(|node_id| acknowledgements.contains(node_id))
+            .count();
+        votes >= self.quorum_size()
+    }
+
+    pub fn add_learner(&mut self, node_id: RustRaftNodeId) -> Result<(), RaftError> {
+        self.ensure_absent(node_id)?;
+        self.learners.push(node_id);
+        self.epoch += 1;
+        Ok(())
+    }
+
+    pub fn add_witness(&mut self, node_id: RustRaftNodeId) -> Result<(), RaftError> {
+        self.ensure_absent(node_id)?;
+        self.witnesses.push(node_id);
+        self.epoch += 1;
+        Ok(())
+    }
+
+    pub fn promote_learner(&mut self, node_id: RustRaftNodeId) -> Result<(), RaftError> {
+        let position = self
+            .learners
+            .iter()
+            .position(|learner| *learner == node_id)
+            .ok_or_else(|| {
+                RaftError::InvalidRequest(format!("node {} is not a learner", node_id))
+            })?;
+        self.learners.remove(position);
+        self.voters.push(node_id);
+        self.epoch += 1;
+        Ok(())
+    }
+
+    pub fn remove_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RaftError> {
+        let removed = remove_node(&mut self.voters, node_id)
+            || remove_node(&mut self.learners, node_id)
+            || remove_node(&mut self.witnesses, node_id);
+        if !removed {
+            return Err(RaftError::NodeNotFound(node_id));
+        }
+        self.epoch += 1;
+        Ok(())
+    }
+
+    pub fn catchup_report(
+        &self,
+        learner_id: RustRaftNodeId,
+        learner_match_index: RustRaftLogIndex,
+        leader_commit_index: RustRaftLogIndex,
+    ) -> RaftLearnerCatchUpReport {
+        let lag = leader_commit_index.saturating_sub(learner_match_index);
+        let is_learner = self.learners.contains(&learner_id);
+        let caught_up = is_learner && learner_match_index >= leader_commit_index;
+        RaftLearnerCatchUpReport {
+            learner_id,
+            learner_match_index,
+            leader_commit_index,
+            caught_up,
+            lag,
+            promotable: caught_up,
+            reason: if !is_learner {
+                "node_is_not_learner".to_string()
+            } else if caught_up {
+                "learner_caught_up".to_string()
+            } else {
+                "learner_lagging".to_string()
+            },
+        }
+    }
+
+    fn ensure_absent(&self, node_id: RustRaftNodeId) -> Result<(), RaftError> {
+        if self.voters.contains(&node_id)
+            || self.learners.contains(&node_id)
+            || self.witnesses.contains(&node_id)
+        {
+            return Err(RaftError::InvalidRequest(format!(
+                "node {} is already a member",
+                node_id
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftJointMembership {
     pub old_voters: Vec<RustRaftNodeId>,
     pub new_voters: Vec<RustRaftNodeId>,
+}
+
+pub type JointConsensusMembership = RustRaftJointMembership;
+
+impl RustRaftJointMembership {
+    pub fn old_quorum_size(&self) -> usize {
+        self.old_voters.len() / 2 + 1
+    }
+
+    pub fn new_quorum_size(&self) -> usize {
+        self.new_voters.len() / 2 + 1
+    }
+
+    pub fn quorum_reached<I>(&self, acknowledgements: I) -> bool
+    where
+        I: IntoIterator<Item = RustRaftNodeId>,
+    {
+        let acknowledgements: Vec<_> = acknowledgements.into_iter().collect();
+        let old_votes = self
+            .old_voters
+            .iter()
+            .filter(|node_id| acknowledgements.contains(node_id))
+            .count();
+        let new_votes = self
+            .new_voters
+            .iter()
+            .filter(|node_id| acknowledgements.contains(node_id))
+            .count();
+        old_votes >= self.old_quorum_size() && new_votes >= self.new_quorum_size()
+    }
+}
+
+fn remove_node(nodes: &mut Vec<RustRaftNodeId>, node_id: RustRaftNodeId) -> bool {
+    if let Some(position) = nodes.iter().position(|existing| *existing == node_id) {
+        nodes.remove(position);
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -825,6 +978,143 @@ pub struct RustRaftWalRecord {
     pub installed_snapshot: Option<RustRaftSnapshotMeta>,
     pub apply_snapshot_fence: RustRaftApplySnapshotFence,
     pub checksum: String,
+}
+
+pub type RaftWalRecord = RustRaftWalRecord;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftWalSegment {
+    pub segment_id: u64,
+    pub first_index: RustRaftLogIndex,
+    pub last_index: RustRaftLogIndex,
+    pub records: Vec<RaftWalRecord>,
+    pub sealed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalRaftWal {
+    pub max_records_per_segment: usize,
+    segments: Vec<RaftWalSegment>,
+    next_segment_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftWalRecoveryReport {
+    pub recovered: Option<RaftWalRecord>,
+    pub truncated_corrupt_tail: bool,
+    pub surviving_records: usize,
+    pub removed_records: usize,
+}
+
+impl LocalRaftWal {
+    pub fn new(max_records_per_segment: usize) -> Result<Self, RaftError> {
+        if max_records_per_segment == 0 {
+            return Err(RaftError::InvalidRequest(
+                "max_records_per_segment must be greater than zero".to_string(),
+            ));
+        }
+        Ok(Self {
+            max_records_per_segment,
+            segments: vec![RaftWalSegment {
+                segment_id: 0,
+                first_index: 0,
+                last_index: 0,
+                records: Vec::new(),
+                sealed: false,
+            }],
+            next_segment_id: 1,
+        })
+    }
+
+    pub fn append(&mut self, mut record: RaftWalRecord) -> Result<String, RaftError> {
+        record.checksum = rustraft_wal_checksum(&record);
+        if self
+            .segments
+            .last()
+            .map(|segment| segment.records.len() >= self.max_records_per_segment)
+            .unwrap_or(true)
+        {
+            if let Some(segment) = self.segments.last_mut() {
+                segment.sealed = true;
+            }
+            self.segments.push(RaftWalSegment {
+                segment_id: self.next_segment_id,
+                first_index: 0,
+                last_index: 0,
+                records: Vec::new(),
+                sealed: false,
+            });
+            self.next_segment_id += 1;
+        }
+
+        let checksum = record.checksum.clone();
+        let record_index = record
+            .hard_state
+            .committed
+            .as_ref()
+            .map(|log_id| log_id.index)
+            .or_else(|| record.entries.last().map(|entry| entry.log_id.index))
+            .unwrap_or_default();
+        let segment = self
+            .segments
+            .last_mut()
+            .ok_or_else(|| RaftError::Storage("WAL has no active segment".to_string()))?;
+        if segment.records.is_empty() {
+            segment.first_index = record_index;
+        }
+        segment.last_index = record_index;
+        segment.records.push(record);
+        Ok(checksum)
+    }
+
+    pub fn segments(&self) -> &[RaftWalSegment] {
+        &self.segments
+    }
+
+    pub fn records(&self) -> Vec<RaftWalRecord> {
+        self.segments
+            .iter()
+            .flat_map(|segment| segment.records.iter().cloned())
+            .collect()
+    }
+
+    pub fn recover(&mut self) -> Result<RaftWalRecoveryReport, RaftError> {
+        let mut records = self.records();
+        let original_len = records.len();
+        while matches!(records.last(), Some(record) if !rustraft_wal_checksum_valid(record)) {
+            records.pop();
+        }
+        let recovered = rustraft_recover_latest_wal_record(&records).ok();
+        let truncated_corrupt_tail = records.len() != original_len;
+        if truncated_corrupt_tail {
+            self.rebuild_from_records(records.clone())?;
+        }
+        Ok(RaftWalRecoveryReport {
+            recovered,
+            truncated_corrupt_tail,
+            surviving_records: records.len(),
+            removed_records: original_len.saturating_sub(records.len()),
+        })
+    }
+
+    pub fn corrupt_tail_for_test(&mut self) -> Result<(), RaftError> {
+        let record = self
+            .segments
+            .last_mut()
+            .and_then(|segment| segment.records.last_mut())
+            .ok_or_else(|| RaftError::Storage("WAL has no tail record".to_string()))?;
+        record.checksum = "corrupt-tail".to_string();
+        Ok(())
+    }
+
+    fn rebuild_from_records(&mut self, records: Vec<RaftWalRecord>) -> Result<(), RaftError> {
+        let max_records_per_segment = self.max_records_per_segment;
+        *self = LocalRaftWal::new(max_records_per_segment)?;
+        for record in records {
+            self.append(record)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1139,12 +1429,64 @@ pub struct RustRaftGenericSnapshot<G = RustRaftGroupId, P = RustRaftSnapshotPayl
     pub payload: P,
 }
 
+pub type RaftSnapshot = RustRaftGenericSnapshot<RustRaftGroupId, RustRaftSnapshotPayload>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftGenericSnapshotChunk<P = RustRaftSnapshotPayload> {
     pub meta: RustRaftSnapshotMeta,
     pub offset: u64,
     pub data: P,
     pub done: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftSnapshotInstallState {
+    pub meta: RustRaftSnapshotMeta,
+    pub bytes: RustRaftSnapshotPayload,
+    pub next_offset: u64,
+    pub complete: bool,
+}
+
+impl RaftSnapshotInstallState {
+    pub fn new(meta: RustRaftSnapshotMeta) -> Self {
+        Self {
+            meta,
+            bytes: Vec::new(),
+            next_offset: 0,
+            complete: false,
+        }
+    }
+
+    pub fn install_chunk(&mut self, chunk: RustRaftSnapshotChunk) -> Result<(), RaftError> {
+        if chunk.meta != self.meta {
+            return Err(RaftError::InvalidRequest(
+                "snapshot chunk metadata changed during install".to_string(),
+            ));
+        }
+        if chunk.offset != self.next_offset {
+            return Err(RaftError::InvalidRequest(format!(
+                "snapshot chunk offset {} does not match next offset {}",
+                chunk.offset, self.next_offset
+            )));
+        }
+        self.next_offset += chunk.data.len() as u64;
+        self.bytes.extend_from_slice(&chunk.data);
+        self.complete = chunk.done;
+        Ok(())
+    }
+
+    pub fn finish(self, group_id: RustRaftGroupId) -> Result<RaftSnapshot, RaftError> {
+        if !self.complete {
+            return Err(RaftError::InvalidRequest(
+                "snapshot install is incomplete".to_string(),
+            ));
+        }
+        Ok(RaftSnapshot {
+            group_id,
+            meta: self.meta,
+            payload: self.bytes,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1272,6 +1614,7 @@ struct RaftNode {
     raft_role: RustRaftRole,
     hard_state: RustRaftHardState,
     log: Vec<RustRaftLogEntry>,
+    installed_snapshot: Option<RustRaftSnapshotMeta>,
     commit_index: RustRaftLogIndex,
     applied_index: RustRaftLogIndex,
     healthy: bool,
@@ -1293,6 +1636,7 @@ impl RaftNode {
                 committed: None,
             },
             log: Vec::new(),
+            installed_snapshot: None,
             commit_index: 0,
             applied_index: 0,
             healthy: true,
@@ -1300,10 +1644,17 @@ impl RaftNode {
     }
 
     fn match_index(&self) -> RustRaftLogIndex {
-        self.log
+        let log_index = self
+            .log
             .last()
             .map(|entry| entry.log_id.index)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let snapshot_index = self
+            .installed_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.last_log_id.index)
+            .unwrap_or_default();
+        log_index.max(snapshot_index)
     }
 
     fn append_entry(&mut self, entry: RustRaftLogEntry) {
@@ -1323,6 +1674,20 @@ impl RaftNode {
             self.applied_index = self.applied_index.max(self.commit_index);
         }
         self.hard_state.committed = (self.commit_index > 0).then_some(RustRaftLogId {
+            term: self.hard_state.current_term,
+            index: self.commit_index,
+        });
+    }
+
+    fn install_snapshot(&mut self, snapshot: RaftSnapshot) {
+        let snapshot_index = snapshot.meta.last_log_id.index;
+        self.installed_snapshot = Some(snapshot.meta);
+        self.log.retain(|entry| entry.log_id.index > snapshot_index);
+        self.commit_index = self.commit_index.max(snapshot_index);
+        if self.replica_role.can_serve_data() {
+            self.applied_index = self.applied_index.max(snapshot_index);
+        }
+        self.hard_state.committed = Some(RustRaftLogId {
             term: self.hard_state.current_term,
             index: self.commit_index,
         });
@@ -1656,6 +2021,115 @@ impl RaftCluster {
         self.campaign(target, true)
     }
 
+    pub fn membership(&self) -> RaftMembership {
+        RaftMembership {
+            group_id: self.group_id,
+            voters: self
+                .nodes
+                .values()
+                .filter(|node| node.replica_role == RustRaftReplicaRole::Voter)
+                .map(|node| node.id)
+                .collect(),
+            learners: self
+                .nodes
+                .values()
+                .filter(|node| node.replica_role == RustRaftReplicaRole::Learner)
+                .map(|node| node.id)
+                .collect(),
+            witnesses: self
+                .nodes
+                .values()
+                .filter(|node| node.replica_role == RustRaftReplicaRole::Witness)
+                .map(|node| node.id)
+                .collect(),
+            epoch: self.current_term,
+        }
+    }
+
+    pub fn add_peer(&mut self, peer: RustRaftPeer) -> Result<(), RaftError> {
+        if self.nodes.contains_key(&peer.node_id) {
+            return Err(RaftError::InvalidRequest(format!(
+                "duplicate raft node id {}",
+                peer.node_id
+            )));
+        }
+        self.nodes
+            .insert(peer.node_id, RaftNode::new(peer.node_id, peer.role));
+        Ok(())
+    }
+
+    pub fn add_learner(&mut self, mut peer: RustRaftPeer) -> Result<(), RaftError> {
+        peer.role = RustRaftReplicaRole::Learner;
+        self.add_peer(peer)
+    }
+
+    pub fn promote_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RaftError> {
+        let commit_index = self.commit_index;
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .ok_or(RaftError::NodeNotFound(node_id))?;
+        if node.match_index() < commit_index {
+            return Err(RaftError::InvalidRequest(format!(
+                "node {} is behind committed index {}",
+                node_id, commit_index
+            )));
+        }
+        node.replica_role = RustRaftReplicaRole::Voter;
+        node.raft_role = RustRaftRole::Follower;
+        Ok(())
+    }
+
+    pub fn add_witness(&mut self, mut peer: RustRaftPeer) -> Result<(), RaftError> {
+        peer.role = RustRaftReplicaRole::Witness;
+        self.add_peer(peer)
+    }
+
+    pub fn remove_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RaftError> {
+        self.nodes
+            .remove(&node_id)
+            .ok_or(RaftError::NodeNotFound(node_id))?;
+        if self.leader_id == Some(node_id) {
+            self.leader_id = None;
+            self.leader_lease_valid = false;
+        }
+        Ok(())
+    }
+
+    pub fn catchup_report(
+        &self,
+        learner_id: RustRaftNodeId,
+    ) -> Result<RaftLearnerCatchUpReport, RaftError> {
+        let node = self
+            .nodes
+            .get(&learner_id)
+            .ok_or(RaftError::NodeNotFound(learner_id))?;
+        Ok(self
+            .membership()
+            .catchup_report(learner_id, node.match_index(), self.commit_index))
+    }
+
+    pub fn install_snapshot_to(
+        &mut self,
+        target: RustRaftNodeId,
+        snapshot: RaftSnapshot,
+        fence: RustRaftApplySnapshotFence,
+    ) -> Result<(), RaftError> {
+        if snapshot.group_id != self.group_id {
+            return Err(RaftError::InvalidRequest(
+                "snapshot group id mismatch".to_string(),
+            ));
+        }
+        rustraft_validate_snapshot_install(&snapshot, &fence)?;
+        let node = self
+            .nodes
+            .get_mut(&target)
+            .ok_or(RaftError::NodeNotFound(target))?;
+        node.install_snapshot(snapshot);
+        self.refresh_cluster_indexes();
+        Ok(())
+    }
+
     pub fn status(&self, node_id: RustRaftNodeId) -> Result<RustRaftStatusSnapshot, RaftError> {
         let node = self
             .nodes
@@ -1670,7 +2144,11 @@ impl RaftCluster {
             commit_index: node.commit_index,
             applied_index: node.applied_index,
             last_log_index: node.match_index(),
-            last_snapshot_index: 0,
+            last_snapshot_index: node
+                .installed_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.last_log_id.index)
+                .unwrap_or_default(),
             peers: self
                 .nodes
                 .values()
@@ -1792,53 +2270,23 @@ impl RustRaftConsensus for RaftCluster {
     }
 
     fn add_peer(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError> {
-        if self.nodes.contains_key(&peer.node_id) {
-            return Err(RaftError::InvalidRequest(format!(
-                "duplicate raft node id {}",
-                peer.node_id
-            )));
-        }
-        self.nodes
-            .insert(peer.node_id, RaftNode::new(peer.node_id, peer.role));
-        Ok(())
+        RaftCluster::add_peer(self, peer)
     }
 
-    fn add_learner(&mut self, mut peer: RustRaftPeer) -> Result<(), RustRaftError> {
-        peer.role = RustRaftReplicaRole::Learner;
-        self.add_peer(peer)
+    fn add_learner(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError> {
+        RaftCluster::add_learner(self, peer)
     }
 
     fn promote_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RustRaftError> {
-        let commit_index = self.commit_index;
-        let node = self
-            .nodes
-            .get_mut(&node_id)
-            .ok_or(RaftError::NodeNotFound(node_id))?;
-        if node.match_index() < commit_index {
-            return Err(RaftError::InvalidRequest(format!(
-                "node {} is behind committed index {}",
-                node_id, commit_index
-            )));
-        }
-        node.replica_role = RustRaftReplicaRole::Voter;
-        node.raft_role = RustRaftRole::Follower;
-        Ok(())
+        RaftCluster::promote_peer(self, node_id)
     }
 
-    fn add_witness(&mut self, mut peer: RustRaftPeer) -> Result<(), RustRaftError> {
-        peer.role = RustRaftReplicaRole::Witness;
-        self.add_peer(peer)
+    fn add_witness(&mut self, peer: RustRaftPeer) -> Result<(), RustRaftError> {
+        RaftCluster::add_witness(self, peer)
     }
 
     fn remove_peer(&mut self, node_id: RustRaftNodeId) -> Result<(), RustRaftError> {
-        self.nodes
-            .remove(&node_id)
-            .ok_or(RaftError::NodeNotFound(node_id))?;
-        if self.leader_id == Some(node_id) {
-            self.leader_id = None;
-            self.leader_lease_valid = false;
-        }
-        Ok(())
+        RaftCluster::remove_peer(self, node_id)
     }
 
     fn transfer_leader(&mut self, target: RustRaftNodeId) -> Result<(), RustRaftError> {
@@ -1898,6 +2346,42 @@ pub trait RustRaftTransport {
     ) -> Result<RustRaftReadIndexResponse, RustRaftError>;
 }
 
+pub fn rustraft_wal_checksum(record: &RaftWalRecord) -> String {
+    let mut hash = 14_695_981_039_346_656_037_u64;
+    let mut mix = |value: u64| {
+        for byte in value.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(1_099_511_628_211);
+        }
+    };
+    mix(record.group_id);
+    mix(record.node_id);
+    mix(record.hard_state.current_term);
+    mix(record.hard_state.voted_for.unwrap_or_default());
+    if let Some(committed) = &record.hard_state.committed {
+        mix(committed.term);
+        mix(committed.index);
+    }
+    for entry in &record.entries {
+        mix(entry.log_id.term);
+        mix(entry.log_id.index);
+        mix(entry.payload.len() as u64);
+    }
+    if let Some(snapshot) = &record.installed_snapshot {
+        mix(snapshot.last_log_id.term);
+        mix(snapshot.last_log_id.index);
+    }
+    mix(record.apply_snapshot_fence.applied_index);
+    mix(record.apply_snapshot_fence.commit_index);
+    mix(record.apply_snapshot_fence.installed_snapshot_index);
+    mix(record.apply_snapshot_fence.first_retained_log_index);
+    format!("{hash:016x}")
+}
+
+pub fn rustraft_wal_checksum_valid(record: &RaftWalRecord) -> bool {
+    record.checksum == rustraft_wal_checksum(record)
+}
+
 pub fn rustraft_validate_apply_snapshot_fence(
     record: &RustRaftWalRecord,
 ) -> Result<(), RustRaftError> {
@@ -1935,11 +2419,58 @@ pub fn rustraft_validate_apply_snapshot_fence(
     Ok(())
 }
 
+pub fn rustraft_validate_snapshot_floor_log_matching(
+    snapshot: &RustRaftSnapshotMeta,
+    first_retained_log_index: RustRaftLogIndex,
+    prev_log_id: Option<&RustRaftLogId>,
+) -> Result<(), RustRaftError> {
+    if first_retained_log_index > 0 && first_retained_log_index <= snapshot.last_log_id.index {
+        return Err(RaftError::Storage(
+            "first retained log index overlaps snapshot floor".to_string(),
+        ));
+    }
+    if let Some(prev_log_id) = prev_log_id {
+        if prev_log_id.index < snapshot.last_log_id.index {
+            return Err(RaftError::Storage(
+                "previous log id is below snapshot floor".to_string(),
+            ));
+        }
+        if prev_log_id.index == snapshot.last_log_id.index
+            && prev_log_id.term != snapshot.last_log_id.term
+        {
+            return Err(RaftError::Storage(
+                "snapshot floor term does not match previous log id".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn rustraft_validate_snapshot_install(
+    snapshot: &RaftSnapshot,
+    fence: &RustRaftApplySnapshotFence,
+) -> Result<(), RustRaftError> {
+    if fence.installed_snapshot_index != snapshot.meta.last_log_id.index {
+        return Err(RaftError::Storage(
+            "snapshot install fence does not match snapshot last log index".to_string(),
+        ));
+    }
+    rustraft_validate_snapshot_floor_log_matching(
+        &snapshot.meta,
+        fence.first_retained_log_index,
+        Some(&snapshot.meta.last_log_id),
+    )
+}
+
 pub fn rustraft_recover_latest_wal_record(
     records: &[RustRaftWalRecord],
 ) -> Result<RustRaftWalRecord, RustRaftError> {
-    let Some(record) = records
+    let valid_records = records
         .iter()
+        .take_while(|record| rustraft_wal_checksum_valid(record))
+        .collect::<Vec<_>>();
+    let Some(record) = valid_records
+        .into_iter()
         .filter(|record| rustraft_validate_apply_snapshot_fence(record).is_ok())
         .max_by_key(|record| {
             record

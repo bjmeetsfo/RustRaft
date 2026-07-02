@@ -1,7 +1,7 @@
 use rustraft::{
     rustraft_learner_promotion_decision, rustraft_read_safety_runtime_decision,
-    rustraft_recover_latest_wal_record, RustRaftApplySnapshotFence, RustRaftHardState,
-    RustRaftLogEntry, RustRaftLogId, RustRaftMembership, RustRaftPeerStatus,
+    rustraft_recover_latest_wal_record, rustraft_wal_checksum, RustRaftApplySnapshotFence,
+    RustRaftHardState, RustRaftLogEntry, RustRaftLogId, RustRaftMembership, RustRaftPeerStatus,
     RustRaftReadSafetyOperation, RustRaftReadSafetyRuntimeInput, RustRaftReplicaRole, RustRaftRole,
     RustRaftSnapshotMeta, RustRaftStatusSnapshot, RustRaftWalRecord,
 };
@@ -86,7 +86,7 @@ fn status_for(node: &ModelNode, nodes: &[ModelNode]) -> RustRaftStatusSnapshot {
 }
 
 fn wal_record(node: &ModelNode) -> RustRaftWalRecord {
-    RustRaftWalRecord {
+    let mut record = RustRaftWalRecord {
         group_id: 7,
         node_id: node.id,
         hard_state: RustRaftHardState {
@@ -129,8 +129,10 @@ fn wal_record(node: &ModelNode) -> RustRaftWalRecord {
                 0
             },
         },
-        checksum: format!("node-{}-{}", node.id, node.commit_index),
-    }
+        checksum: String::new(),
+    };
+    record.checksum = rustraft_wal_checksum(&record);
+    record
 }
 
 #[test]
