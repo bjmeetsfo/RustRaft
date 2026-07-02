@@ -135,6 +135,12 @@ TemporalStore keeps adapter docs and implementation details for command codecs,
 TemporalEngine apply logic, metaserver scheduling, HTTP/process endpoints, and
 storage-object wiring.
 
+`rustraft_standalone_readiness_report()` is the fail-closed status check for a
+non-TemporalStore embedding. It only reports `ProductionReady` when the public
+crate surface covers node lifecycle, replication, election/pre-vote, membership,
+WAL recovery, snapshots, read-index/lease-read, and status/metrics/readiness
+without relying on TemporalStore adapter code.
+
 The intended TemporalStore adapter shape is:
 
 ```rust
@@ -185,6 +191,16 @@ Inspect the open-source embedding surface:
 ```bash
 cargo run --example open_source_surface
 ```
+
+Run the standalone ByteRaft-vs-RustRaft benchmark script from the RustRaft repo:
+
+```bash
+bash scripts/byteraft_vs_rustraft_benchmark.sh --out target/byteraft-vs-rustraft-benchmark/report.json
+```
+
+The script does not enter or depend on the TemporalStore checkout. It records an
+optional `--byteraft-root` path for real ByteRaft binary wiring while the current
+same-machine harness uses the built-in ByteRaft reference model.
 
 These examples are also covered by integration tests so the public snippets stay
 in sync with the crate API.

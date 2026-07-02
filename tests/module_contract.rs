@@ -9,7 +9,8 @@ use rustraft::{
     node::{RaftNodeRuntime, RustRaftNodeOptions},
     readiness::{
         rustraft_open_source_surface, rustraft_parity_report, rustraft_public_api_contract,
-        rustraft_temporalstore_adapter_shape, RustRaftReadinessSnapshot,
+        rustraft_standalone_readiness_report, rustraft_temporalstore_adapter_shape,
+        RustRaftReadinessSnapshot,
     },
     snapshot::{
         PersistentRaftSnapshotStoreOptions, RaftSnapshot, RustRaftApplySnapshotFence,
@@ -139,6 +140,67 @@ fn public_modules_expose_temporalstore_consumption_boundary() {
     };
     assert!(rustraft_parity_report(&readiness).ready);
     assert!(!rustraft_metric_names().append_latency_ms.is_empty());
+}
+
+#[test]
+fn standalone_readiness_report_covers_non_temporalstore_embedding_status() {
+    let report = rustraft_standalone_readiness_report();
+    assert!(report.standalone, "{:?}", report.missing);
+    assert_eq!(
+        report.production_status,
+        rustraft::RustRaftProductionStatus::ProductionReady
+    );
+    assert!(report.missing.is_empty());
+
+    let expected = [
+        "node_lifecycle",
+        "replication",
+        "election_pre_vote",
+        "membership",
+        "wal_recovery",
+        "snapshots",
+        "read_index_lease_read",
+        "status_metrics_readiness",
+    ];
+    let actual = report
+        .capabilities
+        .iter()
+        .map(|capability| capability.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    assert!(report
+        .capabilities
+        .iter()
+        .all(|capability| capability.ready));
+    assert!(report
+        .capabilities
+        .iter()
+        .all(|capability| !capability.evidence.is_empty()));
+    assert!(report
+        .evidence
+        .iter()
+        .any(|item| item.contains("RaftNodeRuntime")));
+    assert!(report
+        .evidence
+        .iter()
+        .any(|item| item.contains("AppendEntriesRequest")));
+    assert!(report
+        .evidence
+        .iter()
+        .any(|item| item.contains("PersistentRaftWalOptions")));
+    assert!(report
+        .evidence
+        .iter()
+        .all(|item| !item.contains("TemporalStore")));
+
+    let api = rustraft_public_api_contract();
+    assert!(api
+        .compatibility_reports
+        .contains(&"rustraft_standalone_readiness_report".to_string()));
+    let surface = rustraft_open_source_surface();
+    assert!(surface
+        .compatibility_reports
+        .contains(&"rustraft_standalone_readiness_report".to_string()));
 }
 
 #[test]

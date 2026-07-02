@@ -31,6 +31,18 @@ fn same_machine_benchmark_covers_required_byteraft_workloads() {
 }
 
 #[test]
+fn external_benchmark_script_runs_outside_temporalstore() {
+    let script = include_str!("../scripts/byteraft_vs_rustraft_benchmark.sh");
+
+    assert!(script.contains("--manifest-path \"$rustraft_root/Cargo.toml\""));
+    assert!(script.contains("--example byteraft_parity_benchmark"));
+    assert!(script.contains("BYTERAFT_ROOT"));
+    assert!(script.contains("BENCHMARK_OUT"));
+    assert!(!script.contains("TemporalStore.git"));
+    assert!(!script.contains("crates/temporalstore-rust"));
+}
+
+#[test]
 fn same_machine_model_passes_twenty_percent_parity_gate() {
     let options = RustRaftBenchmarkOptions::default();
     let mut byteraft = RustRaftSameMachineModelRunner::byteraft_baseline();

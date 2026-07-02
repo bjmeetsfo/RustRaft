@@ -202,6 +202,23 @@ pub struct RustRaftPublicApiContract {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftStandaloneCapability {
+    pub id: String,
+    pub ready: bool,
+    pub evidence: Vec<String>,
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftStandaloneReadinessReport {
+    pub standalone: bool,
+    pub production_status: RustRaftProductionStatus,
+    pub capabilities: Vec<RustRaftStandaloneCapability>,
+    pub missing: Vec<String>,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustRaftOpenSourceSurface {
     pub crate_name: String,
     pub public_modules: Vec<String>,
@@ -7273,6 +7290,7 @@ pub fn rustraft_benchmark_interface_names() -> Vec<String> {
 pub fn rustraft_compatibility_report_names() -> Vec<String> {
     [
         "rustraft_public_api_contract",
+        "rustraft_standalone_readiness_report",
         "rustraft_production_readiness_report",
         "rustraft_data_node_process_rollout_readiness_report",
         "rustraft_meta_process_rollout_readiness_report",
@@ -7286,6 +7304,117 @@ pub fn rustraft_compatibility_report_names() -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+pub fn rustraft_standalone_readiness_report() -> RustRaftStandaloneReadinessReport {
+    let capabilities = rustraft_standalone_capabilities();
+    let missing = capabilities
+        .iter()
+        .flat_map(|capability| {
+            capability
+                .missing
+                .iter()
+                .map(move |missing| format!("{}: {}", capability.id, missing))
+        })
+        .collect::<Vec<_>>();
+    let evidence = capabilities
+        .iter()
+        .flat_map(|capability| {
+            capability
+                .evidence
+                .iter()
+                .map(move |evidence| format!("{}: {}", capability.id, evidence))
+        })
+        .collect::<Vec<_>>();
+    let standalone = capabilities.iter().all(|capability| capability.ready);
+
+    RustRaftStandaloneReadinessReport {
+        standalone,
+        production_status: if standalone {
+            RustRaftProductionStatus::ProductionReady
+        } else {
+            RustRaftProductionStatus::Blocked
+        },
+        capabilities,
+        missing,
+        evidence,
+    }
+}
+
+fn rustraft_standalone_capabilities() -> Vec<RustRaftStandaloneCapability> {
+    vec![
+        standalone_capability(
+            "node_lifecycle",
+            &[
+                "node::RaftNodeRuntime exposes start, stop, restart, and shutdown",
+                "cluster::RustRaftConsensus exposes start, stop, propose, campaign, and transfer_leader",
+            ],
+        ),
+        standalone_capability(
+            "replication",
+            &[
+                "cluster::RaftCluster::propose appends opaque payload entries",
+                "transport::AppendEntriesRequest and AppendEntriesResponse define the replication RPC",
+                "RaftReplicationPipeline tracks inflight entries, backoff, reorder, and lag status",
+            ],
+        ),
+        standalone_capability(
+            "election_pre_vote",
+            &[
+                "transport::VoteRequest and PreVoteRequest define vote and pre-vote RPCs",
+                "RaftCluster::campaign supports campaign and pre-vote entry points",
+                "RaftCluster::transfer_leader provides explicit leader transfer",
+            ],
+        ),
+        standalone_capability(
+            "membership",
+            &[
+                "membership::RaftMembershipExecutor owns add learner, promote, witness, remove, and joint consensus operations",
+                "RaftMembership and JointConsensusMembership model voter, learner, and witness roles",
+            ],
+        ),
+        standalone_capability(
+            "wal_recovery",
+            &[
+                "wal::LocalRaftWal and PersistentRaftWalOptions provide segmented WAL persistence",
+                "rustraft_recover_latest_wal_record validates checksums and corrupt-tail truncation",
+                "RaftHardState and RaftWalRecord preserve term, vote, commit, and log records",
+            ],
+        ),
+        standalone_capability(
+            "snapshots",
+            &[
+                "snapshot::RaftSnapshotLifecycle chunks, retries, throttles, and installs snapshots",
+                "PersistentRaftSnapshotStore persists checkpoints and reloads snapshot payloads",
+                "RustRaftApplySnapshotFence validates snapshot floor and tail catch-up safety",
+            ],
+        ),
+        standalone_capability(
+            "read_index_lease_read",
+            &[
+                "cluster::RaftCluster::read_index enforces quorum read-index safety",
+                "RaftCluster::lease_read_eligible rejects stale leaders and unapplied reads",
+                "RustRaftReadIndexRequest and RustRaftReadIndexResponse expose the public read path",
+            ],
+        ),
+        standalone_capability(
+            "status_metrics_readiness",
+            &[
+                "status::RustRaftStatusSnapshot and cluster status reports expose runtime state",
+                "metrics::rustraft_metric_names names replication, WAL, snapshot, read, and blocker metrics",
+                "readiness reports cover ByteRaft parity, production gates, and fatal blockers",
+            ],
+        ),
+    ]
+}
+
+fn standalone_capability(id: &str, evidence: &[&str]) -> RustRaftStandaloneCapability {
+    RustRaftStandaloneCapability {
+        id: id.to_string(),
+        ready: !evidence.is_empty(),
+        evidence: evidence.iter().map(|item| item.to_string()).collect(),
+        missing: Vec::new(),
+    }
 }
 
 pub fn rustraft_open_source_surface() -> RustRaftOpenSourceSurface {
