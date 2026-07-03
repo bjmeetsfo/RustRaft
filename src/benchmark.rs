@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -275,7 +276,8 @@ impl RustRaftExternalByteRaftRunner {
         build_profile: impl Into<String>,
     ) -> Result<Self, String> {
         let root = byteraft_root.as_ref();
-        let binary = rustraft_find_byteraft_harness(root)?;
+        let build_profile = build_profile.into();
+        let binary = rustraft_find_or_build_byteraft_harness(root, &build_profile)?;
         Self::new(binary, Some(root.to_path_buf()), build_profile)
     }
 }
@@ -369,6 +371,149 @@ pub fn rustraft_find_byteraft_harness(byteraft_root: impl AsRef<Path>) -> Result
         .into_iter()
         .find(|path| path.is_file())
         .ok_or_else(|| format!("benchmark:real_byteraft_missing:{}", root.display()))
+}
+
+pub fn rustraft_find_or_build_byteraft_harness(
+    byteraft_root: impl AsRef<Path>,
+    build_profile: &str,
+) -> Result<PathBuf, String> {
+    let root = byteraft_root.as_ref();
+    if let Ok(binary) = rustraft_find_byteraft_harness(root) {
+        return Ok(binary);
+    }
+    if !root.is_dir() {
+        return Err(format!(
+            "benchmark:real_byteraft_missing:{}",
+            root.display()
+        ));
+    }
+
+    let build_attempts = [
+        try_byteraft_build_script(
+            root,
+            &root.join("scripts/build_byteraft_parity_benchmark.sh"),
+            build_profile,
+        ),
+        try_byteraft_build_script(
+            root,
+            &root.join("build_byteraft_parity_benchmark.sh"),
+            build_profile,
+        ),
+        try_byteraft_cmake_target(root, build_profile),
+        try_byteraft_bazel_target(root, build_profile),
+    ];
+
+    if let Ok(binary) = rustraft_find_byteraft_harness(root) {
+        return Ok(binary);
+    }
+
+    let attempted = build_attempts
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    if attempted.is_empty() {
+        Err(format!(
+            "benchmark:real_byteraft_missing:{}",
+            root.display()
+        ))
+    } else {
+        Err(format!(
+            "benchmark:real_byteraft_missing:{}; build_attempts={}",
+            root.display(),
+            attempted.join("|")
+        ))
+    }
+}
+
+fn try_byteraft_build_script(
+    root: &Path,
+    script: &Path,
+    build_profile: &str,
+) -> Result<(), String> {
+    if !script.is_file() {
+        return Ok(());
+    }
+    let status = Command::new("bash")
+        .arg(script)
+        .arg("--profile")
+        .arg(build_profile)
+        .current_dir(root)
+        .status()
+        .map_err(|err| format!("build_script:{}:{err}", script.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("build_script:{}:{status}", script.display()))
+    }
+}
+
+fn try_byteraft_cmake_target(root: &Path, build_profile: &str) -> Result<(), String> {
+    let cmake_file = root.join("CMakeLists.txt");
+    let Ok(cmake_text) = fs::read_to_string(&cmake_file) else {
+        return Ok(());
+    };
+    if !cmake_text.contains("byteraft_parity_benchmark") {
+        return Ok(());
+    }
+    let build_dir = root.join("build");
+    let build_type = if build_profile == "release" {
+        "Release"
+    } else {
+        "Debug"
+    };
+    let configure = Command::new("cmake")
+        .arg("-S")
+        .arg(root)
+        .arg("-B")
+        .arg(&build_dir)
+        .arg(format!("-DCMAKE_BUILD_TYPE={build_type}"))
+        .current_dir(root)
+        .status()
+        .map_err(|err| format!("cmake_configure:{err}"))?;
+    if !configure.success() {
+        return Err(format!("cmake_configure:{configure}"));
+    }
+    let build = Command::new("cmake")
+        .arg("--build")
+        .arg(&build_dir)
+        .arg("--target")
+        .arg("byteraft_parity_benchmark")
+        .current_dir(root)
+        .status()
+        .map_err(|err| format!("cmake_build:{err}"))?;
+    if build.success() {
+        Ok(())
+    } else {
+        Err(format!("cmake_build:{build}"))
+    }
+}
+
+fn try_byteraft_bazel_target(root: &Path, _build_profile: &str) -> Result<(), String> {
+    let build_file = root.join("BUILD");
+    let Ok(build_text) = fs::read_to_string(&build_file) else {
+        return Ok(());
+    };
+    if !build_text.contains("byteraft_parity_benchmark") {
+        return Ok(());
+    }
+    let status = Command::new("bazel")
+        .arg("build")
+        .arg("//:byteraft_parity_benchmark")
+        .current_dir(root)
+        .status()
+        .map_err(|err| format!("bazel_build:{err}"))?;
+    if status.success() {
+        let bazel_binary = root.join("bazel-bin/byteraft_parity_benchmark");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).map_err(|err| format!("bazel_bin_dir:{err}"))?;
+        if bazel_binary.is_file() {
+            fs::copy(&bazel_binary, bin_dir.join("byteraft_parity_benchmark"))
+                .map_err(|err| format!("bazel_copy:{err}"))?;
+        }
+        Ok(())
+    } else {
+        Err(format!("bazel_build:{status}"))
+    }
 }
 
 pub fn rustraft_run_byteraft_parity_benchmark(

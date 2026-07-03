@@ -15,7 +15,9 @@ Environment:
   BENCHMARK_OUT   Output report path.
 
 Production parity is fail-closed: the script requires a real ByteRaft harness
-and never falls back to the model runner.
+and never falls back to the model runner. If the checkout exposes a
+byteraft_parity_benchmark build hook or CMake/Bazel target, the script builds it
+before failing closed.
 USAGE
 }
 
@@ -67,7 +69,7 @@ if [[ ! -f "$rustraft_root/Cargo.toml" ]]; then
   exit 2
 fi
 
-if [[ -z "$byteraft_bin" ]]; then
+find_byteraft_bin() {
   for candidate in \
     "$byteraft_root/target/release/byteraft_parity_benchmark" \
     "$byteraft_root/target/debug/byteraft_parity_benchmark" \
@@ -76,14 +78,62 @@ if [[ -z "$byteraft_bin" ]]; then
     "$byteraft_root/byteraft_parity_benchmark"; do
     if [[ -x "$candidate" || -f "$candidate" ]]; then
       byteraft_bin="$candidate"
-      break
+      return 0
     fi
   done
+  return 1
+}
+
+try_build_byteraft_harness() {
+  if [[ ! -d "$byteraft_root" ]]; then
+    return 0
+  fi
+
+  for build_script in \
+    "$byteraft_root/scripts/build_byteraft_parity_benchmark.sh" \
+    "$byteraft_root/build_byteraft_parity_benchmark.sh"; do
+    if [[ -f "$build_script" ]]; then
+      bash "$build_script" --profile "$build_profile" || return 1
+      find_byteraft_bin && return 0
+    fi
+  done
+
+  if [[ -f "$byteraft_root/CMakeLists.txt" ]] && grep -q "byteraft_parity_benchmark" "$byteraft_root/CMakeLists.txt"; then
+    cmake_build_type=Debug
+    if [[ "$build_profile" == "release" ]]; then
+      cmake_build_type=Release
+    fi
+    cmake -S "$byteraft_root" -B "$byteraft_root/build" -DCMAKE_BUILD_TYPE="$cmake_build_type"
+    cmake --build "$byteraft_root/build" --target byteraft_parity_benchmark
+    find_byteraft_bin && return 0
+  fi
+
+  if [[ -f "$byteraft_root/BUILD" ]] && grep -q "byteraft_parity_benchmark" "$byteraft_root/BUILD"; then
+    (cd "$byteraft_root" && bazel build //:byteraft_parity_benchmark)
+    mkdir -p "$byteraft_root/bin"
+    if [[ -f "$byteraft_root/bazel-bin/byteraft_parity_benchmark" ]]; then
+      cp "$byteraft_root/bazel-bin/byteraft_parity_benchmark" "$byteraft_root/bin/byteraft_parity_benchmark"
+    fi
+    find_byteraft_bin && return 0
+  fi
+
+  return 0
+}
+
+if [[ -z "$byteraft_bin" ]]; then
+  find_byteraft_bin || true
 fi
 
 if [[ ! -d "$byteraft_root" && -z "$byteraft_bin" ]]; then
   echo "benchmark:real_byteraft_missing: ByteRaft root does not exist: $byteraft_root" >&2
   exit 2
+fi
+
+if [[ -z "$byteraft_bin" ]]; then
+  try_build_byteraft_harness || {
+    echo "benchmark:real_byteraft_missing: failed to build ByteRaft benchmark harness under $byteraft_root" >&2
+    exit 2
+  }
 fi
 
 if [[ -z "$byteraft_bin" || ! -f "$byteraft_bin" ]]; then

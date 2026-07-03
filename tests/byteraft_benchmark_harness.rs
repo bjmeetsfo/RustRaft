@@ -41,6 +41,9 @@ fn external_benchmark_script_runs_outside_temporalstore() {
     assert!(script.contains("benchmark:real_byteraft_missing"));
     assert!(script.contains("BYTERAFT_ROOT"));
     assert!(script.contains("BENCHMARK_OUT"));
+    assert!(script.contains("build_byteraft_parity_benchmark.sh"));
+    assert!(script.contains("--target byteraft_parity_benchmark"));
+    assert!(script.contains("bazel build //:byteraft_parity_benchmark"));
     assert!(!script.contains("TemporalStore.git"));
     assert!(!script.contains("crates/temporalstore-rust"));
 }

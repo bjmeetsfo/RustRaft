@@ -1,8 +1,8 @@
 use rustraft::benchmark::{
     rustraft_assert_production_byteraft_parity, rustraft_byteraft_benchmark_evidence,
-    rustraft_find_byteraft_harness, rustraft_run_byteraft_parity_benchmark,
-    RustRaftBenchmarkEngineSource, RustRaftBenchmarkOptions, RustRaftExternalByteRaftRunner,
-    RustRaftRuntimeBenchmarkRunner,
+    rustraft_find_byteraft_harness, rustraft_find_or_build_byteraft_harness,
+    rustraft_run_byteraft_parity_benchmark, RustRaftBenchmarkEngineSource,
+    RustRaftBenchmarkOptions, RustRaftExternalByteRaftRunner, RustRaftRuntimeBenchmarkRunner,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -103,11 +103,63 @@ fn real_byteraft_runner_uses_external_harness_and_production_sources() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn byteraft_runner_builds_harness_from_checkout_hook_before_failing_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_dir("build-hook");
+    let scripts = root.join("scripts");
+    fs::create_dir_all(&scripts).expect("scripts");
+    let build_script = scripts.join("build_byteraft_parity_benchmark.sh");
+    fs::write(
+        &build_script,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p bin
+cat > bin/byteraft_parity_benchmark <<'HARNESS'
+#!/usr/bin/env bash
+cat <<JSON
+{
+  "workload": "single_key_writes",
+  "engine": "byte_raft",
+  "engine_source": "real_byte_raft",
+  "binary_path": null,
+  "git_revision": null,
+  "build_profile": "fake-build-hook",
+  "node_count": 3,
+  "operation_count": 1,
+  "p50_latency_micros": 1000000,
+  "p99_latency_micros": 1000000,
+  "throughput_ops_per_sec": 1.0,
+  "correctness_passed": true
+}
+JSON
+HARNESS
+chmod +x bin/byteraft_parity_benchmark
+"#,
+    )
+    .expect("build script");
+    let mut perms = fs::metadata(&build_script).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&build_script, perms).expect("chmod");
+
+    let built =
+        rustraft_find_or_build_byteraft_harness(&root, "debug").expect("build fake harness");
+
+    assert_eq!(built, root.join("bin/byteraft_parity_benchmark"));
+    assert!(built.is_file());
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn missing_byteraft_harness_fails_closed_with_real_byteraft_blocker() {
     let root = temp_dir("missing");
     fs::create_dir_all(&root).expect("root");
     let err = rustraft_find_byteraft_harness(&root).expect_err("missing harness");
+    assert!(err.contains("benchmark:real_byteraft_missing"));
+    let err =
+        rustraft_find_or_build_byteraft_harness(&root, "debug").expect_err("missing build target");
     assert!(err.contains("benchmark:real_byteraft_missing"));
     let _ = fs::remove_dir_all(root);
 }
