@@ -1,5 +1,5 @@
 use rustraft::{
-    rustraft_admin_status_surface_evidence, rustraft_byteraft_runtime_capability_prometheus,
+    fault, rustraft_admin_status_surface_evidence, rustraft_byteraft_runtime_capability_prometheus,
     rustraft_byteraft_runtime_capability_report, RustRaftAdminStatusSurfaceEvidence,
     RustRaftAdminStatusSurfaceInput, RustRaftDataNodeProcessRolloutReport, RustRaftMembershipScope,
     RustRaftMembershipTransitionEvidence, RustRaftMembershipTransitionKind,
@@ -273,6 +273,23 @@ fn ready_admin_status_surface() -> RustRaftAdminStatusSurfaceEvidence {
     })
 }
 
+fn ready_fault_harness() -> fault::RustRaftFaultHarnessReadinessReport {
+    let evidence = fault::rustraft_byteraft_fault_scenarios()
+        .into_iter()
+        .map(|requirement| fault::RustRaftFaultScenarioEvidence {
+            scenario: requirement.scenario,
+            process_path_observed: true,
+            independent_wal_dirs_observed: true,
+            independent_snapshot_dirs_observed: true,
+            safety_observed: true,
+            recovery_observed: true,
+            metrics_observed: true,
+            report_path: Some(format!("reports/{}.json", requirement.scenario.id())),
+        })
+        .collect::<Vec<_>>();
+    fault::rustraft_fault_harness_readiness_report(&evidence)
+}
+
 fn ready_input() -> RustRaftProductionReadinessInput {
     RustRaftProductionReadinessInput {
         readiness: ready_snapshot(),
@@ -308,6 +325,7 @@ fn ready_input() -> RustRaftProductionReadinessInput {
             slow_fsync_backpressure_observed: true,
         }),
         admin_status_surface: Some(ready_admin_status_surface()),
+        fault_harness: Some(ready_fault_harness()),
         data_node_rollout: Some(ready_data_rollout()),
         metaserver_rollout: Some(ready_meta_rollout()),
         membership_transitions: transitions(),

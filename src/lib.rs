@@ -136,6 +136,8 @@ pub struct RustRaftProductionReadinessInput {
     #[serde(default)]
     pub admin_status_surface: Option<RustRaftAdminStatusSurfaceEvidence>,
     #[serde(default)]
+    pub fault_harness: Option<fault::RustRaftFaultHarnessReadinessReport>,
+    #[serde(default)]
     pub data_node_rollout: Option<RustRaftDataNodeProcessRolloutReport>,
     #[serde(default)]
     pub metaserver_rollout: Option<RustRaftMetaProcessRolloutReport>,
@@ -8425,6 +8427,13 @@ pub fn rustraft_production_readiness_report(
         &mut production_blockers,
         &mut recommended_next_actions,
     );
+    require_fault_harness(
+        input.fault_harness.as_ref(),
+        &mut satisfied,
+        &mut missing,
+        &mut production_blockers,
+        &mut recommended_next_actions,
+    );
     require_byteraft_benchmark(
         input.byteraft_benchmark.as_ref(),
         &mut satisfied,
@@ -8506,6 +8515,67 @@ fn require_byteraft_benchmark(
             blockers,
             actions,
             "clear ByteRaft benchmark blocker",
+        );
+    }
+}
+
+fn require_fault_harness(
+    fault_harness: Option<&fault::RustRaftFaultHarnessReadinessReport>,
+    satisfied: &mut Vec<String>,
+    missing: &mut Vec<String>,
+    blockers: &mut Vec<String>,
+    actions: &mut Vec<String>,
+) {
+    require_option(
+        "fault:harness_present",
+        fault_harness,
+        satisfied,
+        missing,
+        blockers,
+        actions,
+        "attach ByteRaft-style fault harness evidence from real RustRaft process runs",
+    );
+    let Some(fault_harness) = fault_harness else {
+        blockers.push("fault:harness_missing".to_string());
+        blockers.push("fault:partition_heal_missing".to_string());
+        return;
+    };
+
+    require_bool(
+        fault_harness.ready,
+        "fault:harness_ready",
+        satisfied,
+        missing,
+        blockers,
+        actions,
+        "run all required ByteRaft fault scenarios against RustRaft",
+    );
+
+    for result in &fault_harness.results {
+        let scenario_id = result.scenario.id();
+        require_bool(
+            result.ready,
+            &format!("fault:scenario:{scenario_id}"),
+            satisfied,
+            missing,
+            blockers,
+            actions,
+            "clear ByteRaft fault scenario blocker",
+        );
+    }
+
+    for blocker in &fault_harness.missing {
+        if blocker.starts_with("packet_loss_majority:") {
+            blockers.push("fault:partition_heal_missing".to_string());
+        }
+        require_bool(
+            false,
+            &format!("fault:{blocker}"),
+            satisfied,
+            missing,
+            blockers,
+            actions,
+            "clear ByteRaft fault harness blocker",
         );
     }
 }
@@ -10536,6 +10606,23 @@ mod tests {
         })
     }
 
+    fn ready_fault_harness() -> fault::RustRaftFaultHarnessReadinessReport {
+        let evidence = fault::rustraft_byteraft_fault_scenarios()
+            .into_iter()
+            .map(|requirement| fault::RustRaftFaultScenarioEvidence {
+                scenario: requirement.scenario,
+                process_path_observed: true,
+                independent_wal_dirs_observed: true,
+                independent_snapshot_dirs_observed: true,
+                safety_observed: true,
+                recovery_observed: true,
+                metrics_observed: true,
+                report_path: Some(format!("reports/{}.json", requirement.scenario.id())),
+            })
+            .collect::<Vec<_>>();
+        fault::rustraft_fault_harness_readiness_report(&evidence)
+    }
+
     fn ready_production_input() -> RustRaftProductionReadinessInput {
         RustRaftProductionReadinessInput {
             readiness: ready_snapshot(),
@@ -10571,6 +10658,7 @@ mod tests {
                 slow_fsync_backpressure_observed: true,
             }),
             admin_status_surface: Some(ready_admin_status_surface()),
+            fault_harness: Some(ready_fault_harness()),
             data_node_rollout: Some(ready_data_node_rollout()),
             metaserver_rollout: Some(ready_meta_rollout()),
             membership_transitions: ready_membership_transitions(),
@@ -10636,6 +10724,7 @@ mod tests {
             snapshot_lifecycle: None,
             wal_lifecycle: None,
             admin_status_surface: None,
+            fault_harness: None,
             data_node_rollout: None,
             metaserver_rollout: None,
             membership_transitions: Vec::new(),
@@ -10669,6 +10758,9 @@ mod tests {
         assert!(report
             .production_blockers
             .contains(&"status:admin_surface_missing".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"fault:partition_heal_missing".to_string()));
     }
 
     #[test]
@@ -10729,6 +10821,29 @@ mod tests {
         assert!(report
             .production_blockers
             .contains(&"cluster_commit_index_inconsistent".to_string()));
+    }
+
+    #[test]
+    fn production_readiness_gate_rejects_missing_fault_harness_evidence() {
+        let mut input = ready_production_input();
+        input.fault_harness = Some(fault::rustraft_fault_harness_readiness_report(&[]));
+
+        let report = rustraft_production_readiness_report(&input);
+
+        assert!(!report.ready);
+        assert_eq!(report.production_status, RustRaftProductionStatus::Blocked);
+        assert!(report
+            .production_blockers
+            .contains(&"fault:harness_ready".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"fault:partition_heal_missing".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"fault:packet_loss_majority:evidence_missing".to_string()));
+        assert!(report
+            .production_blockers
+            .contains(&"fault:rolling_restart_joint_consensus:evidence_missing".to_string()));
     }
 
     #[test]

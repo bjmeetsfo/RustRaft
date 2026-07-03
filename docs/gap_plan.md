@@ -41,6 +41,11 @@ startup, object/page storage, and admin endpoints.
 - Real ByteRaft benchmark evidence is now a production readiness input. The
   benchmark gate fails closed when the ByteRaft side or RustRaft side reports a
   model source instead of a real ByteRaft harness plus RustRaft runtime runner.
+- ByteRaft-derived fault harness evidence is now a production readiness input.
+  The production gate fails closed with `fault:partition_heal_missing` and
+  scenario-specific blockers until packet-loss/partition-heal, slow WAL fsync,
+  snapshot/membership, leader-transfer-under-load, follower-rejoin, and rolling
+  restart joint-consensus evidence is attached.
 - Generic Prometheus text output for the same capability families is available
   through `rustraft_byteraft_runtime_capability_prometheus()`, reducing the
   product-local metric logic TemporalStore needs to carry.
@@ -103,7 +108,7 @@ if production_status != production_ready:
 | Snapshot lifecycle | Snapshot floor, chunk retry, stale chunk rejection, and tail catch-up are still tested mostly through TemporalStore. | Add library-level snapshot state machine and fault tests. | `raft_rustraft_snapshot_lifecycle_depth`. |
 | Membership workflow | Learner catch-up, promote, remove, transfer leader, and joint membership need a reusable library state model. | Add membership planner/state transitions to this repo; TemporalStore metaserver consumes it. | `raft_rustraft_leader_transfer_high_write_fault_harness` and membership cases. |
 | Metrics model | RustRaft metric names and status snapshots exist; runtime exporters still need to emit them everywhere. | Wire `RustRaftMetricNames` and `RustRaftStatusSnapshot` into TemporalStore metrics/admin endpoints. | Grafana/Prometheus parity checks. |
-| Fault harness API | Fault cases are currently driven by TemporalStore harnesses. | Add a library-level deterministic harness for partitions, packet loss, slow WAL, restart, compaction, and snapshot install. | `raft_rustraft_*_fault_harness` cases. |
+| Fault harness API | RustRaft owns the fail-closed fault harness report and production gate wiring; real spawned-process evidence still comes from TemporalStore or another embedding harness. | Attach process-produced reports for partitions, packet loss, slow WAL, restart, compaction, and snapshot install. | `rustraft_fault_harness_readiness_report` plus `raft_rustraft_*_fault_harness` cases. |
 | Storage adapter boundary | Stable RustRaft storage trait exists; durable storage implementation remains TemporalStore-specific. | Implement `RustRaftStorage` for TemporalStore log/snapshot storage adapters. | Storage recovery and compaction gates. |
 | Real ByteRaft binary availability | The benchmark runner is wired, but the private ByteRaft checkout/harness may be absent from a machine. | Provide or build `byteraft_parity_benchmark` under `BYTERAFT_ROOT`, or point `BYTERAFT_BENCHMARK_BIN` at it. | `scripts/byteraft_vs_rustraft_benchmark.sh` fails closed with `benchmark:real_byteraft_missing`. |
 
@@ -113,6 +118,8 @@ RustRaft while making TemporalStore-specific adapter boundaries explicit.
 The public `rustraft_fault_harness_readiness_report()` function is the
 fail-closed contract for ByteRaft-derived process-path fault evidence; real
 TemporalStore harnesses still need to provide the observed process reports.
+`rustraft_production_readiness_report()` now requires that report before any
+production-ready claim can pass.
 The public process-rollout readiness helpers are the matching fail-closed
 contract for spawned-process rollout evidence, including independent WAL and
 snapshot dirs, process API writes/mutations, read-index responses, restart

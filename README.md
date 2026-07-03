@@ -69,7 +69,9 @@ surface in TemporalStore readiness gates and CI.
 
 `rustraft_production_readiness_report` is the fail-closed deployment gate. It
 wraps the semantic parity report with runtime evidence for peer pipeline,
-snapshot lifecycle, WAL lifecycle, data-node rollout, and metaserver rollout.
+snapshot lifecycle, WAL lifecycle, data-node rollout, metaserver rollout,
+admin/status observability, fault harness results, and real ByteRaft benchmark
+parity.
 The data-node and metaserver rollout report helpers expose the same fail-closed
 process-path checks independently, so TemporalStore and downstream adopters can
 validate spawned-process evidence before composing the full production report.
@@ -88,7 +90,10 @@ benchmark runners remain available for unit tests, but
 `rustraft_production_readiness_report()` blocks production claims unless
 benchmark evidence proves a real ByteRaft harness and the RustRaft runtime ran
 the same 3-node workloads and passed correctness plus the configured latency and
-throughput threshold.
+throughput threshold. It also requires `rustraft_fault_harness_readiness_report`
+evidence for the ByteRaft-derived packet-loss/partition-heal, slow WAL fsync,
+snapshot-during-membership-change, leader-transfer-under-load,
+follower-rejoin-after-compaction, and rolling-restart joint-consensus scenarios.
 
 ## Why It Lives Separately
 
