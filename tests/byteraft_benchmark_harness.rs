@@ -5,6 +5,7 @@ use rustraft::benchmark::{
     RustRaftBenchmarkOptions, RustRaftBenchmarkRunner, RustRaftBenchmarkSample,
     RustRaftBenchmarkWorkload, RustRaftRuntimeBenchmarkRunner, RustRaftSameMachineModelRunner,
 };
+use std::process::Command;
 
 #[test]
 fn same_machine_benchmark_covers_required_byteraft_workloads() {
@@ -44,8 +45,80 @@ fn external_benchmark_script_runs_outside_temporalstore() {
     assert!(script.contains("build_byteraft_parity_benchmark.sh"));
     assert!(script.contains("--target byteraft_parity_benchmark"));
     assert!(script.contains("bazel build //:byteraft_parity_benchmark"));
+    assert!(script.contains("--native-kvbench-adapter"));
+    assert!(script.contains("BYTERAFT_USE_NATIVE_KVBENCH_ADAPTER"));
+    assert!(script.contains("byteraft_native_kvbench_adapter.sh"));
     assert!(!script.contains("TemporalStore.git"));
     assert!(!script.contains("crates/temporalstore-rust"));
+}
+
+#[test]
+fn native_kvbench_adapter_emits_fail_closed_sample_for_unsupported_workload() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("byteraft_native_kvbench_adapter.sh");
+    let output = Command::new("bash")
+        .arg(script)
+        .arg("--workload")
+        .arg("snapshot_streaming")
+        .arg("--node-count")
+        .arg("3")
+        .arg("--iterations")
+        .arg("7")
+        .arg("--batch-size")
+        .arg("2")
+        .output()
+        .expect("run native kvbench adapter");
+
+    assert!(output.status.success());
+    let sample: RustRaftBenchmarkSample =
+        serde_json::from_slice(&output.stdout).expect("sample JSON");
+    assert_eq!(
+        sample.workload,
+        RustRaftBenchmarkWorkload::SnapshotStreaming
+    );
+    assert_eq!(sample.engine, RustRaftBenchmarkEngine::ByteRaft);
+    assert_eq!(
+        sample.engine_source,
+        RustRaftBenchmarkEngineSource::RealByteRaft
+    );
+    assert_eq!(sample.operation_count, 7);
+    assert_eq!(sample.p50_latency_micros, 1_000_000_000);
+    assert_eq!(sample.p99_latency_micros, 1_000_000_000);
+    assert_eq!(sample.throughput_ops_per_sec, 1.0);
+    assert!(!sample.correctness_passed);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("benchmark:byteraft_native_kvbench_unsupported"));
+}
+
+#[test]
+fn native_kvbench_adapter_preserves_batched_operation_count_on_early_failure() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("byteraft_native_kvbench_adapter.sh");
+    let output = Command::new("bash")
+        .arg(script)
+        .arg("--workload")
+        .arg("batched_writes")
+        .arg("--node-count")
+        .arg("3")
+        .arg("--iterations")
+        .arg("7")
+        .arg("--batch-size")
+        .arg("5")
+        .arg("--byteraft-root")
+        .arg("/path/that/does/not/exist")
+        .output()
+        .expect("run native kvbench adapter");
+
+    assert!(output.status.success());
+    let sample: RustRaftBenchmarkSample =
+        serde_json::from_slice(&output.stdout).expect("sample JSON");
+    assert_eq!(sample.workload, RustRaftBenchmarkWorkload::BatchedWrites);
+    assert_eq!(sample.operation_count, 35);
+    assert!(!sample.correctness_passed);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("benchmark:real_byteraft_missing"));
 }
 
 #[test]

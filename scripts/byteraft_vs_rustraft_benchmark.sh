@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: byteraft_vs_rustraft_benchmark.sh [--rustraft-root PATH] [--byteraft-root PATH] [--byteraft-bin PATH] [--out PATH] [--release]
+Usage: byteraft_vs_rustraft_benchmark.sh [--rustraft-root PATH] [--byteraft-root PATH] [--byteraft-bin PATH] [--out PATH] [--release] [--native-kvbench-adapter]
 
 Runs the standalone RustRaft ByteRaft parity benchmark harness from outside
 TemporalStore and writes the JSON report to --out.
@@ -12,6 +12,9 @@ Environment:
   RUSTRAFT_ROOT   RustRaft checkout. Defaults to this script's parent repo.
   BYTERAFT_ROOT   ByteRaft checkout path. Defaults to RustRaft thirdparty/byteraft.
   BYTERAFT_BENCHMARK_BIN  Real ByteRaft benchmark harness executable.
+  BYTERAFT_USE_NATIVE_KVBENCH_ADAPTER=1
+                  Use RustRaft's native ByteRaft kvbench adapter when the full
+                  byteraft_parity_benchmark harness is absent.
   BENCHMARK_OUT   Output report path.
 
 Production parity is fail-closed: the script requires a real ByteRaft harness
@@ -29,6 +32,7 @@ byteraft_bin="${BYTERAFT_BENCHMARK_BIN:-}"
 out_path="${BENCHMARK_OUT:-$rustraft_root/target/byteraft-vs-rustraft-benchmark/report.json}"
 cargo_profile=()
 build_profile=debug
+use_native_kvbench_adapter="${BYTERAFT_USE_NATIVE_KVBENCH_ADAPTER:-0}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +55,10 @@ while [[ $# -gt 0 ]]; do
     --release)
       cargo_profile=(--release)
       build_profile=release
+      shift
+      ;;
+    --native-kvbench-adapter)
+      use_native_kvbench_adapter=1
       shift
       ;;
     -h|--help)
@@ -168,6 +176,16 @@ if [[ -z "$byteraft_bin" ]]; then
   }
 fi
 
+if [[ -z "$byteraft_bin" && "$use_native_kvbench_adapter" == "1" ]]; then
+  adapter="$rustraft_root/scripts/byteraft_native_kvbench_adapter.sh"
+  if [[ -f "$adapter" ]]; then
+    native_byteraft_capability_report
+    echo "ByteRaft native kvbench adapter enabled: $adapter" >&2
+    echo "Production parity is still expected to fail until unsupported workloads are covered by a full ByteRaft harness." >&2
+    byteraft_bin="$adapter"
+  fi
+fi
+
 if [[ -z "$byteraft_bin" || ! -f "$byteraft_bin" ]]; then
   native_byteraft_capability_report
   echo "benchmark:real_byteraft_missing: no ByteRaft benchmark harness found under $byteraft_root; set BYTERAFT_BENCHMARK_BIN" >&2
@@ -179,6 +197,7 @@ mkdir -p "$(dirname -- "$out_path")"
 tmp_report="$(mktemp)"
 trap 'rm -f "$tmp_report"' EXIT
 
+set +e
 BYTERAFT_ROOT="$byteraft_root" \
 BYTERAFT_BENCHMARK_BIN="$byteraft_bin" \
 RUSTRAFT_BENCHMARK_PROFILE="$build_profile" \
@@ -187,9 +206,16 @@ cargo run \
   "${cargo_profile[@]}" \
   --example byteraft_parity_benchmark \
   >"$tmp_report"
+benchmark_status=$?
+set -e
 
-mv "$tmp_report" "$out_path"
+if [[ -s "$tmp_report" ]]; then
+  mv "$tmp_report" "$out_path"
+else
+  rm -f "$tmp_report"
+fi
 
 echo "ByteRaft-vs-RustRaft benchmark report: $out_path"
 echo "ByteRaft root: $byteraft_root"
 echo "ByteRaft benchmark harness: $byteraft_bin"
+exit "$benchmark_status"

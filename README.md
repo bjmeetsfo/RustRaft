@@ -231,6 +231,16 @@ The model runner is intentionally not used for production parity.
 ByteRaft's native `example/kv/kv_benchmark.cc` / `kvbench` is detected and
 reported as partial evidence, but it does not replace the required JSON parity
 harness because it does not cover every production workload.
+To generate a normal failing report through that partial path, pass
+`--native-kvbench-adapter` after building ByteRaft's example `kvserver` and
+`kvbench` binaries:
+
+```bash
+BYTERAFT_ROOT=/path/to/byteraft \
+  bash scripts/byteraft_vs_rustraft_benchmark.sh \
+  --native-kvbench-adapter \
+  --out target/byteraft-vs-rustraft-benchmark/native-kvbench-report.json
+```
 
 These examples are also covered by integration tests so the public snippets stay
 in sync with the crate API.
