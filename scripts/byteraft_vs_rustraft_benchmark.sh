@@ -17,7 +17,8 @@ Environment:
 Production parity is fail-closed: the script requires a real ByteRaft harness
 and never falls back to the model runner. If the checkout exposes a
 byteraft_parity_benchmark build hook or CMake/Bazel target, the script builds it
-before failing closed.
+before failing closed. A native ByteRaft kvbench checkout is reported as partial
+evidence only; it is not accepted as full production parity.
 USAGE
 }
 
@@ -120,6 +121,37 @@ try_build_byteraft_harness() {
   return 0
 }
 
+native_byteraft_capability_report() {
+  if [[ ! -d "$byteraft_root" ]]; then
+    echo "ByteRaft native capability: root missing ($byteraft_root)" >&2
+    return 0
+  fi
+
+  local kvbench=""
+  for candidate in \
+    "$byteraft_root/build/example/kv/kvbench" \
+    "$byteraft_root/build/example/kv/kv_benchmark" \
+    "$byteraft_root/bin/kvbench" \
+    "$byteraft_root/kvbench"; do
+    if [[ -f "$candidate" ]]; then
+      kvbench="$candidate"
+      break
+    fi
+  done
+
+  local source="missing"
+  local script="missing"
+  local cmake_target="missing"
+  [[ -f "$byteraft_root/example/kv/kv_benchmark.cc" ]] && source="$byteraft_root/example/kv/kv_benchmark.cc"
+  [[ -f "$byteraft_root/script/bench.sh" ]] && script="$byteraft_root/script/bench.sh"
+  if [[ -f "$byteraft_root/example/kv/CMakeLists.txt" ]] && grep -q "add_executable(kvbench" "$byteraft_root/example/kv/CMakeLists.txt"; then
+    cmake_target="present"
+  fi
+
+  echo "ByteRaft native capability: kvbench=${kvbench:-missing} source=$source script=$script cmake_kvbench_target=$cmake_target" >&2
+  echo "ByteRaft native capability is partial: it can inform single-key client write/read benchmarking, but the full parity harness must still cover batched writes, replication batching, WAL fsync, read-index, lease-read, snapshot install/catch-up, snapshot streaming, and leader transfer under load." >&2
+}
+
 if [[ -z "$byteraft_bin" ]]; then
   find_byteraft_bin || true
 fi
@@ -137,6 +169,7 @@ if [[ -z "$byteraft_bin" ]]; then
 fi
 
 if [[ -z "$byteraft_bin" || ! -f "$byteraft_bin" ]]; then
+  native_byteraft_capability_report
   echo "benchmark:real_byteraft_missing: no ByteRaft benchmark harness found under $byteraft_root; set BYTERAFT_BENCHMARK_BIN" >&2
   exit 2
 fi

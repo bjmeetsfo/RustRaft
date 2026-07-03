@@ -228,6 +228,9 @@ The script does not enter or depend on the TemporalStore checkout. It fails
 closed with `benchmark:real_byteraft_missing` unless `BYTERAFT_ROOT` contains a
 `byteraft_parity_benchmark` harness or `BYTERAFT_BENCHMARK_BIN` points to one.
 The model runner is intentionally not used for production parity.
+ByteRaft's native `example/kv/kv_benchmark.cc` / `kvbench` is detected and
+reported as partial evidence, but it does not replace the required JSON parity
+harness because it does not cover every production workload.
 
 These examples are also covered by integration tests so the public snippets stay
 in sync with the crate API.

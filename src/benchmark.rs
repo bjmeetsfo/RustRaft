@@ -128,6 +128,18 @@ pub struct RustRaftBenchmarkReport {
     pub comparisons: Vec<RustRaftBenchmarkComparison>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRaftByteRaftNativeBenchmarkCapability {
+    pub byteraft_root: String,
+    pub kvbench_binary_path: Option<String>,
+    pub kvbench_source_path: Option<String>,
+    pub bench_script_path: Option<String>,
+    pub cmake_kvbench_target_present: bool,
+    pub supported_workloads: Vec<String>,
+    pub missing_required_workloads: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
 pub trait RustRaftBenchmarkRunner {
     fn engine(&self) -> RustRaftBenchmarkEngine;
     fn engine_source(&self) -> RustRaftBenchmarkEngineSource {
@@ -371,6 +383,83 @@ pub fn rustraft_find_byteraft_harness(byteraft_root: impl AsRef<Path>) -> Result
         .into_iter()
         .find(|path| path.is_file())
         .ok_or_else(|| format!("benchmark:real_byteraft_missing:{}", root.display()))
+}
+
+pub fn rustraft_probe_byteraft_native_benchmark(
+    byteraft_root: impl AsRef<Path>,
+) -> RustRaftByteRaftNativeBenchmarkCapability {
+    let root = byteraft_root.as_ref();
+    let kvbench_binary = rustraft_find_byteraft_kvbench(root).ok();
+    let kvbench_source = root.join("example/kv/kv_benchmark.cc");
+    let bench_script = root.join("script/bench.sh");
+    let cmake_kv = root.join("example/kv/CMakeLists.txt");
+    let cmake_kvbench_target_present = fs::read_to_string(&cmake_kv)
+        .map(|text| text.contains("add_executable(kvbench"))
+        .unwrap_or(false);
+
+    let mut supported_workloads = Vec::new();
+    if kvbench_binary.is_some() || kvbench_source.is_file() || bench_script.is_file() {
+        supported_workloads.push(RustRaftBenchmarkWorkload::SingleKeyWrites.id().to_string());
+    }
+
+    let required = rustraft_byteraft_benchmark_workloads()
+        .into_iter()
+        .map(|workload| workload.id().to_string())
+        .collect::<Vec<_>>();
+    let missing_required_workloads = required
+        .into_iter()
+        .filter(|workload| !supported_workloads.contains(workload))
+        .collect::<Vec<_>>();
+
+    let mut blockers = Vec::new();
+    if !root.is_dir() {
+        blockers.push("benchmark:real_byteraft_missing".to_string());
+    }
+    if kvbench_binary.is_none() {
+        blockers.push("benchmark:byteraft_kvbench_binary_missing".to_string());
+    }
+    if !missing_required_workloads.is_empty() {
+        blockers.push("benchmark:byteraft_native_kvbench_partial".to_string());
+    }
+    blockers.extend(
+        missing_required_workloads
+            .iter()
+            .map(|workload| format!("benchmark:workload_missing:{workload}")),
+    );
+
+    RustRaftByteRaftNativeBenchmarkCapability {
+        byteraft_root: root.display().to_string(),
+        kvbench_binary_path: kvbench_binary.map(|path| path.display().to_string()),
+        kvbench_source_path: kvbench_source
+            .is_file()
+            .then(|| kvbench_source.display().to_string()),
+        bench_script_path: bench_script
+            .is_file()
+            .then(|| bench_script.display().to_string()),
+        cmake_kvbench_target_present,
+        supported_workloads,
+        missing_required_workloads,
+        blockers,
+    }
+}
+
+fn rustraft_find_byteraft_kvbench(byteraft_root: &Path) -> Result<PathBuf, String> {
+    let root = byteraft_root;
+    let candidates = [
+        root.join("build/example/kv/kvbench"),
+        root.join("build/example/kv/kv_benchmark"),
+        root.join("bin/kvbench"),
+        root.join("kvbench"),
+    ];
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            format!(
+                "benchmark:byteraft_kvbench_binary_missing:{}",
+                root.display()
+            )
+        })
 }
 
 pub fn rustraft_find_or_build_byteraft_harness(

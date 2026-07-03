@@ -1,8 +1,9 @@
 use rustraft::benchmark::{
     rustraft_assert_production_byteraft_parity, rustraft_byteraft_benchmark_evidence,
     rustraft_find_byteraft_harness, rustraft_find_or_build_byteraft_harness,
-    rustraft_run_byteraft_parity_benchmark, RustRaftBenchmarkEngineSource,
-    RustRaftBenchmarkOptions, RustRaftExternalByteRaftRunner, RustRaftRuntimeBenchmarkRunner,
+    rustraft_probe_byteraft_native_benchmark, rustraft_run_byteraft_parity_benchmark,
+    RustRaftBenchmarkEngineSource, RustRaftBenchmarkOptions, RustRaftExternalByteRaftRunner,
+    RustRaftRuntimeBenchmarkRunner,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -161,5 +162,58 @@ fn missing_byteraft_harness_fails_closed_with_real_byteraft_blocker() {
     let err =
         rustraft_find_or_build_byteraft_harness(&root, "debug").expect_err("missing build target");
     assert!(err.contains("benchmark:real_byteraft_missing"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn native_byteraft_kvbench_is_reported_as_partial_not_production_parity() {
+    let root = temp_dir("native-kvbench");
+    fs::create_dir_all(root.join("example/kv")).expect("kv dir");
+    fs::create_dir_all(root.join("script")).expect("script dir");
+    fs::write(
+        root.join("example/kv/kv_benchmark.cc"),
+        "int main() { return 0; }",
+    )
+    .expect("kv source");
+    fs::write(
+        root.join("example/kv/CMakeLists.txt"),
+        "add_executable(kvbench kv_benchmark.cc)",
+    )
+    .expect("cmake source");
+    fs::write(root.join("script/bench.sh"), "#!/usr/bin/env bash\n").expect("bench script");
+
+    let capability = rustraft_probe_byteraft_native_benchmark(&root);
+
+    assert_eq!(
+        capability.kvbench_source_path,
+        Some(
+            root.join("example/kv/kv_benchmark.cc")
+                .display()
+                .to_string()
+        )
+    );
+    assert_eq!(
+        capability.bench_script_path,
+        Some(root.join("script/bench.sh").display().to_string())
+    );
+    assert!(capability.cmake_kvbench_target_present);
+    assert_eq!(capability.kvbench_binary_path, None);
+    assert_eq!(
+        capability.supported_workloads,
+        vec!["single_key_writes".to_string()]
+    );
+    assert!(capability
+        .missing_required_workloads
+        .contains(&"leader_transfer_under_load".to_string()));
+    assert!(capability
+        .blockers
+        .contains(&"benchmark:byteraft_kvbench_binary_missing".to_string()));
+    assert!(capability
+        .blockers
+        .contains(&"benchmark:byteraft_native_kvbench_partial".to_string()));
+
+    let err = rustraft_find_or_build_byteraft_harness(&root, "debug").expect_err("partial kvbench");
+    assert!(err.contains("benchmark:real_byteraft_missing"));
+
     let _ = fs::remove_dir_all(root);
 }
